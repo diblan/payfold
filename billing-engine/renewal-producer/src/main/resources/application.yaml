@@ -1,0 +1,36 @@
+spring:
+  application:
+    name: renewal-producer
+  datasource:
+    url: jdbc:postgresql://localhost:5432/yourdb
+    username: youruser
+    password: yourpassword
+  jackson:
+    time-zone: Europe/Brussels
+  batch:
+    jdbc:
+      initialize-schema: never
+
+
+app:
+  timezone: Europe/Brussels
+  chunkSize: 1000
+  scheduleCron: "0 0 3 * * *"   # 03:00 local by default
+
+
+rabbitmq:
+  host: localhost
+  port: 5672
+  username: guest
+  password: guest
+  exchange: billing.renewals
+  routingKey: renewal.requested
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,renewal-job
+  endpoint:
+    health:
+      show-details: never

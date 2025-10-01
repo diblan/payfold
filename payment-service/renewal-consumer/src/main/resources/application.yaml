@@ -1,0 +1,23 @@
+spring:
+  application:
+    name: renewal-consumer
+  datasource:
+    url: jdbc:postgresql://localhost:5432/yourdb
+    username: youruser
+    password: yourpassword
+  jackson:
+    time-zone: Europe/Brussels
+
+rabbitmq:
+  host: localhost
+  port: 5672
+  username: guest
+  password: guest
+  exchange: billing.renewals
+  queue: billing.renewals.main
+  routingKey: renewal.requested
+
+payment:
+  provider:
+    baseUrl: http://localhost:8089/mock-psp
+    timeoutMillis: 8000

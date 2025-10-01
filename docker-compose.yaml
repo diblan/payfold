@@ -1,0 +1,155 @@
+services:
+  postgres:
+    image: postgres:18
+    container_name: pg_payfold
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      TZ: ${TZ}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ${POSTGRES_VOLUME}:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} -h 127.0.0.1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  flyway:
+    image: flyway/flyway:11
+    container_name: flyway-payfold
+    command:
+      - -url=jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      - -user=${POSTGRES_USER}
+      - -password=${POSTGRES_PASSWORD}
+      - -connectRetries=30
+      - migrate
+    volumes:
+      - ./db-migrations:/flyway/sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq-payfold
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      TZ: ${TZ}
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"           # AMQP
+      - "${RABBITMQ_MGMT_PORT:-15672}:15672"    # Management UI http://localhost:15672 (guest/guest)
+    volumes:
+      # Persist broker data (queues, messages, etc.)
+      - /payfold/rabbitmq:/var/lib/rabbitmq
+      # Optional: drop extra config/definitions in ./rabbitmq
+      # - ./rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
+      # - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Seed data (Java seed generators)
+  seed-data:
+    image: eclipse-temurin:17-jdk
+    container_name: billing-seed
+    working_dir: /app
+    environment:
+      TZ: ${TZ}
+      POSTGRES_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./seed-data-gen:/app:ro
+    entrypoint: [ "bash","-lc","chmod +x ./run-seeder.sh && ./run-seeder.sh" ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+    restart: "no"
+
+  renewal-producer:
+    build:
+      context: ./billing-engine/renewal-producer
+    image: renewal-producer:latest
+    container_name: renewal-producer
+    environment:
+      TZ: ${TZ}
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/${POSTGRES_DB}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
+
+      # Spring AMQP (Spring Boot autoconfig)
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+
+      # App-specific props (map to rabbitmq.exchange/routingKey, app.timezone/cron)
+      RABBITMQ.EXCHANGE: ${RABBITMQ_EXCHANGE}
+      RABBITMQ.ROUTINGKEY: ${RABBITMQ_ROUTINGKEY}
+      APP.TIMEZONE: ${TZ}
+      APP.SCHEDULECRON: ${APP_SCHEDULECRON}
+    ports:
+      - "${PRODUCER_HTTP_PORT:-8080}:8080"  # actuator: /actuator/health, /actuator/renewal-job
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+      seed-data:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q '\"status\":\"UP\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  renewal-consumer:
+    build:
+      context: ./payment-service/renewal-consumer
+    image: renewal-consumer:latest
+    container_name: renewal-consumer
+    environment:
+      TZ: ${TZ}
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/${POSTGRES_DB}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
+
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+
+      # App-specific props (match your application.yml keys)
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE}
+      RABBITMQ_ROUTINGKEY: ${RABBITMQ_ROUTINGKEY}
+
+      PAYMENT_PROVIDER_BASEURL: ${PAYMENT_PROVIDER_BASEURL}
+    ports:
+      - "${CONSUMER_HTTP_PORT:-8081}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+      seed-data:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q '\"status\":\"UP\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
