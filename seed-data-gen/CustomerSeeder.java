@@ -8,20 +8,25 @@ import java.util.stream.Collectors;
 
 public class CustomerSeeder {
 
-    static final String url  = System.getProperty("db.url");
+    static final String url = System.getProperty("db.url");
     static final String user = System.getProperty("db.user");
     static final String pass = System.getProperty("db.pass");
 
     enum Loc {
         BE("be"), NL("nl"), FR("fr"), EN("en");
         public final String code;
-        Loc(String code) { this.code = code; }
+
+        Loc(String code) {
+            this.code = code;
+        }
     }
 
+    private static final String COUNT_SQL = "SELECT COUNT(*) FROM customer";
+
     private static final String INSERT_SQL = """
-        INSERT INTO customer (id, email, name, locale, status, created_at)
-        VALUES (?, ?, ?, ?, ?, now())
-        """;
+            INSERT INTO customer (id, email, name, locale, status, created_at)
+            VALUES (?, ?, ?, ?, ?, now())
+            """;
 
     // Adjust to your taste (must sum ~1.0; code normalizes anyway)
     private static final Map<Loc, Double> DEFAULT_WEIGHTS = Map.of(
@@ -36,7 +41,24 @@ public class CustomerSeeder {
     public static void main(String[] args) throws Exception {
         // ---- Config ----
         String dataDir = args.length > 0 ? args[0] : "data";
-        int howMany   = args.length > 1 ? Integer.parseInt(args[1]) : 15000;   // number of customers to insert
+        int howMany = args.length > 1 ? Integer.parseInt(args[1]) : 15000;   // number of customers to insert
+
+        try (Connection conn = DriverManager.getConnection(url, user, pass)) {
+            // count
+            int have = 0;
+            try (PreparedStatement ps = conn.prepareStatement(COUNT_SQL); ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                have = rs.getInt(1);
+            }
+
+            if (have >= howMany) {
+                System.out.println("Seed skip: customers=" + have);
+                return;
+            } else {
+                howMany -= have;
+            }
+        }
+
 
         // Optional: override weights via system properties, e.g.
         // -Dw.be=0.60 -Dw.nl=0.20 -Dw.fr=0.15 -Dw.en=0.05
@@ -44,15 +66,15 @@ public class CustomerSeeder {
 
         // ---- Load names per locale ----
         Map<Loc, List<String>> firstNames = new EnumMap<>(Loc.class);
-        Map<Loc, List<String>> lastNames  = new EnumMap<>(Loc.class);
+        Map<Loc, List<String>> lastNames = new EnumMap<>(Loc.class);
 
         for (Loc loc : Loc.values()) {
             firstNames.put(loc, loadNames(Paths.get(dataDir, "first-" + loc.code + ".txt")));
-            lastNames.put(loc,  loadNames(Paths.get(dataDir, "last-"  + loc.code + ".txt")));
+            lastNames.put(loc, loadNames(Paths.get(dataDir, "last-" + loc.code + ".txt")));
         }
 
         validateNonEmpty(firstNames, "first names");
-        validateNonEmpty(lastNames,  "last names");
+        validateNonEmpty(lastNames, "last names");
 
         // ---- Generate + insert ----
         Random rnd = new Random();
@@ -64,7 +86,7 @@ public class CustomerSeeder {
                     Loc loc = pickLocale(weights, rnd);
 
                     String first = pickRandom(firstNames.get(loc), rnd);
-                    String last  = pickRandom(lastNames.get(loc), rnd);
+                    String last = pickRandom(lastNames.get(loc), rnd);
                     String fullName = first + " " + last;
 
                     // email: first.last + short unique suffix @example.<tld>
@@ -107,7 +129,11 @@ public class CustomerSeeder {
 
     private static double parseDoubleOr(double def, String s) {
         if (s == null) return def;
-        try { return Double.parseDouble(s); } catch (Exception e) { return def; }
+        try {
+            return Double.parseDouble(s);
+        } catch (Exception e) {
+            return def;
+        }
     }
 
     private static List<String> loadNames(Path path) throws IOException {
