@@ -1,6 +1,5 @@
 package com.blanchaert.billing.producer.job;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.batch.core.*;
 import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
 import org.springframework.batch.core.job.builder.JobBuilder;
@@ -36,8 +35,6 @@ public class RenewalJobConfig {
     public Step scanStep(JobRepository repo,
                          PlatformTransactionManager tx,
                          JdbcTemplate jdbc,
-                         ObjectMapper om,
-                         @Value("${app.chunkSize:1000}") int chunkSize,
                          @Value("${app.timezone:Europe/Brussels}") String tz) {
         return new StepBuilder("scanStep", repo)
                 .tasklet((contribution, chunkContext) -> {
