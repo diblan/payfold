@@ -20,7 +20,11 @@ import java.util.*;
 @EnableBatchProcessing
 public class RenewalJobConfig {
     @Bean
-    public Job renewalJob(JobRepository repo, Step scanStep, Step publishStep) {
+    public Job renewalJob(
+            JobRepository repo,
+            @Qualifier("scanStep") Step scanStep,
+            @Qualifier("publishStep") Step publishStep
+    ) {
         return new JobBuilder("renewalJob", repo)
                 .start(scanStep)
                 .next(publishStep)

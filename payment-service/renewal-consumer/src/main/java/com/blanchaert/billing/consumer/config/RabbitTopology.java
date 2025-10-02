@@ -1,6 +1,7 @@
 package com.blanchaert.billing.consumer.config;
 
 import org.springframework.amqp.core.*;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -14,28 +15,22 @@ public class RabbitTopology {
 
     @Bean
     public Queue mainQueue(@Value("${rabbitmq.queue}") String q) {
-        return QueueBuilder.durable(q)
-                .withArgument("x-dead-letter-exchange", "billing.renewals.dlx")
-                .build();
+        return QueueBuilder.durable(q).withArgument("x-dead-letter-exchange", "billing.renewals.dlx").build();
     }
 
     @Bean
-    public Binding mainBinding(Queue mainQueue, Exchange renewalsExchange,
-                               @Value("${rabbitmq.routingKey}") String rk) {
-        return
-                BindingBuilder.bind(mainQueue).to(renewalsExchange).with(rk).noargs();
+    public Binding mainBinding(@Qualifier("mainQueue") Queue mainQueue, Exchange renewalsExchange, @Value("${rabbitmq.routingKey}") String rk) {
+        return BindingBuilder.bind(mainQueue).to(renewalsExchange).with(rk).noargs();
     }
 
     @Bean
     public Exchange dlx() {
-        return
-                ExchangeBuilder.directExchange("billing.renewals.dlx").durable(true).build();
+        return ExchangeBuilder.directExchange("billing.renewals.dlx").durable(true).build();
     }
 
     @Bean
     public Queue dlq() {
-        return
-                QueueBuilder.durable("billing.renewals.dlq").build();
+        return QueueBuilder.durable("billing.renewals.dlq").build();
     }
 
     @Bean
