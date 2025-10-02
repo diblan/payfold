@@ -83,7 +83,7 @@ services:
     container_name: renewal-producer
     environment:
       TZ: ${TZ}
-      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/${POSTGRES_DB}
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
       SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER}
       SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
 
@@ -101,7 +101,7 @@ services:
     ports:
       - "${PRODUCER_HTTP_PORT:-8080}:8080"  # actuator: /actuator/health, /actuator/renewal-job
     depends_on:
-      db:
+      postgres:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
@@ -122,7 +122,7 @@ services:
     container_name: renewal-consumer
     environment:
       TZ: ${TZ}
-      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/${POSTGRES_DB}
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
       SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER}
       SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
 
