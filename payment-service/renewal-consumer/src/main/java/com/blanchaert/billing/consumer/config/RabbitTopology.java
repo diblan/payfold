@@ -9,7 +9,7 @@ import org.springframework.context.annotation.Configuration;
 @Configuration
 public class RabbitTopology {
     @Bean
-    public Exchange renewalsExchange(@Value("${rabbitmq.exchange}") String ex) {
+    public DirectExchange renewalsExchange(@Value("${rabbitmq.exchange}") String ex) {
         return ExchangeBuilder.directExchange(ex).durable(true).build();
     }
 
@@ -19,12 +19,14 @@ public class RabbitTopology {
     }
 
     @Bean
-    public Binding mainBinding(@Qualifier("mainQueue") Queue mainQueue, Exchange renewalsExchange, @Value("${rabbitmq.routingKey}") String rk) {
-        return BindingBuilder.bind(mainQueue).to(renewalsExchange).with(rk).noargs();
+    public Binding mainBinding(@Qualifier("mainQueue") Queue mainQueue,
+                               @Qualifier("renewalsExchange") DirectExchange renewalsExchange,
+                               @Value("${rabbitmq.routingKey}") String rk) {
+        return BindingBuilder.bind(mainQueue).to(renewalsExchange).with(rk);
     }
 
     @Bean
-    public Exchange dlx() {
+    public DirectExchange dlx() {
         return ExchangeBuilder.directExchange("billing.renewals.dlx").durable(true).build();
     }
 
@@ -34,7 +36,8 @@ public class RabbitTopology {
     }
 
     @Bean
-    public Binding dlqBinding(Queue dlq, Exchange dlx) {
-        return BindingBuilder.bind(dlq).to(dlx).with("dlq").noargs();
+    public Binding dlqBinding(@Qualifier("dlq") Queue dlq,
+                              @Qualifier("dlx") DirectExchange dlx) {
+        return BindingBuilder.bind(dlq).to(dlx).with("dlq");
     }
 }
