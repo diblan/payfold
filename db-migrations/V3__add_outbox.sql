@@ -33,5 +33,6 @@ CREATE INDEX idx_subscription_plan_id ON subscription (plan_id);
 CREATE INDEX idx_payment_method_active
   ON payment_method (customer_id, status, expires_on);
 
+-- De-dupe the outbox
 ALTER TABLE renewal_outbox
   ADD CONSTRAINT uniq_outbox_sub_due UNIQUE (subscription_id, due_date);
