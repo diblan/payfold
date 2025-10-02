@@ -90,22 +90,48 @@ public class RenewalJobConfig {
     public Step publishStep(JobRepository repo,
                             PlatformTransactionManager tx,
                             JdbcTemplate jdbc,
-                            OutboxPublisher publisher) {
+                            OutboxPublisher publisher,
+                            @Value("${app.publishPageSize:1000}") int publishPageSize) {
         return new StepBuilder("publishStep", repo)
                 .tasklet((contribution, chunkContext) -> {
-                    List<Map<String, Object>> rows = jdbc.queryForList(
-                            "SELECT id, payload FROM renewal_outbox WHERE published_at IS NULL ORDER BY created_at LIMIT 5000");
-                    int n = 0;
-                    for (var r : rows) {
-                        UUID id = (UUID) r.get("id");
-                        String payload = r.get("payload").toString();
-                        if (publisher.publish(payload)) {
-                            jdbc.update("UPDATE renewal_outbox SET published_at = now() WHERE id = ? ", id);
-                            n++;
+                    // Fetch one page of unpublished outbox rows
+                    record OutboxRow(UUID id, String payload) {
+                    }
+                    var rows = jdbc.query(
+                            "SELECT id, payload " +
+                                    "FROM renewal_outbox " +
+                                    "WHERE published_at IS NULL " +
+                                    "ORDER BY id " +
+                                    "LIMIT ?",
+                            ps -> ps.setInt(1, publishPageSize),
+                            (rs, i) -> new OutboxRow((UUID) rs.getObject("id"), rs.getString("payload"))
+                    );
+
+                    if (rows.isEmpty()) {
+                        System.out.println("Published all messages: outbox drained.");
+                        return RepeatStatus.FINISHED; // stop the step
+                    }
+
+                    // Publish and collect the ones we actually sent
+                    var publishedIds = new ArrayList<UUID>(rows.size());
+                    for (var row : rows) {
+                        if (publisher.publish(row.payload)) {
+                            publishedIds.add(row.id);
                         }
                     }
-                    System.out.println("Published messages: " + n);
-                    return RepeatStatus.FINISHED;
+
+                    // Mark them as published in one batch
+                    if (!publishedIds.isEmpty()) {
+                        jdbc.batchUpdate(
+                                "UPDATE renewal_outbox SET published_at = now() WHERE id = ?",
+                                publishedIds,
+                                publishedIds.size(),
+                                (ps, id) -> ps.setObject(1, id)
+                        );
+                    }
+
+                    System.out.println("Published page count: " + publishedIds.size());
+                    return RepeatStatus.CONTINUABLE; // ask Batch to run this tasklet again (new tx), next page
                 }, tx).build();
     }
 }

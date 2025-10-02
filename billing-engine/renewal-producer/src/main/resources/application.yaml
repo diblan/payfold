@@ -14,7 +14,7 @@ spring:
 
 app:
   timezone: Europe/Brussels
-  chunkSize: 1000
+  publishPageSize: 1000
   scheduleCron: "0 0 3 * * *"   # 03:00 local by default
 
 
