@@ -12,8 +12,8 @@
 #
 # Environment:
 #   VERIFY_STRICT_CONSUMER_HEALTH=1   require the consumer's /actuator/health to be UP.
-#     Default 0 until roadmap item R1 lands (the consumer has no actuator dependency
-#     yet); R1 flips the default to 1 — a tightening, per G7.
+#     Default 1 since roadmap item R1 (consumer ships actuator) — a tightening, per
+#     G7. Set 0 only to debug a stack whose consumer is known-broken.
 #
 # Requires: docker compose v2, curl. psql runs inside the postgres container.
 # Safe to re-run against a dirty database: all assertions are absolute conditions
@@ -34,7 +34,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-STRICT_CONSUMER="${VERIFY_STRICT_CONSUMER_HEALTH:-0}"
+STRICT_CONSUMER="${VERIFY_STRICT_CONSUMER_HEALTH:-1}"
 
 # .env cannot be `source`d (values contain unquoted spaces/#); grep the keys we need.
 env_val() {
@@ -144,7 +144,7 @@ if [[ "$STRICT_CONSUMER" == "1" ]]; then
   wait_for "consumer /actuator/health UP" consumer_up
 else
   if consumer_running; then
-    pass "consumer container running (strict health check off until R1)"
+    pass "consumer container running (strict health check explicitly disabled)"
   else
     fail "consumer container running"
   fi

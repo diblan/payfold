@@ -31,7 +31,7 @@ Ordering principle: *repair the feedback loop → correctness → resilience →
 Dependencies: R1, R2 → R3 → R4–R8; R4 → R5; R10 → R11, R12.
 
 <a id="r1"></a>
-### [ ] R1 — Consumer bootstrap hygiene
+### [x] R1 — Consumer bootstrap hygiene
 **Scope:** `payment-service/renewal-consumer/pom.xml` only.
 Add `spring-boot-starter-actuator`; replace `spring-boot-starter-webflux` with
 `spring-boot-starter-web`; remove the duplicate `spring-boot-autoconfigure` and the

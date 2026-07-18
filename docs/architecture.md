@@ -146,14 +146,13 @@ Compose quirks (fixed by [R2](roadmap.md#r2)): the producer's app-specific env v
 **dotted** names (`RABBITMQ.EXCHANGE`, `APP.TIMEZONE`) — non-standard for shell env and
 only accidentally harmless because the yaml defaults equal the `.env` values. The
 consumer correctly uses underscores. The consumer's compose healthcheck hits
-`/actuator/health`, but the consumer has no actuator dependency, so it is perpetually
-unhealthy ([R1](roadmap.md#r1)).
+`/actuator/health`, served by actuator since [R1](roadmap.md#r1).
 
 ## Ports & endpoints
 
 | Where | What |
 |---|---|
 | `localhost:8080` | producer — `/actuator/health`, `POST /actuator/renewal-job?force=true` |
-| `localhost:8081` | consumer — nothing yet (no actuator, [R1](roadmap.md#r1)); container-internal 8080 |
+| `localhost:8081` | consumer — `/actuator/health` (since [R1](roadmap.md#r1)); container-internal 8080 |
 | `localhost:5672` / `15672` | RabbitMQ AMQP / management UI (creds from `.env`) |
 | `localhost:5432` | Postgres (creds from `.env`) |
