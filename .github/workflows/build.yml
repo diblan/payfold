@@ -1,0 +1,22 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - name: Build renewal-producer
+        run: mvn -B -ntp package -f billing-engine/renewal-producer/pom.xml
+      - name: Build renewal-consumer
+        run: mvn -B -ntp package -f payment-service/renewal-consumer/pom.xml

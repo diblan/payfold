@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# End-to-end verification for the Payfold stack. Exit 0 = the system works.
+#
+# This script is the machine-checkable definition of "working" (see AGENTS.md and
+# docs/invariants.md G7): it may only ever be made stricter, never loosened.
+#
+# Usage:
+#   scripts/verify.sh [--no-up] [--timeout SECONDS]
+#
+#   --no-up        skip `docker compose up -d --build` (stack already running)
+#   --timeout N    max seconds to wait for each long condition (default 600)
+#
+# Environment:
+#   VERIFY_STRICT_CONSUMER_HEALTH=1   require the consumer's /actuator/health to be UP.
+#     Default 0 until roadmap item R1 lands (the consumer has no actuator dependency
+#     yet); R1 flips the default to 1 — a tightening, per G7.
+#
+# Requires: docker compose v2, curl. psql runs inside the postgres container.
+# Safe to re-run against a dirty database: all assertions are absolute conditions
+# ("every due renewal is billed"), not count deltas.
+
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+TIMEOUT=600
+NO_UP=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-up) NO_UP=1; shift ;;
+    --timeout) TIMEOUT="${2:?--timeout needs a value}"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+STRICT_CONSUMER="${VERIFY_STRICT_CONSUMER_HEALTH:-0}"
+
+# .env cannot be `source`d (values contain unquoted spaces/#); grep the keys we need.
+env_val() {
+  local v=""
+  if [[ -f .env ]]; then
+    v="$(grep -E "^$1=" .env | head -1 | cut -d= -f2- | sed 's/[[:space:]]*$//')"
+  fi
+  printf '%s' "${v:-$2}"
+}
+
+PGUSER="$(env_val POSTGRES_USER admin)"
+PGDB="$(env_val POSTGRES_DB payfold)"
+PRODUCER_PORT="$(env_val PRODUCER_HTTP_PORT 8080)"
+CONSUMER_PORT="$(env_val CONSUMER_HTTP_PORT 8081)"
+RMQ_USER="$(env_val RABBITMQ_USER guest)"
+RMQ_PASS="$(env_val RABBITMQ_PASSWORD guest)"
+RMQ_MGMT_PORT="$(env_val RABBITMQ_MGMT_PORT 15672)"
+RMQ_QUEUE="$(env_val RABBITMQ_QUEUE billing.renewals.main)"
+RMQ_DLQ="billing.renewals.dlq"
+
+RESULTS=()
+FAIL_COUNT=0
+pass() { RESULTS+=("PASS  $1"); echo "[verify] PASS  $1"; }
+fail() { RESULTS+=("FAIL  $1${2:+ — $2}"); echo "[verify] FAIL  $1${2:+ — $2}" >&2; ((FAIL_COUNT++)); }
+warn() { RESULTS+=("WARN  $1${2:+ — $2}"); echo "[verify] WARN  $1${2:+ — $2}"; }
+note() { echo "[verify] $*"; }
+
+q() { docker compose exec -T postgres psql -U "$PGUSER" -d "$PGDB" -Atc "$1" 2>/dev/null; }
+
+# wait_for <description> <function> — polls every 2s up to $TIMEOUT
+wait_for() {
+  local desc="$1" cond="$2" start=$SECONDS
+  while (( SECONDS - start < TIMEOUT )); do
+    if "$cond"; then pass "$desc"; return 0; fi
+    sleep 2
+  done
+  fail "$desc" "timed out after ${TIMEOUT}s"
+  return 1
+}
+
+summary() {
+  echo
+  echo "================ verify.sh summary ================"
+  printf '%s\n' "${RESULTS[@]}"
+  echo "==================================================="
+  if (( FAIL_COUNT > 0 )); then
+    echo "RESULT: FAIL (${FAIL_COUNT} failed)"
+    exit 1
+  fi
+  echo "RESULT: PASS"
+  exit 0
+}
+
+# --- conditions -------------------------------------------------------------
+
+pg_ready()   { [[ "$(q 'SELECT 1')" == "1" ]]; }
+seeded()     { [[ "$(q 'SELECT count(*) FROM customer')" -gt 0 && "$(q 'SELECT count(*) FROM subscription')" -gt 0 ]] 2>/dev/null; }
+producer_up() { curl -fsS "http://localhost:${PRODUCER_PORT}/actuator/health" 2>/dev/null | grep -q '"status":"UP"'; }
+consumer_up() { curl -fsS "http://localhost:${CONSUMER_PORT}/actuator/health" 2>/dev/null | grep -q '"status":"UP"'; }
+consumer_running() { docker compose ps --status running --services 2>/dev/null | grep -qx renewal-consumer; }
+
+outbox_drained() { [[ "$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NULL')" == "0" ]]; }
+
+# A today-due outbox row counts as billed when a succeeded payment exists under the
+# idempotency key the consumer derives for it today ("sub-<id>|<yyyy-mm-dd>").
+UNBILLED_SQL="SELECT count(*) FROM renewal_outbox o
+WHERE o.due_date = current_date
+  AND NOT EXISTS (
+    SELECT 1 FROM payment p
+    WHERE p.status = 'succeeded'
+      AND p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
+  )"
+all_billed() { [[ "$(q "$UNBILLED_SQL")" == "0" ]]; }
+
+queue_depth() { # queue name -> message count, or "unreachable"
+  local body
+  body="$(curl -fsS -u "${RMQ_USER}:${RMQ_PASS}" \
+    "http://localhost:${RMQ_MGMT_PORT}/api/queues/%2F/$1" 2>/dev/null)" || { echo unreachable; return; }
+  echo "$body" | grep -o '"messages":[0-9]*' | head -1 | cut -d: -f2
+}
+main_queue_empty() { [[ "$(queue_depth "$RMQ_QUEUE")" == "0" ]]; }
+
+trigger_job() { # -> echoes HTTP status code ("000" on timeout/conn error)
+  curl -sS -o /dev/null -w '%{http_code}' --max-time 240 \
+    -X POST "http://localhost:${PRODUCER_PORT}/actuator/renewal-job?force=true" \
+    -H 'Content-Type: application/vnd.spring-boot.actuator.v3+json' \
+    -H 'Accept: application/json' -d '{}' 2>/dev/null
+}
+
+# --- run --------------------------------------------------------------------
+
+if (( ! NO_UP )); then
+  note "starting stack (docker compose up -d --build)…"
+  if docker compose up -d --build; then
+    pass "stack started"
+  else
+    fail "stack started" "docker compose up failed"
+    summary
+  fi
+fi
+
+wait_for "postgres reachable"        pg_ready      || summary
+wait_for "seed data present"         seeded        || summary
+wait_for "producer /actuator/health UP" producer_up || summary
+
+if [[ "$STRICT_CONSUMER" == "1" ]]; then
+  wait_for "consumer /actuator/health UP" consumer_up
+else
+  if consumer_running; then
+    pass "consumer container running (strict health check off until R1)"
+  else
+    fail "consumer container running"
+  fi
+fi
+
+note "triggering renewal job (synchronous endpoint — may take a while)…"
+HTTP_CODE="$(trigger_job)"
+if [[ "$HTTP_CODE" == "200" ]]; then
+  pass "renewal job trigger returned 200"
+elif [[ "$HTTP_CODE" == "000" ]]; then
+  warn "renewal job trigger" "no response within 240s (endpoint blocks until job completes — R10); relying on DB polling"
+else
+  fail "renewal job trigger" "HTTP ${HTTP_CODE}"
+fi
+
+N_DUE="$(q 'SELECT count(*) FROM renewal_outbox WHERE due_date = current_date')"
+if [[ -n "$N_DUE" && "$N_DUE" -gt 0 ]]; then
+  pass "outbox contains renewals due today (${N_DUE})"
+else
+  fail "outbox contains renewals due today" "count=${N_DUE:-error}"
+fi
+
+wait_for "outbox fully published"                outbox_drained
+wait_for "every due renewal billed (succeeded payment per outbox row)" all_billed
+
+PENDING="$(q "SELECT count(*) FROM payment WHERE status = 'pending'")"
+if [[ "$PENDING" == "0" ]]; then
+  pass "no stuck pending payments"
+else
+  fail "no stuck pending payments" "count=${PENDING:-error}"
+fi
+
+MAIN_DEPTH="$(queue_depth "$RMQ_QUEUE")"
+if [[ "$MAIN_DEPTH" == "unreachable" ]]; then
+  warn "queue depths" "RabbitMQ management API unreachable on :${RMQ_MGMT_PORT}; skipping"
+else
+  if wait_for "main queue drained" main_queue_empty; then :; fi
+  DLQ_DEPTH="$(queue_depth "$RMQ_DLQ")"
+  if [[ "$DLQ_DEPTH" == "0" ]]; then
+    pass "DLQ empty"
+  else
+    fail "DLQ empty" "depth=${DLQ_DEPTH}"
+  fi
+fi
+
+note "same-day idempotency probe: re-triggering job, expecting zero new records…"
+SNAP_SQL="SELECT (SELECT count(*) FROM renewal_outbox) || '|' || (SELECT count(*) FROM payment) || '|' || (SELECT count(*) FROM charge) || '|' || (SELECT count(*) FROM invoice)"
+SNAP_BEFORE="$(q "$SNAP_SQL")"
+HTTP_CODE="$(trigger_job)"
+if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "000" ]]; then
+  fail "idempotency probe re-trigger" "HTTP ${HTTP_CODE}"
+fi
+sleep 5   # allow any (unexpected) messages to flow through
+SNAP_AFTER="$(q "$SNAP_SQL")"
+if [[ -n "$SNAP_BEFORE" && "$SNAP_BEFORE" == "$SNAP_AFTER" ]]; then
+  pass "same-day idempotency: outbox/payment/charge/invoice counts unchanged (${SNAP_AFTER})"
+else
+  fail "same-day idempotency" "before=${SNAP_BEFORE} after=${SNAP_AFTER}"
+fi
+
+summary

@@ -5,6 +5,15 @@ and payment service. The services run together via Docker Compose, seeded with
 PostgreSQL data and wired to RabbitMQ so you can execute the renewal workflow
 on-demand.
 
+## For agents & contributors
+
+This project is developed primarily with AI agents under a harness-engineering
+workflow. Start with [AGENTS.md](AGENTS.md) — it maps the repo, the golden rules,
+and the one-item-per-session protocol. The system docs live in [docs/](docs/)
+(architecture, invariants, decisions, quality grades, roadmap), and
+`scripts/verify.sh` is the one-command end-to-end check that defines "working".
+This README stays a quickstart; everything deeper belongs in `docs/`.
+
 ## Prerequisites
 
 - [Docker Desktop](https://docs.docker.com/get-docker/) or a Docker Engine that

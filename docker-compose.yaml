@@ -68,7 +68,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - ./seed-data-gen:/app:ro
-    entrypoint: [ "bash","-lc","chmod +x ./run-seeder.sh && ./run-seeder.sh" ]
+    # invoked via bash: the /app mount is read-only, so chmod +x would fail (EROFS)
+    entrypoint: [ "bash","./run-seeder.sh" ]
     depends_on:
       postgres:
         condition: service_healthy

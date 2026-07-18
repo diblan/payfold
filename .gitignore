@@ -45,4 +45,7 @@ build/
 *.pem
 *.crt
 
+### Private notes (source articles, scratch) — never commit ###
+/notes/
+
 *.zip
