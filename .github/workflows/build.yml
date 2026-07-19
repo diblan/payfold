@@ -16,7 +16,9 @@ jobs:
           distribution: temurin
           java-version: "17"
           cache: maven
-      - name: Build renewal-producer
-        run: mvn -B -ntp package -f billing-engine/renewal-producer/pom.xml
-      - name: Build renewal-consumer
-        run: mvn -B -ntp package -f payment-service/renewal-consumer/pom.xml
+      - name: Verify renewal-producer
+        working-directory: billing-engine/renewal-producer
+        run: ./mvnw -B -ntp verify
+      - name: Verify renewal-consumer
+        working-directory: payment-service/renewal-consumer
+        run: ./mvnw -B -ntp verify

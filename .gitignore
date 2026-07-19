@@ -49,3 +49,7 @@ build/
 /notes/
 
 *.zip
+
+# Maven wrapper jar is downloaded on first ./mvnw run (see .mvn/wrapper/maven-wrapper.properties)
+.mvn/wrapper/maven-wrapper.jar
+**/.mvn/wrapper/maven-wrapper.jar

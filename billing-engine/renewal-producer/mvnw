@@ -1,0 +1,101 @@
+#!/bin/sh
+# ----------------------------------------------------------------------------
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+# ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# Apache Maven Wrapper startup script, version 3.3.3
+#
+# Optional environment variables:
+#   JAVA_HOME       location of a JDK
+#   MAVEN_OPTS      options passed to the JVM
+#   MAVEN_DEBUG_OPTS additional debug options passed to the JVM
+#   MVNW_USERNAME   username used when downloading the wrapper JAR
+#   MVNW_PASSWORD   password used when downloading the wrapper JAR
+#   MVNW_VERBOSE    set to "true" or "debug" for download diagnostics
+# ----------------------------------------------------------------------------
+
+set -euf
+
+[ "${MVNW_VERBOSE-}" != debug ] || set -x
+
+MAVEN_PROJECTBASEDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+WRAPPER_PROPERTIES="$MAVEN_PROJECTBASEDIR/.mvn/wrapper/maven-wrapper.properties"
+WRAPPER_JAR="$MAVEN_PROJECTBASEDIR/.mvn/wrapper/maven-wrapper.jar"
+
+if [ -n "${JAVA_HOME-}" ]; then
+  if [ -x "$JAVA_HOME/jre/sh/java" ]; then
+    JAVACMD="$JAVA_HOME/jre/sh/java"
+  else
+    JAVACMD="$JAVA_HOME/bin/java"
+  fi
+else
+  JAVACMD=$(command -v java 2>/dev/null || true)
+fi
+
+if [ ! -x "${JAVACMD-}" ]; then
+  echo "The JAVA_HOME environment variable is not defined correctly, and no java command could be found." >&2
+  exit 1
+fi
+
+if [ ! -r "$WRAPPER_JAR" ]; then
+  wrapperUrl=$(sed -n 's/^wrapperUrl=//p' "$WRAPPER_PROPERTIES" | tail -n 1)
+  if [ -z "$wrapperUrl" ]; then
+    wrapperVersion=$(sed -n 's/^wrapperVersion=//p' "$WRAPPER_PROPERTIES" | tail -n 1)
+    wrapperUrl="https://repo.maven.apache.org/maven2/org/apache/maven/wrapper/maven-wrapper/$wrapperVersion/maven-wrapper-$wrapperVersion.jar"
+  fi
+
+  case "$wrapperUrl" in
+    https://*) ;;
+    *)
+      echo "Error: wrapperUrl must use HTTPS, but was '$wrapperUrl'." >&2
+      exit 1
+      ;;
+  esac
+
+  [ "${MVNW_VERBOSE-}" != true ] || echo "Downloading Maven Wrapper JAR from $wrapperUrl"
+  tmpJar="$WRAPPER_JAR.tmp.$$"
+  trap 'rm -f "$tmpJar"' EXIT HUP INT TERM
+
+  if command -v wget >/dev/null 2>&1; then
+    if [ -n "${MVNW_USERNAME-}" ] && [ -n "${MVNW_PASSWORD-}" ]; then
+      wget --user="$MVNW_USERNAME" --password="$MVNW_PASSWORD" "$wrapperUrl" -O "$tmpJar"
+    else
+      wget "$wrapperUrl" -O "$tmpJar"
+    fi
+  elif command -v curl >/dev/null 2>&1; then
+    if [ -n "${MVNW_USERNAME-}" ] && [ -n "${MVNW_PASSWORD-}" ]; then
+      curl -fsSL --user "$MVNW_USERNAME:$MVNW_PASSWORD" "$wrapperUrl" -o "$tmpJar"
+    else
+      curl -fsSL "$wrapperUrl" -o "$tmpJar"
+    fi
+  else
+    echo "Error: neither wget nor curl is available to download the Maven Wrapper JAR." >&2
+    exit 1
+  fi
+
+  mv "$tmpJar" "$WRAPPER_JAR"
+  trap - EXIT HUP INT TERM
+fi
+
+exec "$JAVACMD" \
+  ${MAVEN_OPTS-} \
+  ${MAVEN_DEBUG_OPTS-} \
+  -classpath "$WRAPPER_JAR" \
+  "-Dmaven.multiModuleProjectDirectory=$MAVEN_PROJECTBASEDIR" \
+  org.apache.maven.wrapper.MavenWrapperMain "$@"

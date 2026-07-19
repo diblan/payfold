@@ -54,7 +54,7 @@ RabbitMQ data volume is hardcoded to host path `/payfold/rabbitmq`.
 verify.sh green.
 
 <a id="r3"></a>
-### [ ] R3 — Test infrastructure + CI upgrade
+### [x] R3 — Test infrastructure + CI upgrade
 **Scope:** both modules + `.github/workflows/build.yml`.
 Add Maven wrapper; `spring-boot-starter-test` + Testcontainers (postgres, rabbitmq);
 one context-load/smoke test per service (consumer's exercises listener wiring against
@@ -150,3 +150,15 @@ Dead code/config sweep; doc-drift check of [architecture.md](architecture.md) ag
 the code; full re-grade of [quality.md](quality.md); prune stale roadmap notes.
 **Done when:** the checklist above is completed and quality.md's re-grade date is
 updated. **No behavior changes allowed** in this session type.
+
+<a id="r14"></a>
+### [ ] R14 — Migrate to Testcontainers 2.x
+**Scope:** both module poms + test imports.
+Docker Engine 29 (min API 1.44) rejects the API-1.32 fallback in Testcontainers
+1.21.x's shaded docker-java; tests pass locally only via a machine-local
+`~/.docker-java.properties` pin (`api.version=1.44`, noticed during [R3](#r3)). CI
+runners will hit the same wall when they adopt Engine 29. Testcontainers 2.x renames
+artifacts (`testcontainers-postgresql`, `-rabbitmq`, `-junit-jupiter`) and needs a
+Spring Boot version with Testcontainers 2 support.
+**Done when:** both suites are green on Testcontainers 2.x with the
+`~/.docker-java.properties` pin deleted.
