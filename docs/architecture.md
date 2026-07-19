@@ -128,25 +128,25 @@ Unpublished = `published_at IS NULL`.
 
 ## Configuration truth table
 
-Every key's real consumer. "DEAD" keys are deleted by [R2](roadmap.md#r2); keep this
-table at all-alive after that.
+Every remaining `application.yaml` key has a real consumer.
 
 | Key (application.yaml) | Consumed by | Status |
 |---|---|---|
+| `spring.application.name` (both) | Spring Boot application identity | alive |
 | `spring.datasource.*` | Spring Boot autoconfig (overridden by compose `SPRING_DATASOURCE_*`) | alive (placeholder values in yaml) |
+| `spring.jackson.time-zone` (both) | Spring Boot Jackson autoconfig | alive |
 | `spring.batch.jdbc.initialize-schema` (producer) | Spring Batch | alive |
 | `app.timezone`, `app.scheduleCron`, `app.publishPageSize` (producer) | `RenewalScheduler`, `RenewalJobConfig` | alive |
 | `rabbitmq.exchange`, `rabbitmq.routingKey` (producer) | `RabbitConfig`, `OutboxPublisher` | alive |
-| `rabbitmq.host/port/username/password` (both) | **nothing** — broker connection comes from `spring.rabbitmq.*` compose env only | DEAD → R2 |
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |
-| `payment.provider.baseUrl/timeoutMillis` (consumer) | **nothing** — revived by [R8](roadmap.md#r8) | DEAD → R2 |
-| `management.endpoints.*` (producer) | actuator exposure incl. `renewal-job` | alive |
+| `management.endpoints.web.exposure.include` (producer) | actuator exposure incl. `renewal-job` | alive |
+| `management.endpoint.health.show-details` (producer) | actuator health response detail policy | alive |
 
-Compose quirks (fixed by [R2](roadmap.md#r2)): the producer's app-specific env vars use
-**dotted** names (`RABBITMQ.EXCHANGE`, `APP.TIMEZONE`) — non-standard for shell env and
-only accidentally harmless because the yaml defaults equal the `.env` values. The
-consumer correctly uses underscores. The consumer's compose healthcheck hits
-`/actuator/health`, served by actuator since [R1](roadmap.md#r1).
+[R2](roadmap.md#r2) replaced the producer's dotted app-specific environment names with
+Spring relaxed-binding underscore names and added named-volume defaults for Postgres
+and RabbitMQ; local `.env` values can still select bind-mount paths. The consumer's
+compose healthcheck hits `/actuator/health`, served by actuator since
+[R1](roadmap.md#r1).
 
 ## Ports & endpoints
 

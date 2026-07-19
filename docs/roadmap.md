@@ -41,7 +41,7 @@ build; the strict-consumer-health default in `scripts/verify.sh` is flipped ON
 (a tightening, per [G7](invariants.md#g7)).
 
 <a id="r2"></a>
-### [ ] R2 — Config truthfulness
+### [x] R2 — Config truthfulness
 **Scope:** `docker-compose.yaml`, `.env.example`, both `application.yaml`s.
 Producer env: dotted names (`RABBITMQ.EXCHANGE`, `APP.TIMEZONE`, …) → underscore
 relaxed-binding names. Delete dead keys: `rabbitmq.host/port/username/password` (both

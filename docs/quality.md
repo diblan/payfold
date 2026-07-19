@@ -18,11 +18,11 @@ Last full re-grade: **2026-07-18** (harness adoption).
 
 | Module | Grade | Why | Tracked by |
 |---|---|---|---|
-| `billing-engine/renewal-producer` | **C** | Outbox scan/publish works and is same-day idempotent; but no publisher confirms, no `SKIP LOCKED`, single-tx scan won't survive 10M rows, progress via `System.out` | [R6](roadmap.md#r6), [R7](roadmap.md#r7), [R9](roadmap.md#r9), [R10](roadmap.md#r10), [R11](roadmap.md#r11) |
-| `payment-service/renewal-consumer` | **D** | Billing chain works same-day; pom is clean and actuator health passes since R1 (2026-07-18). Still D per rubric: DLQ is an unreachable safety net, PSP config is dead, and cross-midnight redelivery duplicates records | [R2](roadmap.md#r2), [R4](roadmap.md#r4), [R5](roadmap.md#r5), [R8](roadmap.md#r8) |
+| `billing-engine/renewal-producer` | **C** | Outbox scan/publish works, its config is truthful, and same-day retries are idempotent; no publisher confirms or `SKIP LOCKED`, the single-tx scan won't survive 10M rows, and progress uses `System.out` | [R6](roadmap.md#r6), [R7](roadmap.md#r7), [R9](roadmap.md#r9), [R10](roadmap.md#r10), [R11](roadmap.md#r11) |
+| `payment-service/renewal-consumer` | **D** | Billing chain works same-day, config is truthful, and actuator health passes. Still D per rubric: the DLQ is unreachable and cross-midnight redelivery duplicates records | [R4](roadmap.md#r4), [R5](roadmap.md#r5), [R8](roadmap.md#r8) |
 | `db-migrations` | **B** | Clean, ordered, sole schema authority; V1 carries aspirational tables (`bank_tx`, `recon_match`, `ledger_entry`) no code uses — harmless but reviewer-confusing | — |
 | `seed-data-gen` | **C** | Seeds 15k due-today customers idempotently; `SubscriptionSeeder.java` is dead code, seed size hardcoded, `.bat`/`.sh` drift | [R12](roadmap.md#r12) |
-| `docker-compose.yaml` + config | **C** | Stack boots and orders dependencies correctly; all healthchecks pass since R1 (2026-07-18). Remaining: dotted env names bind only by accident, dead yaml keys, RabbitMQ volume hardcoded to `/payfold/rabbitmq`, and `.env.example`'s `POSTGRES_VOLUME=pg_data` refers to an undeclared named volume — the documented first-time `docker compose up` fails until the value is changed to a path | [R2](roadmap.md#r2) |
+| `docker-compose.yaml` + config | **B** | Stack ordering and healthchecks pass; app-specific env names use relaxed binding, yaml contains only consumed keys, and declared named-volume defaults preserve path overrides | — |
 | `docs/` + harness | **B** | Fresh and complete as of adoption; verify.sh covers the happy path + same-day idempotency only — poison/failure probes arrive with [R5](roadmap.md#r5)/[R8](roadmap.md#r8) | [R3](roadmap.md#r3) |
 
 ## Test coverage
