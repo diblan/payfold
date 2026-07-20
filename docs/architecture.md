@@ -16,7 +16,7 @@ Honesty table:
 |---|---|
 | Transactional outbox (atomic scan + publish intent) | Demonstrated |
 | Idempotent redelivery handling | Demonstrated — payload-keyed; covered by a cross-midnight integration test, see [G2](invariants.md#g2) |
-| Bounded failure handling (DLQ) | Declared, not reachable — see [G5](invariants.md#g5) → [R5](roadmap.md#r5) |
+| Bounded failure handling (DLQ) | Demonstrated — bounded listener retry + DLQ routing; poison-path integration test and `verify.sh` probe; see [G5](invariants.md#g5) |
 | Throughput at 330k/day | Extrapolated — demo seeds 15k; measured run is [R12](roadmap.md#r12) |
 | Horizontal producer scaling | Not yet — no `SKIP LOCKED`, see [R7](roadmap.md#r7) |
 
@@ -48,8 +48,7 @@ Honesty table:
                  │                      │                 │
                  │ DLX billing.renewals │                 │
                  │ .dlx ─▶ DLQ (rk dlq) │                 │
-                 │ [declared, currently │                 │
-                 │  UNREACHABLE → R5]   │                 │
+                 │ [reachable since R5] │                 │
                  └──────────┬───────────┘                 │
                             ▼                             ▼
                  ┌──────────────────────┐   invoice / charge /
@@ -104,14 +103,17 @@ unique constraint (this *is* the idempotency mechanism, [D2](decisions.md#d2)):
 | `finalizeBilling` | `charge`, `invoice`, `subscription` | sets settled/paid, advances `renewed_at` to `period_end` at 09:00 |
 
 The consumer uses validated payload values only and has no clock-derived fallbacks.
-Missing or invalid required fields throw `InvalidRenewalMessageException`. Today that
-exception still requeues forever; [R5](roadmap.md#r5) adds bounded retry and DLQ routing.
+Missing or invalid required fields throw `InvalidRenewalMessageException`; deterministic
+contract violations skip retry and dead-letter immediately.
 
-**Topology** (`RabbitTopology`): main queue has `x-dead-letter-exchange:
-billing.renewals.dlx`, but **no `x-dead-letter-routing-key`** — dead letters would keep
-rk `renewal.requested` while the DLQ is bound with rk `dlq`, so they'd be *dropped*.
-Moreover there is no `spring.rabbitmq.listener` retry config, so failed messages requeue
-forever and never dead-letter at all. Both halves are [R5](roadmap.md#r5).
+**Topology** (`RabbitTopology`): the main queue has `x-dead-letter-exchange:
+billing.renewals.dlx` and `x-dead-letter-routing-key: dlq`, matching the DLQ binding.
+The listener makes at most five attempts with exponential backoff from 1s to a 10s cap
+at a 2.0 multiplier, then `default-requeue-rejected: false` lets RabbitMQ dead-letter
+the rejected message. `InvalidRenewalMessageException` is non-retryable and goes
+straight to the DLQ; other failures use the bounded retry budget. Queue arguments are
+immutable, so brokers carrying the pre-R5 queue must delete it or wipe the RabbitMQ
+volume before redeclaration; [D4](decisions.md#d4) records why the queue name stayed.
 
 ## Message contract — renewal.requested v1
 
@@ -164,6 +166,7 @@ Every remaining `application.yaml` key has a real consumer.
 | `app.timezone`, `app.scheduleCron`, `app.publishPageSize` (producer) | `RenewalScheduler`, `RenewalJobConfig` | alive |
 | `rabbitmq.exchange`, `rabbitmq.routingKey` (producer) | `RabbitConfig`, `OutboxPublisher` | alive |
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |
+| `spring.rabbitmq.listener.simple.*` (consumer) | Spring Boot AMQP autoconfig + `ListenerRetryConfig` (`max-attempts`) | alive |
 | `management.endpoints.web.exposure.include` (producer) | actuator exposure incl. `renewal-job` | alive |
 | `management.endpoint.health.show-details` (producer) | actuator health response detail policy | alive |
 

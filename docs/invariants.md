@@ -55,9 +55,13 @@ No floats, no implicit currency. Every amount column and payload field is
 A message that cannot be processed must land in `billing.renewals.dlq` after a bounded
 number of attempts. Never infinite requeue; never silent drop.
 
-*Status:* **VIOLATED** twice over — no listener retry cap (poison messages requeue
-forever) and the dead-letter routing key mismatch would drop them if they ever were
-dead-lettered. → [R5](roadmap.md#r5)
+*Why:* poison messages must not block the listener forever or disappear outside the
+observable failure path.
+*Enforced by:* a five-attempt retry cap with bounded exponential backoff; DLX + explicit
+`dlq` routing key; `default-requeue-rejected: false`; a no-retry fast path for
+deterministic contract violations; a poison-path integration test; and the strict
+`verify.sh` poison probe.
+*Status:* **HELD** (since R5, 2026-07-20)
 
 <a id="g6"></a>
 ## G6 — Docs change in the same PR as behavior

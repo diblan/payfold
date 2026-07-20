@@ -74,7 +74,7 @@ midnight and finds exactly one invoice/charge/payment; [G2](invariants.md#g2) �
 HELD; decision entry for contract v1; verify.sh same-day probe still green.
 
 <a id="r5"></a>
-### [ ] R5 — Make the DLQ reachable
+### [x] R5 — Make the DLQ reachable
 **Scope:** consumer listener config + `RabbitTopology`.
 `spring.rabbitmq.listener` retry with backoff and a bounded cap;
 `default-requeue-rejected: false` after exhaustion; add

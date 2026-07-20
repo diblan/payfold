@@ -7,6 +7,16 @@ spring:
     password: yourpassword
   jackson:
     time-zone: Europe/Brussels
+  rabbitmq:
+    listener:
+      simple:
+        default-requeue-rejected: false
+        retry:
+          enabled: true
+          max-attempts: 5
+          initial-interval: 1s
+          multiplier: 2.0
+          max-interval: 10s
 
 rabbitmq:
   exchange: billing.renewals

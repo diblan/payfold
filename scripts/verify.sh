@@ -5,15 +5,19 @@
 # docs/invariants.md G7): it may only ever be made stricter, never loosened.
 #
 # Usage:
-#   scripts/verify.sh [--no-up] [--timeout SECONDS]
+#   scripts/verify.sh [--no-up] [--timeout SECONDS] [--poison|--no-poison]
 #
 #   --no-up        skip `docker compose up -d --build` (stack already running)
 #   --timeout N    max seconds to wait for each long condition (default 600)
+#   --poison       run the poison-message DLQ probe (default since R5)
+#   --no-poison    skip the poison probe only when debugging a known-broken stack
 #
 # Environment:
 #   VERIFY_STRICT_CONSUMER_HEALTH=1   require the consumer's /actuator/health to be UP.
 #     Default 1 since roadmap item R1 (consumer ships actuator) — a tightening, per
 #     G7. Set 0 only to debug a stack whose consumer is known-broken.
+#   The R5 poison probe is also strict by default: management API failures fail
+#   verification, and poison must reach the DLQ within its independent 60s cap.
 #
 # Requires: docker compose v2, curl. psql runs inside the postgres container.
 # Safe to re-run against a dirty database: all assertions are absolute conditions
@@ -26,10 +30,13 @@ cd "$ROOT"
 
 TIMEOUT=600
 NO_UP=0
+POISON=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-up) NO_UP=1; shift ;;
     --timeout) TIMEOUT="${2:?--timeout needs a value}"; shift 2 ;;
+    --poison) POISON=1; shift ;;
+    --no-poison) POISON=0; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -53,6 +60,8 @@ RMQ_USER="$(env_val RABBITMQ_USER guest)"
 RMQ_PASS="$(env_val RABBITMQ_PASSWORD guest)"
 RMQ_MGMT_PORT="$(env_val RABBITMQ_MGMT_PORT 15672)"
 RMQ_QUEUE="$(env_val RABBITMQ_QUEUE billing.renewals.main)"
+RMQ_EXCHANGE="$(env_val RABBITMQ_EXCHANGE billing.renewals)"
+RMQ_RK="$(env_val RABBITMQ_ROUTINGKEY renewal.requested)"
 RMQ_DLQ="billing.renewals.dlq"
 
 RESULTS=()
@@ -203,6 +212,76 @@ if [[ -n "$SNAP_BEFORE" && "$SNAP_BEFORE" == "$SNAP_AFTER" ]]; then
   pass "same-day idempotency: outbox/payment/charge/invoice counts unchanged (${SNAP_AFTER})"
 else
   fail "same-day idempotency" "before=${SNAP_BEFORE} after=${SNAP_AFTER}"
+fi
+
+if (( POISON )); then
+  note "poison-message probe: publishing malformed payload and expecting bounded dead-lettering…"
+  POISON_MARKER="payfold-poison-probe-$(date +%s)-$$"
+  if ! PUBLISH_RESPONSE="$(curl -fsS -u "${RMQ_USER}:${RMQ_PASS}" \
+    -X POST "http://localhost:${RMQ_MGMT_PORT}/api/exchanges/%2F/${RMQ_EXCHANGE}/publish" \
+    -H 'Content-Type: application/json' \
+    -d "{\"properties\":{},\"routing_key\":\"${RMQ_RK}\",\"payload\":\"${POISON_MARKER}\",\"payload_encoding\":\"string\"}" \
+    2>/dev/null)"; then
+    fail "poison message published" "RabbitMQ management API unreachable on :${RMQ_MGMT_PORT}"
+    summary
+  elif echo "$PUBLISH_RESPONSE" | grep -q '"routed":true'; then
+    pass "poison message published and routed"
+  else
+    fail "poison message published and routed" "response=${PUBLISH_RESPONSE:-empty}"
+    summary
+  fi
+
+  POISON_DLQ_READY=0
+  POISON_WAIT_START=$SECONDS
+  while (( SECONDS - POISON_WAIT_START < 60 )); do
+    if [[ "$(queue_depth "$RMQ_DLQ")" == "1" ]]; then
+      POISON_DLQ_READY=1
+      break
+    fi
+    sleep 2
+  done
+  if (( POISON_DLQ_READY )); then
+    pass "poison message reached DLQ within 60s"
+  else
+    fail "poison message reached DLQ within 60s" \
+      "if the broker carries pre-R5 queue args, wipe the RabbitMQ volume (docker compose down -v) so the queue is redeclared"
+  fi
+
+  MAIN_DEPTH="$(queue_depth "$RMQ_QUEUE")"
+  if [[ "$MAIN_DEPTH" == "0" ]]; then
+    pass "main queue empty after poison message"
+  else
+    fail "main queue empty after poison message" "depth=${MAIN_DEPTH}"
+  fi
+
+  if ! DRAIN_RESPONSE="$(curl -fsS -u "${RMQ_USER}:${RMQ_PASS}" \
+    -X POST "http://localhost:${RMQ_MGMT_PORT}/api/queues/%2F/${RMQ_DLQ}/get" \
+    -H 'Content-Type: application/json' \
+    -d '{"count":5,"ackmode":"ack_requeue_false","encoding":"auto"}' \
+    2>/dev/null)"; then
+    fail "poison message drained from DLQ" "RabbitMQ management API unreachable on :${RMQ_MGMT_PORT}"
+  elif echo "$DRAIN_RESPONSE" | grep -Fq "$POISON_MARKER"; then
+    pass "poison message drained from DLQ"
+  else
+    fail "poison message drained from DLQ" "marker not found in response"
+  fi
+
+  # The management API's message counter refreshes on a ~5s stats interval; poll
+  # briefly instead of trusting the first read after the drain.
+  POISON_DLQ_EMPTY=0
+  POISON_EMPTY_START=$SECONDS
+  while (( SECONDS - POISON_EMPTY_START < 30 )); do
+    if [[ "$(queue_depth "$RMQ_DLQ")" == "0" ]]; then
+      POISON_DLQ_EMPTY=1
+      break
+    fi
+    sleep 2
+  done
+  if (( POISON_DLQ_EMPTY )); then
+    pass "DLQ empty after poison probe"
+  else
+    fail "DLQ empty after poison probe" "depth=$(queue_depth "$RMQ_DLQ")"
+  fi
 fi
 
 summary

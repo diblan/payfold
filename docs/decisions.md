@@ -41,10 +41,14 @@ boot. See [G3](invariants.md#g3).
 `billing.renewals` (direct) routes `renewal.requested` to `billing.renewals.main`;
 a DLX (`billing.renewals.dlx`) and DLQ (`billing.renewals.dlq`, bound with rk `dlq`)
 exist for failures. The consumer declares the full topology; the producer only the exchange.
-**Known defects, kept visible on purpose:** the main queue sets no
-`x-dead-letter-routing-key`, so dead letters would keep rk `renewal.requested` and be
-dropped by the DLX; and no listener retry cap exists, so nothing dead-letters in the
-first place. Both are [R5](roadmap.md#r5) / [G5](invariants.md#g5).
+The known defects were fixed by [R5](roadmap.md#r5) on 2026-07-20: the main queue now
+sets `x-dead-letter-routing-key: dlq`, and listener failures have a bounded retry cap.
+RabbitMQ queue arguments are immutable, so brokers carrying the pre-R5 queue must
+delete it or wipe the RabbitMQ volume before the consumer can redeclare it. The queue
+kept its name: a v2 name would leave the old queue bound to `renewal.requested` on
+stale brokers, silently duplicating every message into it forever; the same-name
+argument change instead makes the strict poison probe fail loudly, preserving
+[G5](invariants.md#g5).
 
 ## D5 — Fake PSP first — pre-2026-07 — active
 <a id="d5"></a>

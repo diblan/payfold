@@ -15,7 +15,10 @@ public class RabbitTopology {
 
     @Bean
     public Queue mainQueue(@Value("${rabbitmq.queue}") String q) {
-        return QueueBuilder.durable(q).withArgument("x-dead-letter-exchange", "billing.renewals.dlx").build();
+        return QueueBuilder.durable(q)
+                .withArgument("x-dead-letter-exchange", "billing.renewals.dlx")
+                .withArgument("x-dead-letter-routing-key", "dlq")
+                .build();
     }
 
     @Bean

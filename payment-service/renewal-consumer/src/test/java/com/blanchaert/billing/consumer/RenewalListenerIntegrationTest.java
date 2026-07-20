@@ -6,6 +6,7 @@ import com.blanchaert.billing.consumer.service.InvalidRenewalMessageException;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+import org.springframework.amqp.core.AmqpAdmin;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.core.MessageBuilder;
 import org.springframework.amqp.core.MessageProperties;
@@ -22,12 +23,14 @@ import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -52,6 +55,9 @@ class RenewalListenerIntegrationTest {
 
     @Autowired
     private RabbitTemplate rabbitTemplate;
+
+    @Autowired
+    private AmqpAdmin amqpAdmin;
 
     @Autowired
     private ObjectMapper objectMapper;
@@ -286,6 +292,106 @@ class RenewalListenerIntegrationTest {
         assertThat(invoices).isZero();
         assertThat(charges).isZero();
         assertThat(payments).isZero();
+    }
+
+    @Test
+    void poisonMessagesDeadLetterWhileGoodMessagesFlow() throws JsonProcessingException {
+        byte[] malformedBody = "this is not json".getBytes(StandardCharsets.UTF_8);
+
+        UUID invalidCustomerId = UUID.randomUUID();
+        UUID invalidSubscriptionId = UUID.randomUUID();
+        UUID planId = jdbcTemplate.queryForObject(
+                "SELECT id FROM plan WHERE name = 'Standard'",
+                UUID.class);
+        LocalDate invalidDueDate = LocalDate.of(2026, 9, 1);
+        RenewalRequested invalidRenewal = new RenewalRequested(
+                1,
+                UUID.randomUUID(),
+                invalidSubscriptionId,
+                invalidCustomerId,
+                planId,
+                "month",
+                1499,
+                "EUR",
+                null,
+                invalidDueDate.toString(),
+                invalidDueDate.toString(),
+                invalidDueDate.plusMonths(1).toString(),
+                "2026-09-01T00:00:00.000Z");
+        byte[] invalidBody = objectMapper.writeValueAsBytes(invalidRenewal);
+
+        UUID customerId = UUID.randomUUID();
+        UUID subscriptionId = UUID.randomUUID();
+        LocalDate periodStart = LocalDate.of(2026, 10, 1);
+        LocalDate periodEnd = periodStart.plusMonths(1);
+        String idempotencyKey = "sub-" + subscriptionId + "|" + periodStart;
+
+        jdbcTemplate.update("""
+                INSERT INTO customer (id, email, name, status)
+                VALUES (?, ?, ?, 'active')
+                """, customerId, "poison-test-" + customerId + "@example.com", "Poison Test Customer");
+        jdbcTemplate.update("""
+                INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
+                VALUES (?, ?, ?, 'active', ?)
+                """, subscriptionId, customerId, planId, periodStart.atStartOfDay().atOffset(ZoneOffset.UTC));
+
+        RenewalRequested goodRenewal = new RenewalRequested(
+                1,
+                UUID.randomUUID(),
+                subscriptionId,
+                customerId,
+                planId,
+                "month",
+                1499,
+                "EUR",
+                idempotencyKey,
+                periodStart.toString(),
+                periodStart.toString(),
+                periodEnd.toString(),
+                "2026-10-01T00:00:00.000Z");
+        byte[] goodBody = objectMapper.writeValueAsBytes(goodRenewal);
+
+        rabbitTemplate.convertAndSend(
+                "billing.renewals",
+                "renewal.requested",
+                MessageBuilder.withBody(malformedBody).build());
+        rabbitTemplate.convertAndSend(
+                "billing.renewals",
+                "renewal.requested",
+                MessageBuilder.withBody(invalidBody)
+                        .setContentType(MessageProperties.CONTENT_TYPE_JSON)
+                        .build());
+        rabbitTemplate.convertAndSend(
+                "billing.renewals",
+                "renewal.requested",
+                MessageBuilder.withBody(goodBody)
+                        .setContentType(MessageProperties.CONTENT_TYPE_JSON)
+                        .build());
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            Long succeededPayments = jdbcTemplate.queryForObject("""
+                    SELECT count(*)
+                    FROM payment
+                    WHERE idempotency_key = ? AND status = 'succeeded'
+                    """, Long.class, idempotencyKey);
+            assertThat(succeededPayments).isEqualTo(1L);
+        });
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(amqpAdmin.getQueueInfo("billing.renewals.dlq").getMessageCount()).isEqualTo(2));
+
+        Message firstDeadLetter = rabbitTemplate.receive("billing.renewals.dlq", 5000);
+        Message secondDeadLetter = rabbitTemplate.receive("billing.renewals.dlq", 5000);
+        assertThat(firstDeadLetter).isNotNull();
+        assertThat(secondDeadLetter).isNotNull();
+        assertThat(Set.of(
+                new String(firstDeadLetter.getBody(), StandardCharsets.UTF_8),
+                new String(secondDeadLetter.getBody(), StandardCharsets.UTF_8)))
+                .isEqualTo(Set.of(
+                        new String(malformedBody, StandardCharsets.UTF_8),
+                        new String(invalidBody, StandardCharsets.UTF_8)));
+
+        assertThat(amqpAdmin.getQueueInfo("billing.renewals.main").getMessageCount()).isZero();
     }
 
     private static PostgreSQLContainer<?> postgresWithMigrations() {
