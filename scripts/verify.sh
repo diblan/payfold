@@ -4,7 +4,8 @@
 # This script is the machine-checkable definition of "working" (see AGENTS.md and
 # docs/invariants.md G7): it may only ever be made stricter, never loosened.
 # It includes exact deterministic provider-failure assertions derived from the
-# PSP_FAIL_HEX environment variable.
+# PSP_FAIL_HEX environment variable and same-run Prometheus metric/DB delta
+# cross-checks.
 #
 # Usage:
 #   scripts/verify.sh [--no-up] [--timeout SECONDS] [--poison|--no-poison]
@@ -12,7 +13,7 @@
 #   --no-up        skip `docker compose up -d --build` (stack already running)
 #   --timeout N    max seconds to wait for each long condition (default 600)
 #   --poison       run the poison-message DLQ probe (default since R5)
-#   --no-poison    skip the poison probe only when debugging a known-broken stack
+#   --no-poison    skip poison payload/DLQ checks only; listener metrics stay required
 #
 # Environment:
 #   VERIFY_STRICT_CONSUMER_HEALTH=1   require the consumer's /actuator/health to be UP.
@@ -22,8 +23,9 @@
 #   verification, and poison must reach the DLQ within its independent 60s cap.
 #
 # Requires: docker compose v2, curl. psql runs inside the postgres container.
-# Safe to re-run against a dirty database: all assertions are absolute conditions
-# ("every due renewal is billed"), not count deltas.
+# Safe to re-run against a dirty database: assertions are absolute conditions plus
+# same-run metric deltas whose baselines are snapshotted within this run, so process
+# restarts and persisted database rows do not skew the cross-checks.
 
 set -uo pipefail
 
@@ -130,6 +132,26 @@ queue_depth() { # queue name -> message count, or "unreachable"
     "http://localhost:${RMQ_MGMT_PORT}/api/queues/%2F/$1" 2>/dev/null)" || { echo unreachable; return; }
   echo "$body" | grep -o '"messages":[0-9]*' | head -1 | cut -d: -f2
 }
+
+prom_val() { # port, extended-regex over metric lines -> integer sum | absent | unreachable
+  local body
+  body="$(curl -fsS "http://localhost:$1/actuator/prometheus" 2>/dev/null)" || { echo unreachable; return; }
+  echo "$body" | grep -E "$2" \
+    | awk '{s+=$NF} END { if (NR==0) print "absent"; else printf "%.0f\n", s }'
+}
+
+producer_prometheus_ready() {
+  local inserted published
+  inserted="$(prom_val "$PRODUCER_PORT" '^outbox_inserted_total ')"
+  published="$(prom_val "$PRODUCER_PORT" '^outbox_published_total ')"
+  [[ "$inserted" != "absent" && "$inserted" != "unreachable"
+    && "$published" != "absent" && "$published" != "unreachable" ]]
+}
+consumer_prometheus_ready() {
+  local processed
+  processed="$(prom_val "$CONSUMER_PORT" '^renewals_processed_total\{outcome="(succeeded|failed)"\}')"
+  [[ "$processed" != "absent" && "$processed" != "unreachable" ]]
+}
 main_queue_empty() { [[ "$(queue_depth "$RMQ_QUEUE")" == "0" ]]; }
 
 trigger_job() { # -> echoes HTTP status code ("000" on timeout/conn error)
@@ -165,6 +187,15 @@ else
   fi
 fi
 
+wait_for "producer /actuator/prometheus serves outbox counters" producer_prometheus_ready || summary
+wait_for "consumer /actuator/prometheus serves renewals counter" consumer_prometheus_ready || summary
+
+M_INS_BEFORE="$(prom_val "$PRODUCER_PORT" '^outbox_inserted_total ')"
+M_PUB_BEFORE="$(prom_val "$PRODUCER_PORT" '^outbox_published_total ')"
+M_PROC_BEFORE="$(prom_val "$CONSUMER_PORT" '^renewals_processed_total\{outcome="(succeeded|failed)"\}')"
+DB_OUTBOX_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox')"
+DB_PUB_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NOT NULL')"
+
 note "triggering renewal job (synchronous endpoint — may take a while)…"
 HTTP_CODE="$(trigger_job)"
 if [[ "$HTTP_CODE" == "200" ]]; then
@@ -184,6 +215,58 @@ fi
 
 wait_for "outbox fully published"                outbox_drained
 wait_for "every due renewal reached its predicted terminal payment (PSP rule [${PSP_FAIL_HEX}])" all_billed
+
+DB_OUTBOX_AFTER="$(q 'SELECT count(*) FROM renewal_outbox')"
+DB_PUB_AFTER="$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NOT NULL')"
+DB_INS_DELTA=unavailable
+DB_PUB_DELTA=unavailable
+if [[ "$DB_OUTBOX_BEFORE" =~ ^[0-9]+$ && "$DB_OUTBOX_AFTER" =~ ^[0-9]+$ ]]; then
+  DB_INS_DELTA=$((DB_OUTBOX_AFTER - DB_OUTBOX_BEFORE))
+fi
+if [[ "$DB_PUB_BEFORE" =~ ^[0-9]+$ && "$DB_PUB_AFTER" =~ ^[0-9]+$ ]]; then
+  DB_PUB_DELTA=$((DB_PUB_AFTER - DB_PUB_BEFORE))
+fi
+
+inserted_metric_delta_matches() {
+  local current
+  current="$(prom_val "$PRODUCER_PORT" '^outbox_inserted_total ')"
+  [[ "$current" =~ ^[0-9]+$ ]] && (( current - M_INS_BEFORE == DB_INS_DELTA ))
+}
+published_metric_delta_matches() {
+  local current
+  current="$(prom_val "$PRODUCER_PORT" '^outbox_published_total ')"
+  [[ "$current" =~ ^[0-9]+$ ]] && (( current - M_PUB_BEFORE == DB_PUB_DELTA ))
+}
+processed_metric_delta_matches() {
+  local current
+  current="$(prom_val "$CONSUMER_PORT" '^renewals_processed_total\{outcome="(succeeded|failed)"\}')"
+  [[ "$current" =~ ^[0-9]+$ ]] && (( current - M_PROC_BEFORE == DB_PUB_DELTA ))
+}
+batch_job_timer_recorded() {
+  local count
+  count="$(prom_val "$PRODUCER_PORT" '^spring_batch_job_seconds_count')"
+  [[ "$count" != "absent" && "$count" != "unreachable" ]]
+}
+
+if [[ "$M_INS_BEFORE" =~ ^[0-9]+$ && "$DB_INS_DELTA" =~ ^-?[0-9]+$ ]]; then
+  wait_for "outbox_inserted_total delta matches outbox rows inserted (${DB_INS_DELTA})" inserted_metric_delta_matches
+else
+  fail "outbox_inserted_total delta matches outbox rows inserted (${DB_INS_DELTA})" \
+    "invalid baseline=${M_INS_BEFORE} or DB delta=${DB_INS_DELTA}"
+fi
+if [[ "$M_PUB_BEFORE" =~ ^[0-9]+$ && "$DB_PUB_DELTA" =~ ^-?[0-9]+$ ]]; then
+  wait_for "outbox_published_total delta matches rows published this run (${DB_PUB_DELTA})" published_metric_delta_matches
+else
+  fail "outbox_published_total delta matches rows published this run (${DB_PUB_DELTA})" \
+    "invalid baseline=${M_PUB_BEFORE} or DB delta=${DB_PUB_DELTA}"
+fi
+if [[ "$M_PROC_BEFORE" =~ ^[0-9]+$ && "$DB_PUB_DELTA" =~ ^-?[0-9]+$ ]]; then
+  wait_for "renewals_processed_total{succeeded,failed} delta matches rows published this run (${DB_PUB_DELTA})" processed_metric_delta_matches
+else
+  fail "renewals_processed_total{succeeded,failed} delta matches rows published this run (${DB_PUB_DELTA})" \
+    "invalid baseline=${M_PROC_BEFORE} or DB delta=${DB_PUB_DELTA}"
+fi
+wait_for "spring_batch_job_seconds recorded on producer" batch_job_timer_recorded
 
 EXPECTED_FAILED="$(q "SELECT count(*) FROM renewal_outbox o WHERE o.due_date = current_date AND right(o.subscription_id::text, 1) ~ '[${PSP_FAIL_HEX}]'")"
 ACTUAL_FAILED="$(q "SELECT count(*) FROM payment WHERE status = 'failed' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
@@ -314,5 +397,12 @@ if (( POISON )); then
     fail "DLQ empty after poison probe" "depth=$(queue_depth "$RMQ_DLQ")"
   fi
 fi
+
+listener_timer_recorded() {
+  local count
+  count="$(prom_val "$CONSUMER_PORT" '^spring_rabbitmq_listener_seconds_count')"
+  [[ "$count" != "absent" && "$count" != "unreachable" ]]
+}
+wait_for "spring_rabbitmq_listener timer recorded on consumer" listener_timer_recorded
 
 summary

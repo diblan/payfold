@@ -19,6 +19,7 @@ Honesty table:
 | Idempotent redelivery handling | Demonstrated — payload-keyed; covered by a cross-midnight integration test, see [G2](invariants.md#g2) |
 | Bounded failure handling (DLQ) | Demonstrated — bounded listener retry + DLQ routing; poison-path integration test and `verify.sh` probe; see [G5](invariants.md#g5) |
 | Provider failure path (mock PSP) | Demonstrated — deterministic decline + timeout handling, failed payments quarantined unfinalized; exact-count verify.sh assertion |
+| Operational observability | Demonstrated — SLF4J logging, Prometheus counters + built-in job/listener timers, `verify.sh` cross-checks metric deltas against DB deltas |
 | Throughput at 330k/day | Extrapolated — demo seeds 15k; measured run is [R12](roadmap.md#r12) |
 | Horizontal producer scaling | Demonstrated — `FOR UPDATE SKIP LOCKED` page claims + advisory-lock cron guard; exactly-once under two concurrent publishers proven by test (compose still runs a single producer instance) |
 
@@ -172,6 +173,43 @@ the timeout path. `verify.sh` recomputes the exact expected failed set in SQL wi
 same last-character predicate and asserts every due renewal has its predicted terminal
 payment status.
 
+## Observability
+
+Both services log through SLF4J, with Logback supplied by Spring Boot's defaults.
+Normal batch progress and coordination skips are INFO; an unconfirmed publish page is
+WARN. A declined payment is INFO because it is an expected business outcome whose
+signal is the outcome counter.
+
+The Prometheus name is the external contract used by the roadmap and `verify.sh`.
+Micrometer converts dots in meter names to underscores for Prometheus and appends
+`_total` to counter names.
+
+| Micrometer meter | Prometheus name | Type | Tags | Incremented |
+|---|---|---|---|---|
+| `outbox.inserted` | `outbox_inserted_total` | Counter | none | By the number of rows inserted immediately after the scan SQL update |
+| `outbox.published` | `outbox_published_total` | Counter | none | By the number of confirm-gated rows immediately after their `published_at` batch update |
+| `renewals.processed` | `renewals_processed_total{outcome="..."}` | Counter | `outcome=succeeded \| failed \| invalid` | Per processed delivery at its decision point: after successful finalization, at either terminal-failure return, or when validation rejects the message |
+
+All counter series are registered eagerly and therefore render as `0.0` from boot;
+`verify.sh` depends on that property. The renewal outcome taxonomy is bounded to
+`succeeded`, `failed`, and `invalid`. Transient or unexpected failures increment no
+outcome counter because they have no decided business outcome; retries remain visible
+through the listener timer's `result="failure"` tag.
+
+| Micrometer meter | Prometheus series | Tags |
+|---|---|---|
+| `spring.batch.job` | `spring_batch_job_seconds_count/_sum/_max` | `spring_batch_job_name`, `spring_batch_job_status`, `error` |
+| `spring.batch.step` | `spring_batch_step_seconds_count/_sum/_max` | `spring_batch_step_name`, `spring_batch_step_job_name`, `spring_batch_step_status`, `error` |
+| `spring.rabbitmq.listener` | `spring_rabbitmq_listener_seconds_count/_sum/_max` | `listener_id="renewal"`, `queue`, `result`, `exception` |
+
+These timers come from Spring Batch observation support, auto-wired through
+`@EnableBatchProcessing`'s `BatchObservabilityBeanPostProcessor`, and Spring AMQP's
+`MicrometerHolder`; they are deliberately not hand-rolled. The `error` tag on the
+batch series is added by Spring Boot's observation handler, not by Batch itself;
+tag sets above match the live `/actuator/prometheus` output. The end-to-end verifier
+cross-checks same-run metric deltas against database deltas because counters reset with
+the service process while the database persists.
+
 ## Message contract — renewal.requested v1
 
 The producer writes all contract fields into the outbox payload in the same scan
@@ -227,7 +265,8 @@ Every remaining `application.yaml` key has a real consumer.
 | `payment.provider.base-url` (consumer) | `PaymentProviderProperties`, `PspClient`; compose overrides with `PAYMENT_PROVIDER_BASE_URL` | alive |
 | `payment.provider.timeout-ms` (consumer) | `PaymentProviderProperties`, `PspClient` connect + read timeout | alive |
 | `spring.rabbitmq.listener.simple.*` (consumer) | Spring Boot AMQP autoconfig + `ListenerRetryConfig` (`max-attempts`) | alive |
-| `management.endpoints.web.exposure.include` (producer) | actuator exposure incl. `renewal-job` | alive |
+| `management.endpoints.web.exposure.include` (producer) | actuator exposure for `health`, `info`, `metrics`, `prometheus`, and `renewal-job` | alive |
+| `management.endpoints.web.exposure.include` (consumer) | actuator exposure for `health`, `info`, `metrics`, and `prometheus`; the compose healthcheck relies on `health` | alive |
 | `management.endpoint.health.show-details` (producer) | actuator health response detail policy | alive |
 
 [R2](roadmap.md#r2) replaced the producer's dotted app-specific environment names with
@@ -240,8 +279,8 @@ compose healthcheck hits `/actuator/health`, served by actuator since
 
 | Where | What |
 |---|---|
-| `localhost:8080` | producer — `/actuator/health`, `POST /actuator/renewal-job?force=true` |
-| `localhost:8081` | consumer — `/actuator/health` (since [R1](roadmap.md#r1)); container-internal 8080 |
+| `localhost:8080` | producer — `/actuator/health`, `/actuator/prometheus`, `POST /actuator/renewal-job?force=true` |
+| `localhost:8081` | consumer — `/actuator/health` (since [R1](roadmap.md#r1)), `/actuator/prometheus`; container-internal 8080 |
 | `localhost:8082` | mock PSP (WireMock) — POST `/psp/charges`; admin/journal at `/__admin` |
 | `localhost:5672` / `15672` | RabbitMQ AMQP / management UI (creds from `.env`) |
 | `localhost:5432` | Postgres (creds from `.env`) |

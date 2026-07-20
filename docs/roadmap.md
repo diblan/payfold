@@ -112,7 +112,7 @@ subscription not advanced; failure rate configurable via env.
 assert failed count matches the configured rate ± tolerance).
 
 <a id="r9"></a>
-### [ ] R9 — Observability
+### [x] R9 — Observability
 **Scope:** both services.
 Replace every `System.out.println` with SLF4J; Micrometer counters
 (`outbox_inserted_total`, `outbox_published_total`, `renewals_processed_total{outcome}`)

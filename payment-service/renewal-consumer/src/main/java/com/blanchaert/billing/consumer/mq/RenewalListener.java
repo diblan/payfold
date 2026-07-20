@@ -21,7 +21,7 @@ public class RenewalListener {
         this.queue = queue;
     }
 
-    @RabbitListener(queues = "${rabbitmq.queue}")
+    @RabbitListener(id = "renewal", queues = "${rabbitmq.queue}")
     public void onMessage(Message msg) throws Exception {
         RenewalRequested evt = om.readValue(msg.getBody(),
                 RenewalRequested.class);

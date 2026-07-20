@@ -5,6 +5,7 @@ import com.blanchaert.billing.consumer.service.BillingService;
 import com.blanchaert.billing.consumer.service.InvalidRenewalMessageException;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.springframework.amqp.core.AmqpAdmin;
 import org.springframework.amqp.core.Message;
@@ -89,6 +90,9 @@ class RenewalListenerIntegrationTest {
     @Autowired
     private BillingService billingService;
 
+    @Autowired
+    private MeterRegistry registry;
+
     @Test
     void listenerCreatesASucceededPayment() throws JsonProcessingException {
         UUID customerId = UUID.randomUUID();
@@ -128,6 +132,10 @@ class RenewalListenerIntegrationTest {
                 .setContentType(MessageProperties.CONTENT_TYPE_JSON)
                 .build();
 
+        double succeededBefore = registry.get("renewals.processed")
+                .tag("outcome", "succeeded")
+                .counter()
+                .count();
         rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", message);
 
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
@@ -138,6 +146,12 @@ class RenewalListenerIntegrationTest {
                     """, Long.class, idempotencyKey);
             assertThat(succeededPayments).isEqualTo(1L);
         });
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(registry.get("renewals.processed")
+                        .tag("outcome", "succeeded")
+                        .counter()
+                        .count() - succeededBefore).isEqualTo(1.0));
     }
 
     @Test

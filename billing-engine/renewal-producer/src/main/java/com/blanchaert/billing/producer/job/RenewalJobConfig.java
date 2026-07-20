@@ -1,5 +1,9 @@
 package com.blanchaert.billing.producer.job;
 
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.batch.core.*;
 import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
 import org.springframework.batch.core.job.builder.JobBuilder;
@@ -24,6 +28,8 @@ import java.util.concurrent.TimeoutException;
 @Configuration
 @EnableBatchProcessing
 public class RenewalJobConfig {
+    private static final Logger log = LoggerFactory.getLogger(RenewalJobConfig.class);
+
     @Bean
     public Job renewalJob(
             JobRepository repo,
@@ -40,7 +46,11 @@ public class RenewalJobConfig {
     public Step scanStep(JobRepository repo,
                          PlatformTransactionManager tx,
                          JdbcTemplate jdbc,
+                         MeterRegistry meters,
                          @Value("${app.timezone:Europe/Brussels}") String tz) {
+        Counter insertedCounter = Counter.builder("outbox.inserted")
+                .description("Outbox rows inserted by scanStep")
+                .register(meters);
         return new StepBuilder("scanStep", repo)
                 .tasklet((contribution, chunkContext) -> {
                     ZoneId zone = ZoneId.of(tz);
@@ -107,7 +117,8 @@ public class RenewalJobConfig {
                         ps.setObject(3, end);
                         return ps;
                     });
-                    System.out.println("Outbox rows inserted: " + inserted);
+                    insertedCounter.increment(inserted);
+                    log.info("Outbox rows inserted: {}", inserted);
                     return RepeatStatus.FINISHED;
                 }, tx).build();
     }
@@ -117,8 +128,12 @@ public class RenewalJobConfig {
                             PlatformTransactionManager tx,
                             JdbcTemplate jdbc,
                             OutboxPublisher publisher,
+                            MeterRegistry meters,
                             @Value("${app.publishPageSize:1000}") int publishPageSize,
                             @Value("${app.confirmTimeoutMs:10000}") long confirmTimeoutMs) {
+        Counter publishedCounter = Counter.builder("outbox.published")
+                .description("Outbox rows confirmed published")
+                .register(meters);
         return new StepBuilder("publishStep", repo)
                 .tasklet((contribution, chunkContext) -> {
                     // Claim one page of unpublished rows; SKIP LOCKED keeps concurrent publishers disjoint
@@ -136,7 +151,7 @@ public class RenewalJobConfig {
                     );
 
                     if (rows.isEmpty()) {
-                        System.out.println("No publishable outbox rows visible (drained, or remainder claimed by a concurrent publisher).");
+                        log.info("No publishable outbox rows visible (drained, or remainder claimed by a concurrent publisher).");
                         return RepeatStatus.FINISHED; // stop the step
                     }
 
@@ -174,14 +189,15 @@ public class RenewalJobConfig {
                             confirmedIds.size(),
                             (ps, id) -> ps.setObject(1, id)
                     );
+                    publishedCounter.increment(confirmedIds.size());
 
                     int unconfirmedCount = rows.size() - confirmedIds.size();
                     if (unconfirmedCount > 0) {
-                        System.out.println("Warning: " + unconfirmedCount + " of " + rows.size()
-                                + " unconfirmed, rows stay unpublished and will be re-picked.");
+                        log.warn("{} of {} unconfirmed, rows stay unpublished and will be re-picked.",
+                                unconfirmedCount, rows.size());
                     }
 
-                    System.out.println("Published page count: " + confirmedIds.size());
+                    log.info("Published page count: {}", confirmedIds.size());
                     return RepeatStatus.CONTINUABLE; // ask Batch to run this tasklet again (new tx), next page
                 }, tx).build();
     }

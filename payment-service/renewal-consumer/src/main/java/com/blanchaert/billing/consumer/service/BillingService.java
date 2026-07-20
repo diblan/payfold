@@ -3,6 +3,10 @@ package com.blanchaert.billing.consumer.service;
 import com.blanchaert.billing.consumer.model.RenewalRequested;
 import com.blanchaert.billing.consumer.psp.PspChargeOutcome;
 import com.blanchaert.billing.consumer.psp.PspClient;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
@@ -13,16 +17,29 @@ import java.util.UUID;
 
 @Service
 public class BillingService {
+    private static final Logger log = LoggerFactory.getLogger(BillingService.class);
+
     private final JdbcTemplate jdbc;
     private final PspClient psp;
+    private final Counter processedSucceeded;
+    private final Counter processedFailed;
+    private final Counter processedInvalid;
 
-    public BillingService(JdbcTemplate jdbc, PspClient psp) {
+    public BillingService(JdbcTemplate jdbc, PspClient psp, MeterRegistry meters) {
         this.jdbc = jdbc;
         this.psp = psp;
+        this.processedSucceeded = processedCounter(meters, "succeeded");
+        this.processedFailed = processedCounter(meters, "failed");
+        this.processedInvalid = processedCounter(meters, "invalid");
     }
 
     public void process(RenewalRequested evt) {
-        validate(evt);
+        try {
+            validate(evt);
+        } catch (InvalidRenewalMessageException e) {
+            processedInvalid.increment();
+            throw e;
+        }
 
         LocalDate dueDate = LocalDate.parse(evt.due_date());
         LocalDate ps = LocalDate.parse(evt.period_start());
@@ -38,19 +55,29 @@ public class BillingService {
         String status = jdbc.queryForObject("SELECT status FROM payment WHERE id = ?", String.class, paymentId);
         if ("failed".equals(status)) {
             // Terminal: dunning is a non-goal (D5); redelivery must not re-attempt the charge.
+            processedFailed.increment();
             return;
         }
         if ("pending".equals(status)) {
             PspChargeOutcome outcome = psp.charge(idem, evt.subscription_id(), evt.amount_cents(), evt.currency());
             if (!outcome.succeeded()) {
                 markPaymentFailed(paymentId);
-                System.out.println("Payment failed for " + idem + ": " + outcome.reason());
+                log.info("Payment failed for {}: {}", idem, outcome.reason());
+                processedFailed.increment();
                 return;
             }
             markPaymentSucceeded(paymentId);
         }
         // 6) Finalize only a succeeded payment; failed outcomes return above unfinalized.
         finalizeBilling(invoiceId, chargeId, evt.subscription_id(), pe);
+        processedSucceeded.increment();
+    }
+
+    private Counter processedCounter(MeterRegistry meters, String outcome) {
+        return Counter.builder("renewals.processed")
+                .description("Renewal messages by processing outcome")
+                .tag("outcome", outcome)
+                .register(meters);
     }
 
     private void validate(RenewalRequested evt) {

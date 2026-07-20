@@ -1,5 +1,7 @@
 package com.blanchaert.billing.producer.job;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.batch.core.Job;
 import org.springframework.batch.core.JobParameters;
 import org.springframework.batch.core.JobParametersBuilder;
@@ -18,6 +20,7 @@ import java.time.ZoneId;
 
 @Component
 public class RenewalScheduler {
+    private static final Logger log = LoggerFactory.getLogger(RenewalScheduler.class);
     private static final long RENEWAL_JOB_LOCK_KEY = 0x504159464F4C4437L;
 
     private final JobLauncher launcher;
@@ -43,7 +46,7 @@ public class RenewalScheduler {
         // connection for the whole job, acquire and release on it explicitly.
         try (Connection session = dataSource.getConnection()) {
             if (!tryAdvisoryLock(session)) {
-                System.out.println("Renewal job skipped: another producer instance holds the scheduler lock.");
+                log.info("Renewal job skipped: another producer instance holds the scheduler lock.");
                 return;
             }
             try {
@@ -55,8 +58,8 @@ public class RenewalScheduler {
             } catch (JobExecutionAlreadyRunningException | JobInstanceAlreadyCompleteException e) {
                 // Sequential-duplicate window: a peer already ran today's instance
                 // before we acquired the lock (e.g. clock skew between instances).
-                System.out.println("Renewal job skipped: scheduleDate already run or running ("
-                        + e.getClass().getSimpleName() + ").");
+                log.info("Renewal job skipped: scheduleDate already run or running ({}).",
+                        e.getClass().getSimpleName());
             } finally {
                 releaseAdvisoryLock(session);
             }

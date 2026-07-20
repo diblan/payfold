@@ -1,6 +1,7 @@
 package com.blanchaert.billing.producer;
 
 import com.blanchaert.billing.producer.job.OutboxPublisher;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.springframework.batch.core.BatchStatus;
 import org.springframework.batch.core.Job;
@@ -47,6 +48,9 @@ class PublisherConfirmGatingTest {
     @Autowired
     private JdbcTemplate jdbc;
 
+    @Autowired
+    private MeterRegistry registry;
+
     @MockitoBean
     private OutboxPublisher publisher;
 
@@ -89,9 +93,13 @@ class PublisherConfirmGatingTest {
                 .addString("scheduleDate", "2026-01-01")
                 .addLong("run.id", ThreadLocalRandom.current().nextLong())
                 .toJobParameters();
+        double insertedBefore = registry.get("outbox.inserted").counter().count();
+        double publishedBefore = registry.get("outbox.published").counter().count();
         var jobExecution = jobLauncher.run(renewalJob, parameters);
 
         assertThat(jobExecution.getStatus()).isEqualTo(BatchStatus.FAILED);
+        assertThat(registry.get("outbox.inserted").counter().count() - insertedBefore).isEqualTo(0.0);
+        assertThat(registry.get("outbox.published").counter().count() - publishedBefore).isEqualTo(2.0);
         assertThat(isPublished(A)).isTrue();
         assertThat(isPublished(B)).isFalse();
         assertThat(isPublished(C)).isTrue();
