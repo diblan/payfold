@@ -184,7 +184,7 @@ public class BillingService {
                 chargeId);
         jdbc.update("UPDATE invoice SET status = 'paid' WHERE id = ?",
                 invoiceId);
-        // advance renewed_at to period end at 09:00 local (stored as TIMESTAMP)
+        // advance renewed_at to period end at 09:00 local (column is TIMESTAMPTZ)
         LocalDateTime ldt = newRenewalDate.atTime(9, 0);
         jdbc.update("UPDATE subscription SET renewed_at = ? WHERE id = ?",
                 Timestamp.valueOf(ldt), subscriptionId);

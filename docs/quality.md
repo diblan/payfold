@@ -3,7 +3,7 @@
 Coarse, honest, and **maintained**: any PR touching a module re-grades it in the same
 PR ([G6](invariants.md#g6)). The value of this file is currency, not precision.
 
-Last full re-grade: **2026-07-18** (harness adoption).
+Last full re-grade: **2026-07-21** (R13 entropy pass).
 
 ## Rubric
 
@@ -18,11 +18,12 @@ Last full re-grade: **2026-07-18** (harness adoption).
 
 | Module | Grade | Why | Tracked by |
 |---|---|---|---|
-| `billing-engine/renewal-producer` | **C** | SLF4J logging, eager Prometheus counters, and built-in batch timers are in ([R9](roadmap.md#r9)); the single-transaction scan and synchronous trigger endpoint remain | [R10](roadmap.md#r10), [R11](roadmap.md#r11) |
-| `payment-service/renewal-consumer` | **A** | Tested (real-broker integration suite including decline, timeout, and poison paths), observable (SLF4J, `renewals_processed_total{outcome}`, Prometheus endpoint, and listener timer), and documented (contract + architecture); no known behavior defects | — |
+| `billing-engine/renewal-producer` | **C** | Tested (smoke, confirm-gating, and competing-publisher suites), observable (eager counters + built-in batch timers), documented; the single-transaction scan and the synchronous trigger endpoint remain tracked scale gaps | [R10](roadmap.md#r10), [R11](roadmap.md#r11), [R14](roadmap.md#r14) |
+| `payment-service/renewal-consumer` | **A** | Tested (real-broker integration suite including decline, timeout, and poison paths), observable (SLF4J, `renewals_processed_total{outcome}`, Prometheus endpoint, and listener timer), and documented (contract + architecture); no known behavior defects | [R14](roadmap.md#r14) |
 | `db-migrations` | **B** | Clean, ordered, sole schema authority; V1 carries aspirational tables (`bank_tx`, `recon_match`, `ledger_entry`) no code uses — harmless but reviewer-confusing | — |
 | `seed-data-gen` | **C** | Seeds 15k due-today customers idempotently; `SubscriptionSeeder.java` is dead code, seed size hardcoded, `.bat`/`.sh` drift | [R12](roadmap.md#r12) |
-| `docker-compose.yaml` + config | **B** | Stack ordering and healthchecks pass; app-specific env names use relaxed binding, yaml contains only consumed keys, and declared named-volume defaults preserve path overrides. The mock-psp service renders mapping templates, has a healthcheck, and gates consumer startup through `depends_on` | — |
+| `mock-psp/` (WireMock) | **B** | Deterministic decline rule (last-hex-char class) rendered from inert `.json.tpl` templates by the compose entrypoint; healthchecked; exercised end-to-end by the consumer integration suite and `verify.sh`'s exact per-row assertions. The sed-render entrypoint itself has no direct test | — |
+| `docker-compose.yaml` + config | **B** | Stack ordering and healthchecks pass; app-specific env names use relaxed binding, yaml contains only consumed keys, and declared named-volume defaults preserve path overrides | — |
 | `docs/` + harness | **B** | CI uses pinned Maven wrappers and runs real-container integration tests for both services; `verify.sh` covers the happy path, same-day idempotency, poison probe, per-row predicted PSP outcomes with an exact failed count, and same-run metric/DB delta cross-checks | — |
 
 ## Test coverage

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run the CustomerSeeder program with the PostgreSQL driver
+# Compile and run the seeders (CustomerSeeder, then SubscriptionSeederDueToday) against Postgres
 
 # Compile to a writable path: the source dir is mounted read-only in docker compose
 OUT="${SEED_OUT_DIR:-/tmp/seed-out}"

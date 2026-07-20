@@ -43,13 +43,10 @@ services:
       TZ: ${TZ}
     ports:
       - "${RABBITMQ_PORT:-5672}:5672"           # AMQP
-      - "${RABBITMQ_MGMT_PORT:-15672}:15672"    # Management UI http://localhost:15672 (guest/guest)
+      - "${RABBITMQ_MGMT_PORT:-15672}:15672"    # Management UI http://localhost:15672 (creds from .env)
     volumes:
       # Persist broker data (queues, messages, etc.)
       - ${RABBITMQ_VOLUME:-rmq_data}:/var/lib/rabbitmq
-      # Optional: drop extra config/definitions in ./rabbitmq
-      # - ./rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
-      # - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 5s
@@ -122,7 +119,7 @@ services:
       APP_TIMEZONE: ${TZ}
       APP_SCHEDULECRON: ${APP_SCHEDULECRON}
     ports:
-      - "${PRODUCER_HTTP_PORT:-8080}:8080"  # actuator: /actuator/health, /actuator/renewal-job
+      - "${PRODUCER_HTTP_PORT:-8080}:8080"  # actuator: /actuator/health, /actuator/prometheus, POST /actuator/renewal-job
     depends_on:
       postgres:
         condition: service_healthy

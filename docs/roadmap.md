@@ -151,6 +151,8 @@ the code; full re-grade of [quality.md](quality.md); prune stale roadmap notes.
 **Done when:** the checklist above is completed and quality.md's re-grade date is
 updated. **No behavior changes allowed** in this session type.
 
+*Last run: 2026-07-21 (after R9, commit ecb935b).*
+
 <a id="r14"></a>
 ### [ ] R14 — Migrate to Testcontainers 2.x
 **Scope:** both module poms + test imports.

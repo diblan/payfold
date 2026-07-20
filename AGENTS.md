@@ -18,13 +18,14 @@ understanding to human reviewers as much as they guide agents.
 | `payment-service/renewal-consumer/` | Listener → `BillingService` upsert chain (invoice/charge/payment) |
 | `db-migrations/` | Flyway V1–V4 — the **only** place schema changes happen |
 | `seed-data-gen/` | JDBC seeders run by compose (15k customers, due today) |
-| `docker-compose.yaml` | Full local stack: postgres, flyway, seed, rabbitmq, both services |
+| `mock-psp/` | WireMock mock PSP: decline-rule mapping templates (`.json.tpl`) rendered by the compose entrypoint |
+| `docker-compose.yaml` | Full local stack: postgres, flyway, seed, rabbitmq, mock-psp, both services |
 | `scripts/verify.sh` | End-to-end check; **the definition of "working"** |
 | `docs/architecture.md` | System map, message flow, scale math, config truth table |
 | `docs/invariants.md` | Golden rules G1–G8 with HELD/VIOLATED status |
-| `docs/decisions.md` | Decision log D1–D7 |
+| `docs/decisions.md` | Decision log D1–D8 |
 | `docs/quality.md` | Module grades A–D, re-graded on touch |
-| `docs/roadmap.md` | Non-goals + the ordered work queue R1–R13 |
+| `docs/roadmap.md` | Non-goals + the ordered work queue R1–R15 |
 | `notes/` | Gitignored private scratch (source articles); **never commit or quote verbatim** |
 
 ## Run & verify

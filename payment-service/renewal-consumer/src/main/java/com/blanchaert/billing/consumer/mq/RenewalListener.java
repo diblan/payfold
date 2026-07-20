@@ -5,20 +5,16 @@ import com.blanchaert.billing.consumer.service.BillingService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 @Component
 public class RenewalListener {
     private final ObjectMapper om;
     private final BillingService billing;
-    private final String queue;
 
-    public RenewalListener(ObjectMapper om, BillingService billing,
-                           @Value("${rabbitmq.queue}") String queue) {
+    public RenewalListener(ObjectMapper om, BillingService billing) {
         this.om = om;
         this.billing = billing;
-        this.queue = queue;
     }
 
     @RabbitListener(id = "renewal", queues = "${rabbitmq.queue}")
