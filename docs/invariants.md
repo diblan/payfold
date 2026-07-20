@@ -11,10 +11,18 @@ not shameful — it is a tracked debt with a roadmap item; an *undocumented* vio
 A renewal event reaches RabbitMQ only via a `renewal_outbox` row written in the same
 database as the business data it derives from. No code path may call
 `RabbitTemplate.convertAndSend` for renewals outside `OutboxPublisher` draining the outbox.
+Publishing is confirm-gated: `published_at` is set only after a broker confirm
+([R6](roadmap.md#r6)).
+A missing or timed-out confirm leaves the row unpublished and it is re-published, so
+outbox delivery is **at-least-once**. The broker may receive a message whose confirm was
+not seen in time, and that message is sent again; consumer idempotency absorbs this
+duplicate window ([G2](invariants.md#g2)).
 
 *Why:* atomicity between "we decided to bill this subscription" and "we will tell the
 payment service" — the transactional outbox pattern is the core of this project.
-*Enforced by:* code review; only `OutboxPublisher` touches the template.
+*Enforced by:* code review; only `OutboxPublisher` touches the template; correlated
+publisher confirms gate `published_at`; `PublisherConfirmGatingTest` proves an
+unconfirmed row stays unpublished and is re-picked.
 *Status:* **HELD**
 
 <a id="g2"></a>
@@ -88,6 +96,10 @@ verify.sh, the change is wrong (or the tightening belongs in the same PR).
 The `renewal.requested` payload is a contract between producer and consumer. Within a
 version, changes are additive only (consumers tolerate unknown fields); removing or
 re-typing a field requires a version bump and a decision entry.
+The contract includes delivery semantics: `renewal.requested` is delivered
+at-least-once. Duplicates are possible at any time, including the [R6](roadmap.md#r6)
+confirm-timeout re-publish window, and consumers must remain idempotent per
+[G2](invariants.md#g2).
 
 *Status:* **HELD** — contract v1 is documented in
 [architecture.md](architecture.md#message-contract--renewalrequested-v1) and fully

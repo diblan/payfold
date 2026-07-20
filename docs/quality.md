@@ -18,7 +18,7 @@ Last full re-grade: **2026-07-18** (harness adoption).
 
 | Module | Grade | Why | Tracked by |
 |---|---|---|---|
-| `billing-engine/renewal-producer` | **C** | The payload now carries the full v1 contract; the outbox scan/publish and a real-Postgres context smoke test work. No publisher confirms or `SKIP LOCKED`, the single-tx scan won't survive 10M rows, and progress uses `System.out` | [R6](roadmap.md#r6), [R7](roadmap.md#r7), [R9](roadmap.md#r9), [R10](roadmap.md#r10), [R11](roadmap.md#r11) |
+| `billing-engine/renewal-producer` | **C** | The payload carries the full v1 contract, and correlated confirms now gate `published_at`, proven by an unconfirmed-repick test. The single-tx scan, missing `SKIP LOCKED`, `System.out` logging, and synchronous trigger endpoint remain | [R7](roadmap.md#r7), [R9](roadmap.md#r9), [R10](roadmap.md#r10), [R11](roadmap.md#r11) |
 | `payment-service/renewal-consumer` | **B** | Bounded failure handling is real and proven by the retry cap, DLQ routing, poison integration test, and `verify.sh` probe; idempotency remains held across midnight. Remaining gaps are low-risk and tracked: the fake PSP is documented scope ([D5](decisions.md#d5)), and logging still uses `System.out` | [R8](roadmap.md#r8), [R9](roadmap.md#r9) |
 | `db-migrations` | **B** | Clean, ordered, sole schema authority; V1 carries aspirational tables (`bank_tx`, `recon_match`, `ledger_entry`) no code uses — harmless but reviewer-confusing | — |
 | `seed-data-gen` | **C** | Seeds 15k due-today customers idempotently; `SubscriptionSeeder.java` is dead code, seed size hardcoded, `.bat`/`.sh` drift | [R12](roadmap.md#r12) |
@@ -28,8 +28,9 @@ Last full re-grade: **2026-07-18** (harness adoption).
 ## Test coverage
 
 Both services have JUnit 5 integration coverage backed by Testcontainers and the real
-V1–V4 migrations. The producer test loads the Spring context against PostgreSQL and
-asserts the `renewalJob` bean exists. The consumer suite publishes real
+V1–V4 migrations. The producer has a context smoke test and a confirm-gating job test
+against a real-PostgreSQL container with publisher futures faked; the latter proves
+unconfirmed rows stay unpublished and are re-picked. The consumer suite publishes real
 `renewal.requested` messages through RabbitMQ, covers cross-midnight redelivery
 idempotency, and covers the poison path: malformed and contract-violating messages
 dead-letter while a subsequent good message processes. CI runs both suites with each

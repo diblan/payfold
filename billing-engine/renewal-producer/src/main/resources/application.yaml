@@ -7,6 +7,8 @@ spring:
     password: yourpassword
   jackson:
     time-zone: Europe/Brussels
+  rabbitmq:
+    publisher-confirm-type: correlated
   batch:
     jdbc:
       initialize-schema: never
@@ -15,6 +17,7 @@ spring:
 app:
   timezone: Europe/Brussels
   publishPageSize: 1000
+  confirmTimeoutMs: 10000
   scheduleCron: "0 0 3 * * *"   # 03:00 local by default
 
 

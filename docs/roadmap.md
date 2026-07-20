@@ -86,7 +86,7 @@ malformed message via the management API, assert DLQ depth 1, drain it);
 [G5](invariants.md#g5) → HELD.
 
 <a id="r6"></a>
-### [ ] R6 — Publisher confirms
+### [x] R6 — Publisher confirms
 **Scope:** `OutboxPublisher`, `RabbitConfig`, publishStep.
 Correlated publisher confirms; a row's `published_at` is set only after broker confirm;
 unconfirmed rows are naturally re-picked by the next page.
@@ -162,3 +162,14 @@ artifacts (`testcontainers-postgresql`, `-rabbitmq`, `-junit-jupiter`) and needs
 Spring Boot version with Testcontainers 2 support.
 **Done when:** both suites are green on Testcontainers 2.x with the
 `~/.docker-java.properties` pin deleted.
+
+<a id="r15"></a>
+### [ ] R15 — Unroutable-message detection (publisher returns)
+**Scope:** producer `RabbitConfig`, `OutboxPublisher`, application.yaml.
+A publisher confirm only means the exchange accepted the message: if no queue is
+bound (e.g. the consumer never declared topology), the message is confirmed and
+silently dropped. Enable `publisher-returns` + `mandatory` and treat a returned
+message as unconfirmed so its outbox row stays unpublished. Mind the
+correlation subtlety: a returned message is also ack'ed, so the return must win.
+**Done when:** a test publishing to a binding-less exchange keeps the row's
+`published_at` NULL; [architecture.md](architecture.md) documents the semantics.

@@ -2,9 +2,12 @@ package com.blanchaert.billing.producer.job;
 
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.core.MessageBuilder;
+import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+
+import java.util.concurrent.CompletableFuture;
 
 @Component
 public class OutboxPublisher {
@@ -20,9 +23,10 @@ public class OutboxPublisher {
         this.routingKey = routingKey;
     }
 
-    public boolean publish(String json) {
+    public CompletableFuture<Boolean> publish(String id, String json) {
         Message msg = MessageBuilder.withBody(json.getBytes()).setContentType("application/json").build();
-        rabbit.convertAndSend(exchange, routingKey, msg);
-        return true;
+        CorrelationData correlation = new CorrelationData(id);
+        rabbit.convertAndSend(exchange, routingKey, msg, correlation);
+        return correlation.getFuture().thenApply(confirm -> confirm != null && confirm.isAck());
     }
 }

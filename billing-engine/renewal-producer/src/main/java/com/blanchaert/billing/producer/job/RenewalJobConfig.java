@@ -15,6 +15,11 @@ import org.springframework.transaction.PlatformTransactionManager;
 
 import java.time.*;
 import java.util.*;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 @Configuration
 @EnableBatchProcessing
@@ -112,7 +117,8 @@ public class RenewalJobConfig {
                             PlatformTransactionManager tx,
                             JdbcTemplate jdbc,
                             OutboxPublisher publisher,
-                            @Value("${app.publishPageSize:1000}") int publishPageSize) {
+                            @Value("${app.publishPageSize:1000}") int publishPageSize,
+                            @Value("${app.confirmTimeoutMs:10000}") long confirmTimeoutMs) {
         return new StepBuilder("publishStep", repo)
                 .tasklet((contribution, chunkContext) -> {
                     // Fetch one page of unpublished outbox rows
@@ -133,25 +139,48 @@ public class RenewalJobConfig {
                         return RepeatStatus.FINISHED; // stop the step
                     }
 
-                    // Publish and collect the ones we actually sent
-                    var publishedIds = new ArrayList<UUID>(rows.size());
+                    var futures = new LinkedHashMap<UUID, CompletableFuture<Boolean>>(rows.size());
                     for (var row : rows) {
-                        if (publisher.publish(row.payload)) {
-                            publishedIds.add(row.id);
+                        futures.put(row.id(), publisher.publish(row.id().toString(), row.payload()));
+                    }
+
+                    long deadline = System.nanoTime() + confirmTimeoutMs * 1_000_000L;
+                    var confirmedIds = new ArrayList<UUID>(rows.size());
+                    for (var entry : futures.entrySet()) {
+                        long remaining = Math.max(deadline - System.nanoTime(), 0L);
+                        try {
+                            if (entry.getValue().get(remaining, TimeUnit.NANOSECONDS)) {
+                                confirmedIds.add(entry.getKey());
+                            }
+                        } catch (TimeoutException | ExecutionException | CancellationException ignored) {
+                            // Leave the row unpublished so the next page or job run re-picks it.
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new IllegalStateException("interrupted awaiting publisher confirms", e);
                         }
                     }
 
-                    // Mark them as published in one batch
-                    if (!publishedIds.isEmpty()) {
-                        jdbc.batchUpdate(
-                                "UPDATE renewal_outbox SET published_at = now() WHERE id = ?",
-                                publishedIds,
-                                publishedIds.size(),
-                                (ps, id) -> ps.setObject(1, id)
+                    if (confirmedIds.isEmpty()) {
+                        throw new IllegalStateException(
+                                "0/" + rows.size() + " rows confirmed within " + confirmTimeoutMs
+                                        + " ms"
                         );
                     }
 
-                    System.out.println("Published page count: " + publishedIds.size());
+                    jdbc.batchUpdate(
+                            "UPDATE renewal_outbox SET published_at = now() WHERE id = ?",
+                            confirmedIds,
+                            confirmedIds.size(),
+                            (ps, id) -> ps.setObject(1, id)
+                    );
+
+                    int unconfirmedCount = rows.size() - confirmedIds.size();
+                    if (unconfirmedCount > 0) {
+                        System.out.println("Warning: " + unconfirmedCount + " of " + rows.size()
+                                + " unconfirmed, rows stay unpublished and will be re-picked.");
+                    }
+
+                    System.out.println("Published page count: " + confirmedIds.size());
                     return RepeatStatus.CONTINUABLE; // ask Batch to run this tasklet again (new tx), next page
                 }, tx).build();
     }

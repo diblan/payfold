@@ -15,6 +15,7 @@ Honesty table:
 | Property | Status |
 |---|---|
 | Transactional outbox (atomic scan + publish intent) | Demonstrated |
+| Broker-acknowledged publish (publisher confirms) | Demonstrated — confirm-gated `published_at`, unconfirmed-repick test; unroutable-message detection is [R15](roadmap.md#r15) |
 | Idempotent redelivery handling | Demonstrated — payload-keyed; covered by a cross-midnight integration test, see [G2](invariants.md#g2) |
 | Bounded failure handling (DLQ) | Demonstrated — bounded listener retry + DLQ routing; poison-path integration test and `verify.sh` probe; see [G5](invariants.md#g5) |
 | Throughput at 330k/day | Extrapolated — demo seeds 15k; measured run is [R12](roadmap.md#r12) |
@@ -81,9 +82,17 @@ Single transaction over all active subscriptions is the 10M-scale bottleneck ([R
 
 **publishStep** — tasklet re-run per page (`RepeatStatus.CONTINUABLE`), one page per
 transaction: select `LIMIT ${app.publishPageSize}` (default 1000) unpublished rows ordered
-by `id`, publish each via `OutboxPublisher` (plain `convertAndSend`, no publisher confirms
-→ [R6](roadmap.md#r6), no `FOR UPDATE SKIP LOCKED` → [R7](roadmap.md#r7)), then batch-update
-`published_at = now()`.
+by `id` (no `FOR UPDATE SKIP LOCKED` → [R7](roadmap.md#r7)), then publish each via
+`OutboxPublisher` with correlated publisher confirms
+(`spring.rabbitmq.publisher-confirm-type: correlated`) and the outbox row id as the
+correlation id. The tasklet awaits all confirms for the page inside the page transaction,
+up to one `app.confirmTimeoutMs` deadline (default 10s), and sets `published_at` only for
+confirmed rows. Unconfirmed rows stay NULL and are re-picked by the next page or job run:
+delivery is at-least-once, and consumer idempotency absorbs duplicates ([G2](invariants.md#g2)).
+A page with zero confirmed rows fails the job, making the failure visible instead of
+tight-looping over the same page. A confirm means the exchange accepted the message;
+an unroutable message is confirmed and silently dropped until publisher returns add
+detection in [R15](roadmap.md#r15).
 
 Producer declares only the exchange (`RabbitConfig`); the consumer owns the rest of the topology.
 
@@ -163,7 +172,8 @@ Every remaining `application.yaml` key has a real consumer.
 | `spring.datasource.*` | Spring Boot autoconfig (overridden by compose `SPRING_DATASOURCE_*`) | alive (placeholder values in yaml) |
 | `spring.jackson.time-zone` (both) | Spring Boot Jackson autoconfig | alive |
 | `spring.batch.jdbc.initialize-schema` (producer) | Spring Batch | alive |
-| `app.timezone`, `app.scheduleCron`, `app.publishPageSize` (producer) | `RenewalScheduler`, `RenewalJobConfig` | alive |
+| `spring.rabbitmq.publisher-confirm-type` (producer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` confirm type); load-bearing: without it confirm futures never complete and every page times out | alive |
+| `app.timezone`, `app.scheduleCron`, `app.publishPageSize`, `app.confirmTimeoutMs` (producer) | `RenewalScheduler`, `RenewalJobConfig` | alive |
 | `rabbitmq.exchange`, `rabbitmq.routingKey` (producer) | `RabbitConfig`, `OutboxPublisher` | alive |
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |
 | `spring.rabbitmq.listener.simple.*` (consumer) | Spring Boot AMQP autoconfig + `ListenerRetryConfig` (`max-attempts`) | alive |
