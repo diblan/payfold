@@ -3,6 +3,8 @@
 #
 # This script is the machine-checkable definition of "working" (see AGENTS.md and
 # docs/invariants.md G7): it may only ever be made stricter, never loosened.
+# It includes exact deterministic provider-failure assertions derived from the
+# PSP_FAIL_HEX environment variable.
 #
 # Usage:
 #   scripts/verify.sh [--no-up] [--timeout SECONDS] [--poison|--no-poison]
@@ -62,6 +64,7 @@ RMQ_MGMT_PORT="$(env_val RABBITMQ_MGMT_PORT 15672)"
 RMQ_QUEUE="$(env_val RABBITMQ_QUEUE billing.renewals.main)"
 RMQ_EXCHANGE="$(env_val RABBITMQ_EXCHANGE billing.renewals)"
 RMQ_RK="$(env_val RABBITMQ_ROUTINGKEY renewal.requested)"
+PSP_FAIL_HEX="$(env_val PSP_FAIL_HEX 0)"
 RMQ_DLQ="billing.renewals.dlq"
 
 RESULTS=()
@@ -107,16 +110,19 @@ consumer_running() { docker compose ps --status running --services 2>/dev/null |
 
 outbox_drained() { [[ "$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NULL')" == "0" ]]; }
 
-# A today-due outbox row counts as billed when a succeeded payment exists under the
-# idempotency key the consumer derives for it today ("sub-<id>|<yyyy-mm-dd>").
-UNBILLED_SQL="SELECT count(*) FROM renewal_outbox o
+# A today-due outbox row is correctly billed when a payment exists under its
+# derived idempotency key with EXACTLY the terminal status the deterministic
+# mock-PSP rule predicts: 'failed' when the subscription id's last hex char is
+# in [$PSP_FAIL_HEX], 'succeeded' otherwise.
+MISMATCHED_SQL="SELECT count(*) FROM renewal_outbox o
 WHERE o.due_date = current_date
   AND NOT EXISTS (
     SELECT 1 FROM payment p
-    WHERE p.status = 'succeeded'
-      AND p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
+    WHERE p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
+      AND p.status = CASE WHEN right(o.subscription_id::text, 1) ~ '[${PSP_FAIL_HEX}]'
+                          THEN 'failed' ELSE 'succeeded' END
   )"
-all_billed() { [[ "$(q "$UNBILLED_SQL")" == "0" ]]; }
+all_billed() { [[ "$(q "$MISMATCHED_SQL")" == "0" ]]; }
 
 queue_depth() { # queue name -> message count, or "unreachable"
   local body
@@ -177,7 +183,32 @@ else
 fi
 
 wait_for "outbox fully published"                outbox_drained
-wait_for "every due renewal billed (succeeded payment per outbox row)" all_billed
+wait_for "every due renewal reached its predicted terminal payment (PSP rule [${PSP_FAIL_HEX}])" all_billed
+
+EXPECTED_FAILED="$(q "SELECT count(*) FROM renewal_outbox o WHERE o.due_date = current_date AND right(o.subscription_id::text, 1) ~ '[${PSP_FAIL_HEX}]'")"
+ACTUAL_FAILED="$(q "SELECT count(*) FROM payment WHERE status = 'failed' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
+if [[ -n "$EXPECTED_FAILED" && "$ACTUAL_FAILED" == "$EXPECTED_FAILED" ]]; then
+  pass "failed payment count matches deterministic PSP rule exactly (PSP_FAIL_HEX=[${PSP_FAIL_HEX}], failed=${ACTUAL_FAILED}/${N_DUE})"
+else
+  fail "failed payment count matches deterministic PSP rule exactly" "expected=${EXPECTED_FAILED:-error} actual=${ACTUAL_FAILED:-error}"
+fi
+
+FAILED_FINALIZED="$(q "SELECT count(*) FROM payment p JOIN charge c ON c.id = p.charge_id WHERE p.status = 'failed' AND c.status <> 'pending'")"
+if [[ "$FAILED_FINALIZED" == "0" ]]; then
+  pass "no failed payment has a finalized charge"
+else
+  fail "no failed payment has a finalized charge" "count=${FAILED_FINALIZED:-error}"
+fi
+
+FAILED_ADVANCED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id
+WHERE o.due_date = current_date
+  AND right(o.subscription_id::text, 1) ~ '[${PSP_FAIL_HEX}]'
+  AND s.renewed_at >= current_date")"
+if [[ "$FAILED_ADVANCED" == "0" ]]; then
+  pass "no failed renewal advanced its subscription"
+else
+  fail "no failed renewal advanced its subscription" "count=${FAILED_ADVANCED:-error}"
+fi
 
 PENDING="$(q "SELECT count(*) FROM payment WHERE status = 'pending'")"
 if [[ "$PENDING" == "0" ]]; then

@@ -18,6 +18,7 @@ Honesty table:
 | Broker-acknowledged publish (publisher confirms) | Demonstrated — confirm-gated `published_at`, unconfirmed-repick test; unroutable-message detection is [R15](roadmap.md#r15) |
 | Idempotent redelivery handling | Demonstrated — payload-keyed; covered by a cross-midnight integration test, see [G2](invariants.md#g2) |
 | Bounded failure handling (DLQ) | Demonstrated — bounded listener retry + DLQ routing; poison-path integration test and `verify.sh` probe; see [G5](invariants.md#g5) |
+| Provider failure path (mock PSP) | Demonstrated — deterministic decline + timeout handling, failed payments quarantined unfinalized; exact-count verify.sh assertion |
 | Throughput at 330k/day | Extrapolated — demo seeds 15k; measured run is [R12](roadmap.md#r12) |
 | Horizontal producer scaling | Demonstrated — `FOR UPDATE SKIP LOCKED` page claims + advisory-lock cron guard; exactly-once under two concurrent publishers proven by test (compose still runs a single producer instance) |
 
@@ -55,7 +56,13 @@ Honesty table:
                  ┌──────────────────────┐   invoice / charge /
                  │   renewal-consumer   ├─▶ payment / subscription
                  │   :8081 (host)       │   upserts via unique
-                 └──────────────────────┘   constraints
+                 └──────────┬───────────┘   constraints
+                            │ POST /psp/charges
+                            ▼
+                 ┌──────────────────────┐
+                 │ mock-psp (WireMock)  │  declines iff last hex char of
+                 │ :8082 (host)         │  subscription_id ∈ PSP_FAIL_HEX
+                 └──────────────────────┘
 ```
 
 ## The renewal job (producer)
@@ -124,8 +131,18 @@ unique constraint (this *is* the idempotency mechanism, [D2](decisions.md#d2)):
 | `upsertInvoice` | `invoice` | `period_start`, `period_end`; `uniq_invoice_period (customer_id, period_start, period_end, currency)` |
 | `upsertCharge` | `charge` | actual `due_date`; `uniq_charge_period (subscription_id, due_date, amount_cents, currency)` |
 | `upsertPayment` | `payment` | `idempotency_key`; `payment.idempotency_key UNIQUE` |
-| `markPaymentSucceeded` | `payment` | — (unconditional; no PSP call yet → [R8](roadmap.md#r8)) |
+| `PspClient.charge` | — | HTTP `POST /psp/charges` to the mock PSP; called only while the payment is 'pending' |
+| `markPaymentSucceeded` / `markPaymentFailed` | `payment` | terminal status + `completed_at` from the PSP outcome; 'failed' returns without finalizing |
 | `finalizeBilling` | `charge`, `invoice`, `subscription` | sets settled/paid, advances `renewed_at` to `period_end` at 09:00 |
+
+Provider declines, timeouts, 5xx responses, and unreachable-provider errors are
+business failures: the payment becomes `failed`, the message is ACKed, and nothing is
+sent to the DLQ, which remains reserved for unprocessable messages ([G5](invariants.md#g5)).
+Failed payments are terminal and redelivery does not re-attempt them because dunning is
+a non-goal; a succeeded payment is replayed through `finalizeBilling` only. A crash
+between a provider 200 response and the payment-status write can call the PSP again on
+redelivery. A real PSP would deduplicate the transmitted `idempotency_key`; the
+stateless mock returns the same deterministic outcome.
 
 The consumer uses validated payload values only and has no clock-derived fallbacks.
 Missing or invalid required fields throw `InvalidRenewalMessageException`; deterministic
@@ -139,6 +156,21 @@ the rejected message. `InvalidRenewalMessageException` is non-retryable and goes
 straight to the DLQ; other failures use the bounded retry budget. Queue arguments are
 immutable, so brokers carrying the pre-R5 queue must delete it or wipe the RabbitMQ
 volume before redeclaration; [D4](decisions.md#d4) records why the queue name stayed.
+
+## Mock PSP
+
+The mock provider runs WireMock `3.13.2-alpine`. Its source mappings live as inert
+templates in `mock-psp/mappings/*.json.tpl`; the Compose entrypoint renders them with
+`sed`, substituting `PSP_FAIL_HEX` into the decline rule before WireMock starts. A
+subscription is declined exactly when the last hex character of its UUID belongs to
+that set, so `k` configured hex characters decline exactly `k/16` subscriptions; a
+non-hex value such as `x` disables failures.
+
+The consumer integration test uses the same image and templates through a
+Testcontainers `GenericContainer`, then adds a test-only delayed response mapping for
+the timeout path. `verify.sh` recomputes the exact expected failed set in SQL with the
+same last-character predicate and asserts every due renewal has its predicted terminal
+payment status.
 
 ## Message contract — renewal.requested v1
 
@@ -192,6 +224,8 @@ Every remaining `application.yaml` key has a real consumer.
 | `app.timezone`, `app.scheduleCron`, `app.publishPageSize`, `app.confirmTimeoutMs` (producer) | `RenewalScheduler`, `RenewalJobConfig` | alive |
 | `rabbitmq.exchange`, `rabbitmq.routingKey` (producer) | `RabbitConfig`, `OutboxPublisher` | alive |
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |
+| `payment.provider.base-url` (consumer) | `PaymentProviderProperties`, `PspClient`; compose overrides with `PAYMENT_PROVIDER_BASE_URL` | alive |
+| `payment.provider.timeout-ms` (consumer) | `PaymentProviderProperties`, `PspClient` connect + read timeout | alive |
 | `spring.rabbitmq.listener.simple.*` (consumer) | Spring Boot AMQP autoconfig + `ListenerRetryConfig` (`max-attempts`) | alive |
 | `management.endpoints.web.exposure.include` (producer) | actuator exposure incl. `renewal-job` | alive |
 | `management.endpoint.health.show-details` (producer) | actuator health response detail policy | alive |
@@ -208,5 +242,6 @@ compose healthcheck hits `/actuator/health`, served by actuator since
 |---|---|
 | `localhost:8080` | producer — `/actuator/health`, `POST /actuator/renewal-job?force=true` |
 | `localhost:8081` | consumer — `/actuator/health` (since [R1](roadmap.md#r1)); container-internal 8080 |
+| `localhost:8082` | mock PSP (WireMock) — POST `/psp/charges`; admin/journal at `/__admin` |
 | `localhost:5672` / `15672` | RabbitMQ AMQP / management UI (creds from `.env`) |
 | `localhost:5432` | Postgres (creds from `.env`) |

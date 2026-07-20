@@ -56,6 +56,28 @@ services:
       timeout: 3s
       retries: 20
 
+  # Mock payment provider (R8): WireMock with a deterministic decline rule.
+  # The entrypoint renders the mapping templates, substituting the PSP_FAIL_HEX
+  # char class into the decline rule's regex; see docs/architecture.md#mock-psp.
+  mock-psp:
+    image: wiremock/wiremock:3.13.2-alpine
+    container_name: mock-psp
+    environment:
+      PSP_FAIL_HEX: ${PSP_FAIL_HEX:-0}
+    ports:
+      - "${PSP_HTTP_PORT:-8082}:8080"   # admin API at /__admin for demo inspection
+    volumes:
+      - ./mock-psp/mappings:/psp-templates:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'mkdir -p /home/wiremock/mappings && for f in /psp-templates/*.json.tpl; do b="$$(basename "$$f")"; sed "s/__PSP_FAIL_HEX__/$${PSP_FAIL_HEX:-0}/g" "$$f" > "/home/wiremock/mappings/$${b%.tpl}"; done && exec /docker-entrypoint.sh'
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/__admin/health | grep -q healthy"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   # Seed data (Java seed generators)
   seed-data:
     image: eclipse-temurin:17-jdk
@@ -136,12 +158,15 @@ services:
       RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE}
       RABBITMQ_QUEUE: ${RABBITMQ_QUEUE}
       RABBITMQ_ROUTINGKEY: ${RABBITMQ_ROUTINGKEY}
+      PAYMENT_PROVIDER_BASE_URL: http://mock-psp:8080
     ports:
       - "${CONSUMER_HTTP_PORT:-8081}:8080"
     depends_on:
       postgres:
         condition: service_healthy
       rabbitmq:
+        condition: service_healthy
+      mock-psp:
         condition: service_healthy
       flyway:
         condition: service_completed_successfully

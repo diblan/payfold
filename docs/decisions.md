@@ -52,12 +52,15 @@ argument change instead makes the strict poison probe fail loudly, preserving
 
 ## D5 — Fake PSP first — pre-2026-07 — active
 <a id="d5"></a>
-`markPaymentSucceeded` unconditionally succeeds; no provider is called. The
-`payment.provider.*` config keys were added speculatively and are currently dead.
+The initial fake-PSP phase unconditionally called `markPaymentSucceeded` and lasted
+until R8 (2026-07-20), which introduced a WireMock mock called over HTTP with a
+deterministic subscription-id failure rule.
 **Why:** the project's point is delivery semantics (outbox, idempotency, failure
 routing) — provider integration is orthogonal and would have front-loaded complexity.
-**Follow-up:** a WireMock-based mock PSP with a configurable failure rate is
-[R8](roadmap.md#r8); until then a "payment" here means "delivery semantics exercised".
+**Current state:** provider outcomes are business failures and are never dead-lettered;
+failed payments are terminal, with dunning still a non-goal. A "payment" still moves
+no real money, so the real-PSP boundary in the [non-goals table](roadmap.md#non-goals)
+is unchanged.
 
 ## D6 — Spring Batch tasklets over a custom loop — pre-2026-07 — active
 <a id="d6"></a>

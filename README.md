@@ -55,6 +55,8 @@ This README stays a quickstart; everything deeper belongs in `docs/`.
    - `seed-data`: executes the Java seed scripts in `seed-data-gen` to populate
      reference data
    - `rabbitmq`: RabbitMQ 3.13 with the management UI exposed locally
+   - `mock-psp`: WireMock mock payment provider (port `8082`), declining a
+     deterministic `PSP_FAIL_HEX` slice of renewals
    - `renewal-producer`: Spring Boot billing engine (port `8080`)
    - `renewal-consumer`: Spring Boot payment service (port `8081`)
 

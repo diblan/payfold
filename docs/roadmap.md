@@ -102,7 +102,7 @@ advisory lock (or ShedLock) so two producer instances can run.
 published exactly once; [architecture.md](architecture.md) scaling note updated.
 
 <a id="r8"></a>
-### [ ] R8 — Mock PSP with a failure path
+### [x] R8 — Mock PSP with a failure path
 **Scope:** compose (+WireMock container), `BillingService`, revived `payment.provider.*`.
 Consumer calls the mock over HTTP (baseUrl + timeout from config); provider
 failure/timeout → `payment.status = 'failed'`, invoice/charge **not** finalized,

@@ -1,6 +1,8 @@
 package com.blanchaert.billing.consumer.service;
 
 import com.blanchaert.billing.consumer.model.RenewalRequested;
+import com.blanchaert.billing.consumer.psp.PspChargeOutcome;
+import com.blanchaert.billing.consumer.psp.PspClient;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
@@ -12,9 +14,11 @@ import java.util.UUID;
 @Service
 public class BillingService {
     private final JdbcTemplate jdbc;
+    private final PspClient psp;
 
-    public BillingService(JdbcTemplate jdbc) {
+    public BillingService(JdbcTemplate jdbc, PspClient psp) {
         this.jdbc = jdbc;
+        this.psp = psp;
     }
 
     public void process(RenewalRequested evt) {
@@ -30,9 +34,22 @@ public class BillingService {
         UUID chargeId = upsertCharge(evt.subscription_id(), invoiceId, evt.amount_cents(), evt.currency(), dueDate);
         // 4) Create payment row (pending) guarded by idempotency unique key
         UUID paymentId = upsertPayment(idem, chargeId, evt.amount_cents(), evt.currency());
-        // 5) Simulate call to payment provider (replace with real PSP). Here we mark as succeeded.
-        markPaymentSucceeded(paymentId);
-        // 6) Mark invoice paid, charge settled; advance subscription. Use Europe / Brussels 09:00 local
+        // 5) Call the PSP only for a pending payment; failed payments are terminal.
+        String status = jdbc.queryForObject("SELECT status FROM payment WHERE id = ?", String.class, paymentId);
+        if ("failed".equals(status)) {
+            // Terminal: dunning is a non-goal (D5); redelivery must not re-attempt the charge.
+            return;
+        }
+        if ("pending".equals(status)) {
+            PspChargeOutcome outcome = psp.charge(idem, evt.subscription_id(), evt.amount_cents(), evt.currency());
+            if (!outcome.succeeded()) {
+                markPaymentFailed(paymentId);
+                System.out.println("Payment failed for " + idem + ": " + outcome.reason());
+                return;
+            }
+            markPaymentSucceeded(paymentId);
+        }
+        // 6) Finalize only a succeeded payment; failed outcomes return above unfinalized.
         finalizeBilling(invoiceId, chargeId, evt.subscription_id(), pe);
     }
 
@@ -128,6 +145,10 @@ public class BillingService {
 
     private void markPaymentSucceeded(UUID paymentId) {
         jdbc.update("UPDATE payment SET status = 'succeeded', completed_at = now()WHERE id = ? ", paymentId);
+    }
+
+    private void markPaymentFailed(UUID paymentId) {
+        jdbc.update("UPDATE payment SET status = 'failed', completed_at = now() WHERE id = ?", paymentId);
     }
 
     private void finalizeBilling(UUID invoiceId, UUID chargeId, UUID
