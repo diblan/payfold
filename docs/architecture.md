@@ -19,7 +19,7 @@ Honesty table:
 | Idempotent redelivery handling | Demonstrated — payload-keyed; covered by a cross-midnight integration test, see [G2](invariants.md#g2) |
 | Bounded failure handling (DLQ) | Demonstrated — bounded listener retry + DLQ routing; poison-path integration test and `verify.sh` probe; see [G5](invariants.md#g5) |
 | Throughput at 330k/day | Extrapolated — demo seeds 15k; measured run is [R12](roadmap.md#r12) |
-| Horizontal producer scaling | Not yet — no `SKIP LOCKED`, see [R7](roadmap.md#r7) |
+| Horizontal producer scaling | Demonstrated — `FOR UPDATE SKIP LOCKED` page claims + advisory-lock cron guard; exactly-once under two concurrent publishers proven by test (compose still runs a single producer instance) |
 
 ## Component map
 
@@ -65,10 +65,20 @@ Job `renewalJob` = `scanStep` → `publishStep`, defined in
 
 Two ways to launch, both build the identifying parameter `scheduleDate = today`:
 
-- **Cron** — `RenewalScheduler`, `${app.scheduleCron}` (default `0 0 3 * * *`, zone `${app.timezone}`).
+- **Cron** — `RenewalScheduler`, `${app.scheduleCron}` (default `0 0 3 * * *`, zone
+  `${app.timezone}`). Cron launches are serialized across producer instances by a
+  Postgres session advisory lock; a losing instance logs a one-line skip without
+  creating a second `JobExecution`. If a peer already ran today's `scheduleDate`
+  before the lock is acquired, the JobRepository rejection is caught and skipped
+  cleanly. One dedicated database connection holds and explicitly releases the lock
+  for the whole job; if the JVM dies, its session dies and Postgres releases the lock
+  automatically, so no lease table is needed.
 - **On demand** — `POST /actuator/renewal-job?force=true` (`RenewalJobEndpoint`).
   `force=true` adds a random `run.id` so the same day can be re-run; without it,
   Spring Batch rejects a repeated job instance for the same `scheduleDate`.
+  The force path deliberately remains outside the scheduler guard: it is the
+  operator's manual override, each force run is a distinct job instance, and
+  `SKIP LOCKED` keeps concurrent runs row-safe.
   The endpoint is **synchronous**: it blocks until the whole job finishes ([R10](roadmap.md#r10)).
 
 **scanStep** — one tasklet, one transaction, one SQL statement:
@@ -82,17 +92,23 @@ Single transaction over all active subscriptions is the 10M-scale bottleneck ([R
 
 **publishStep** — tasklet re-run per page (`RepeatStatus.CONTINUABLE`), one page per
 transaction: select `LIMIT ${app.publishPageSize}` (default 1000) unpublished rows ordered
-by `id` (no `FOR UPDATE SKIP LOCKED` → [R7](roadmap.md#r7)), then publish each via
-`OutboxPublisher` with correlated publisher confirms
+by `id` with `FOR UPDATE SKIP LOCKED`, so concurrent publishers claim disjoint pages,
+then publish each via `OutboxPublisher` with correlated publisher confirms
 (`spring.rabbitmq.publisher-confirm-type: correlated`) and the outbox row id as the
-correlation id. The tasklet awaits all confirms for the page inside the page transaction,
-up to one `app.confirmTimeoutMs` deadline (default 10s), and sets `published_at` only for
-confirmed rows. Unconfirmed rows stay NULL and are re-picked by the next page or job run:
-delivery is at-least-once, and consumer idempotency absorbs duplicates ([G2](invariants.md#g2)).
-A page with zero confirmed rows fails the job, making the failure visible instead of
-tight-looping over the same page. A confirm means the exchange accepted the message;
-an unroutable message is confirmed and silently dropped until publisher returns add
-detection in [R15](roadmap.md#r15).
+correlation id. The row locks intentionally span the confirm await inside the page
+transaction, bounded by one `app.confirmTimeoutMs` deadline (default 10s); this keeps
+in-flight rows invisible to peers until `published_at` is updated and the transaction
+commits. Under READ COMMITTED, the lock-time recheck drops a row that a peer published
+and committed while the statement was acquiring locks. An empty page means none are
+visible to this publisher — the outbox is drained or the remainder is peer-claimed —
+and the tasklet finishes rather than busy-waiting. That is safe because claims last only
+for the transaction: a peer either publishes its rows or its locks end with its failed
+transaction and a later page or job run re-picks them. Unconfirmed rows stay NULL and
+are re-picked by the next page or job run: delivery is at-least-once, and consumer
+idempotency absorbs duplicates ([G2](invariants.md#g2)). A page with zero confirmed rows
+fails the job, making the failure visible instead of tight-looping over the same page.
+A confirm means the exchange accepted the message; an unroutable message is confirmed
+and silently dropped until publisher returns add detection in [R15](roadmap.md#r15).
 
 Producer declares only the exchange (`RabbitConfig`); the consumer owns the rest of the topology.
 

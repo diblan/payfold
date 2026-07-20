@@ -121,7 +121,7 @@ public class RenewalJobConfig {
                             @Value("${app.confirmTimeoutMs:10000}") long confirmTimeoutMs) {
         return new StepBuilder("publishStep", repo)
                 .tasklet((contribution, chunkContext) -> {
-                    // Fetch one page of unpublished outbox rows
+                    // Claim one page of unpublished rows; SKIP LOCKED keeps concurrent publishers disjoint
                     record OutboxRow(UUID id, String payload) {
                     }
                     var rows = jdbc.query(
@@ -129,13 +129,14 @@ public class RenewalJobConfig {
                                     "FROM renewal_outbox " +
                                     "WHERE published_at IS NULL " +
                                     "ORDER BY id " +
-                                    "LIMIT ?",
+                                    "LIMIT ? " +
+                                    "FOR UPDATE SKIP LOCKED",
                             ps -> ps.setInt(1, publishPageSize),
                             (rs, i) -> new OutboxRow((UUID) rs.getObject("id"), rs.getString("payload"))
                     );
 
                     if (rows.isEmpty()) {
-                        System.out.println("Published all messages: outbox drained.");
+                        System.out.println("No publishable outbox rows visible (drained, or remainder claimed by a concurrent publisher).");
                         return RepeatStatus.FINISHED; // stop the step
                     }
 

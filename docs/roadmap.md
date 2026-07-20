@@ -94,7 +94,7 @@ unconfirmed rows are naturally re-picked by the next page.
 documented in [invariants.md](invariants.md) under [G1](invariants.md#g1)/[G8](invariants.md#g8).
 
 <a id="r7"></a>
-### [ ] R7 — Competing-producer safety
+### [x] R7 — Competing-producer safety
 **Scope:** publishStep SQL + scheduler.
 `SELECT ... FOR UPDATE SKIP LOCKED` on the publish page; scheduler guard via Postgres
 advisory lock (or ShedLock) so two producer instances can run.
