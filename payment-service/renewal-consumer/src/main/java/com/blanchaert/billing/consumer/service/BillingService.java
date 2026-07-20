@@ -6,6 +6,7 @@ import org.springframework.stereotype.Service;
 
 import java.sql.Timestamp;
 import java.time.*;
+import java.time.format.DateTimeParseException;
 import java.util.UUID;
 
 @Service
@@ -17,20 +18,68 @@ public class BillingService {
     }
 
     public void process(RenewalRequested evt) {
-        // 1) Compute period
-        LocalDate ps = evt.period_start() != null ? LocalDate.parse(evt.period_start()) : LocalDate.now();
-        LocalDate pe = evt.period_end() != null ? LocalDate.parse(evt.period_end()) : ("year".equalsIgnoreCase(evt.interval()) ? ps.plusYears(1) : ps.plusMonths(1));
-        String idem = (evt.idempotency_key() != null && !evt.idempotency_key().isBlank()) ? evt.idempotency_key() : ("sub-" + evt.subscription_id() + "|" + ps);
+        validate(evt);
+
+        LocalDate dueDate = LocalDate.parse(evt.due_date());
+        LocalDate ps = LocalDate.parse(evt.period_start());
+        LocalDate pe = LocalDate.parse(evt.period_end());
+        String idem = evt.idempotency_key();
         // 2) Upsert invoice
         UUID invoiceId = upsertInvoice(evt.customer_id(), ps, pe, evt.amount_cents(), evt.currency());
         // 3) Upsert charge linked to subscription + invoice + due_date
-        UUID chargeId = upsertCharge(evt.subscription_id(), invoiceId, evt.amount_cents(), evt.currency(), pe);
+        UUID chargeId = upsertCharge(evt.subscription_id(), invoiceId, evt.amount_cents(), evt.currency(), dueDate);
         // 4) Create payment row (pending) guarded by idempotency unique key
         UUID paymentId = upsertPayment(idem, chargeId, evt.amount_cents(), evt.currency());
         // 5) Simulate call to payment provider (replace with real PSP). Here we mark as succeeded.
         markPaymentSucceeded(paymentId);
         // 6) Mark invoice paid, charge settled; advance subscription. Use Europe / Brussels 09:00 local
         finalizeBilling(invoiceId, chargeId, evt.subscription_id(), pe);
+    }
+
+    private void validate(RenewalRequested evt) {
+        if (evt.event_id() == null) {
+            throw invalid(evt, "event_id", "must not be null");
+        }
+        if (evt.subscription_id() == null) {
+            throw invalid(evt, "subscription_id", "must not be null");
+        }
+        if (evt.customer_id() == null) {
+            throw invalid(evt, "customer_id", "must not be null");
+        }
+        if (evt.idempotency_key() == null || evt.idempotency_key().isBlank()) {
+            throw invalid(evt, "idempotency_key", "must not be null or blank");
+        }
+        if (evt.currency() == null || evt.currency().isBlank()) {
+            throw invalid(evt, "currency", "must not be null or blank");
+        }
+        if (evt.amount_cents() <= 0) {
+            throw invalid(evt, "amount_cents", "must be greater than zero");
+        }
+
+        parseDate(evt, "due_date", evt.due_date());
+        LocalDate periodStart = parseDate(evt, "period_start", evt.period_start());
+        LocalDate periodEnd = parseDate(evt, "period_end", evt.period_end());
+        if (!periodEnd.isAfter(periodStart)) {
+            throw invalid(evt, "period_end", "must be after period_start");
+        }
+    }
+
+    private LocalDate parseDate(RenewalRequested evt, String field, String value) {
+        if (value == null) {
+            throw invalid(evt, field, "must not be null");
+        }
+        try {
+            return LocalDate.parse(value);
+        } catch (DateTimeParseException exception) {
+            throw invalid(evt, field, "must be an ISO date");
+        }
+    }
+
+    private InvalidRenewalMessageException invalid(RenewalRequested evt, String field, String detail) {
+        return new InvalidRenewalMessageException(
+                "Invalid renewal message field " + field
+                        + " (event_id=" + evt.event_id()
+                        + ", subscription_id=" + evt.subscription_id() + "): " + detail);
     }
 
     private UUID upsertInvoice(UUID customerId, LocalDate ps, LocalDate pe,

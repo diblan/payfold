@@ -1,6 +1,8 @@
 package com.blanchaert.billing.consumer;
 
 import com.blanchaert.billing.consumer.model.RenewalRequested;
+import com.blanchaert.billing.consumer.service.BillingService;
+import com.blanchaert.billing.consumer.service.InvalidRenewalMessageException;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
@@ -24,10 +26,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
 @SpringBootTest
@@ -52,6 +56,9 @@ class RenewalListenerIntegrationTest {
     @Autowired
     private ObjectMapper objectMapper;
 
+    @Autowired
+    private BillingService billingService;
+
     @Test
     void listenerCreatesASucceededPayment() throws JsonProcessingException {
         UUID customerId = UUID.randomUUID();
@@ -73,6 +80,8 @@ class RenewalListenerIntegrationTest {
                 """, subscriptionId, customerId, planId, periodStart.atStartOfDay().atOffset(ZoneOffset.UTC));
 
         RenewalRequested renewal = new RenewalRequested(
+                1,
+                UUID.randomUUID(),
                 subscriptionId,
                 customerId,
                 planId,
@@ -81,7 +90,9 @@ class RenewalListenerIntegrationTest {
                 "EUR",
                 idempotencyKey,
                 periodStart.toString(),
-                periodEnd.toString());
+                periodStart.toString(),
+                periodEnd.toString(),
+                "2026-07-01T00:00:00.000Z");
         Message message = MessageBuilder
                 .withBody(objectMapper.writeValueAsBytes(renewal))
                 .setContentType(MessageProperties.CONTENT_TYPE_JSON)
@@ -97,6 +108,184 @@ class RenewalListenerIntegrationTest {
                     """, Long.class, idempotencyKey);
             assertThat(succeededPayments).isEqualTo(1L);
         });
+    }
+
+    @Test
+    void crossMidnightRedeliveryCreatesNoDuplicates() throws JsonProcessingException {
+        UUID customerId = UUID.randomUUID();
+        UUID subscriptionId = UUID.randomUUID();
+        UUID sentinelCustomerId = UUID.randomUUID();
+        UUID sentinelSubscriptionId = UUID.randomUUID();
+        UUID planId = jdbcTemplate.queryForObject(
+                "SELECT id FROM plan WHERE name = 'Standard'",
+                UUID.class);
+        LocalDate dueDate = LocalDate.of(2026, 6, 15);
+        LocalDate periodEnd = LocalDate.of(2026, 7, 15);
+        String idempotencyKey = "sub-" + subscriptionId + "|2026-06-15";
+
+        jdbcTemplate.update("""
+                INSERT INTO customer (id, email, name, status)
+                VALUES (?, ?, ?, 'active')
+                """, customerId, "midnight-test-" + customerId + "@example.com", "Midnight Test Customer");
+        jdbcTemplate.update("""
+                INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
+                VALUES (?, ?, ?, 'active', ?)
+                """, subscriptionId, customerId, planId, dueDate.atStartOfDay().atOffset(ZoneOffset.UTC));
+        jdbcTemplate.update("""
+                INSERT INTO customer (id, email, name, status)
+                VALUES (?, ?, ?, 'active')
+                """, sentinelCustomerId, "sentinel-test-" + sentinelCustomerId + "@example.com", "Sentinel Test Customer");
+        jdbcTemplate.update("""
+                INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
+                VALUES (?, ?, ?, 'active', ?)
+                """, sentinelSubscriptionId, sentinelCustomerId, planId,
+                LocalDate.of(2026, 8, 15).atStartOfDay().atOffset(ZoneOffset.UTC));
+
+        // These payload dates differ from the machine date: any surviving consume-time clock
+        // dependency would mint a different key or period on redelivery: duplicates or wrong dates.
+        RenewalRequested renewal = new RenewalRequested(
+                1,
+                UUID.randomUUID(),
+                subscriptionId,
+                customerId,
+                planId,
+                "month",
+                1499,
+                "EUR",
+                idempotencyKey,
+                dueDate.toString(),
+                dueDate.toString(),
+                periodEnd.toString(),
+                "2026-06-15T00:00:00.000Z");
+        byte[] renewalBytes = objectMapper.writeValueAsBytes(renewal);
+        Message renewalMessage = MessageBuilder
+                .withBody(renewalBytes)
+                .setContentType(MessageProperties.CONTENT_TYPE_JSON)
+                .build();
+
+        LocalDate sentinelDueDate = LocalDate.of(2026, 8, 15);
+        String sentinelKey = "sub-" + sentinelSubscriptionId + "|2026-08-15";
+        RenewalRequested sentinel = new RenewalRequested(
+                1,
+                UUID.randomUUID(),
+                sentinelSubscriptionId,
+                sentinelCustomerId,
+                planId,
+                "month",
+                1499,
+                "EUR",
+                sentinelKey,
+                sentinelDueDate.toString(),
+                sentinelDueDate.toString(),
+                sentinelDueDate.plusMonths(1).toString(),
+                "2026-08-15T00:00:00.000Z");
+        Message sentinelMessage = MessageBuilder
+                .withBody(objectMapper.writeValueAsBytes(sentinel))
+                .setContentType(MessageProperties.CONTENT_TYPE_JSON)
+                .build();
+
+        rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", renewalMessage);
+        rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", renewalMessage);
+        rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", sentinelMessage);
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            Long sentinelPayments = jdbcTemplate.queryForObject("""
+                    SELECT count(*)
+                    FROM payment
+                    WHERE idempotency_key = ? AND status = 'succeeded'
+                    """, Long.class, sentinelKey);
+            assertThat(sentinelPayments).isEqualTo(1L);
+        });
+
+        Long payments = jdbcTemplate.queryForObject("""
+                SELECT count(*)
+                FROM payment
+                WHERE idempotency_key = ? AND status = 'succeeded'
+                """, Long.class, idempotencyKey);
+        assertThat(payments).isEqualTo(1L);
+
+        Long invoices = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM invoice WHERE customer_id = ?",
+                Long.class, customerId);
+        assertThat(invoices).isEqualTo(1L);
+        LocalDate storedPeriodStart = jdbcTemplate.queryForObject(
+                "SELECT period_start FROM invoice WHERE customer_id = ?",
+                (rs, rowNum) -> rs.getObject("period_start", LocalDate.class), customerId);
+        LocalDate storedPeriodEnd = jdbcTemplate.queryForObject(
+                "SELECT period_end FROM invoice WHERE customer_id = ?",
+                (rs, rowNum) -> rs.getObject("period_end", LocalDate.class), customerId);
+        assertThat(storedPeriodStart).isEqualTo(dueDate);
+        assertThat(storedPeriodEnd).isEqualTo(periodEnd);
+
+        Long charges = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM charge WHERE subscription_id = ?",
+                Long.class, subscriptionId);
+        assertThat(charges).isEqualTo(1L);
+        LocalDate storedDueDate = jdbcTemplate.queryForObject(
+                "SELECT due_date FROM charge WHERE subscription_id = ?",
+                (rs, rowNum) -> rs.getObject("due_date", LocalDate.class), subscriptionId);
+        assertThat(storedDueDate).isEqualTo(dueDate);
+        assertThat(storedDueDate).isNotEqualTo(periodEnd);
+
+        LocalDateTime renewedAt = jdbcTemplate.queryForObject(
+                "SELECT renewed_at FROM subscription WHERE id = ?",
+                (rs, rowNum) -> rs.getTimestamp(1).toLocalDateTime(), subscriptionId);
+        assertThat(renewedAt).isEqualTo(LocalDateTime.of(2026, 7, 15, 9, 0));
+    }
+
+    @Test
+    void invalidMessagesAreRejectedWithoutWrites() {
+        UUID customerId = UUID.randomUUID();
+        UUID subscriptionId = UUID.randomUUID();
+        UUID planId = jdbcTemplate.queryForObject(
+                "SELECT id FROM plan WHERE name = 'Standard'",
+                UUID.class);
+        LocalDate dueDate = LocalDate.of(2026, 6, 15);
+
+        jdbcTemplate.update("""
+                INSERT INTO customer (id, email, name, status)
+                VALUES (?, ?, ?, 'active')
+                """, customerId, "invalid-test-" + customerId + "@example.com", "Invalid Test Customer");
+        jdbcTemplate.update("""
+                INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
+                VALUES (?, ?, ?, 'active', ?)
+                """, subscriptionId, customerId, planId, dueDate.atStartOfDay().atOffset(ZoneOffset.UTC));
+
+        RenewalRequested missingKey = new RenewalRequested(
+                1, UUID.randomUUID(), subscriptionId, customerId, planId, "month", 1499, "EUR",
+                null, dueDate.toString(), dueDate.toString(), dueDate.plusMonths(1).toString(),
+                "2026-06-15T00:00:00.000Z");
+        RenewalRequested missingDueDate = new RenewalRequested(
+                1, UUID.randomUUID(), subscriptionId, customerId, planId, "month", 1499, "EUR",
+                "sub-" + subscriptionId + "|2026-06-15", null, dueDate.toString(),
+                dueDate.plusMonths(1).toString(), "2026-06-15T00:00:00.000Z");
+        RenewalRequested malformedDueDate = new RenewalRequested(
+                1, UUID.randomUUID(), subscriptionId, customerId, planId, "month", 1499, "EUR",
+                "sub-" + subscriptionId + "|2026-06-15", "not-a-date", dueDate.toString(),
+                dueDate.plusMonths(1).toString(), "2026-06-15T00:00:00.000Z");
+
+        assertThatThrownBy(() -> billingService.process(missingKey))
+                .isInstanceOf(InvalidRenewalMessageException.class);
+        assertThatThrownBy(() -> billingService.process(missingDueDate))
+                .isInstanceOf(InvalidRenewalMessageException.class);
+        assertThatThrownBy(() -> billingService.process(malformedDueDate))
+                .isInstanceOf(InvalidRenewalMessageException.class);
+
+        Long invoices = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM invoice WHERE customer_id = ?",
+                Long.class, customerId);
+        Long charges = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM charge WHERE subscription_id = ?",
+                Long.class, subscriptionId);
+        Long payments = jdbcTemplate.queryForObject("""
+                SELECT count(*)
+                FROM payment p
+                JOIN charge c ON c.id = p.charge_id
+                WHERE c.subscription_id = ?
+                """, Long.class, subscriptionId);
+        assertThat(invoices).isZero();
+        assertThat(charges).isZero();
+        assertThat(payments).isZero();
     }
 
     private static PostgreSQLContainer<?> postgresWithMigrations() {

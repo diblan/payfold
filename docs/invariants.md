@@ -27,9 +27,9 @@ consume time.
 
 *Why:* RabbitMQ is at-least-once; redelivery timing is not under our control.
 *Enforced by:* DB unique constraints (`uniq_invoice_period`, `uniq_charge_period`,
-`payment.idempotency_key`) + producer-supplied key material.
-*Status:* **VIOLATED** — payload carries no key/period; consumer falls back to
-`LocalDate.now()`. → [R4](roadmap.md#r4)
+`payment.idempotency_key`) + producer-supplied key/period material + a cross-midnight
+redelivery integration test; the consumer never reads the clock.
+*Status:* **HELD** (since R4, 2026-07-20)
 
 <a id="g3"></a>
 ## G3 — Schema changes only via Flyway
@@ -85,5 +85,6 @@ The `renewal.requested` payload is a contract between producer and consumer. Wit
 version, changes are additive only (consumers tolerate unknown fields); removing or
 re-typing a field requires a version bump and a decision entry.
 
-*Status:* **PARTIAL** — the contract exists implicitly (`RenewalRequested` record) but
-is not yet written down or fully populated. Formalized by [R4](roadmap.md#r4).
+*Status:* **HELD** — contract v1 is documented in
+[architecture.md](architecture.md#message-contract--renewalrequested-v1) and fully
+populated by the producer.

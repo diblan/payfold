@@ -62,7 +62,7 @@ real containers). CI switches from bare `mvn` to `./mvnw verify`.
 **Done when:** `./mvnw verify` green locally and in Actions.
 
 <a id="r4"></a>
-### [ ] R4 — Message contract v1: cross-midnight idempotency
+### [x] R4 — Message contract v1: cross-midnight idempotency
 **Scope:** producer payload SQL, `RenewalRequested`, `BillingService`; contract section
 added to [architecture.md](architecture.md).
 Payload gains `event_id` (outbox row id), `idempotency_key` (`sub-<id>|<due_date>`),

@@ -58,20 +58,41 @@ public class RenewalJobConfig {
                             ), win AS (
                                 SELECT *, due_ts AT TIME ZONE ? AS due_local
                                 FROM due
+                            ), events AS (
+                                SELECT *, gen_random_uuid() AS event_id,
+                                    (due_local)::date AS due_date
+                                FROM win
+                                WHERE due_local >= ? AND due_local < ?
                             )
-                            INSERT INTO renewal_outbox (subscription_id, due_date, payload)
-                            SELECT subscription_id,
-                                (due_local)::date AS due_date,
+                            INSERT INTO renewal_outbox (id, subscription_id, due_date, payload)
+                            SELECT event_id,
+                                subscription_id,
+                                due_date,
                                 jsonb_build_object(
+                                    'schema_version', 1,
+                                    'event_id', event_id,
                                     'subscription_id', subscription_id,
                                     'customer_id', customer_id,
                                     'plan_id', plan_id,
                                     'interval', interval,
                                     'amount_cents', price_cents,
-                                    'currency', currency
+                                    'currency', currency,
+                                    'idempotency_key', 'sub-' || subscription_id || '|' || to_char(due_date, 'YYYY-MM-DD'),
+                                    'due_date', to_char(due_date, 'YYYY-MM-DD'),
+                                    'period_start', to_char(due_date, 'YYYY-MM-DD'),
+                                    'period_end', to_char(
+                                        (CASE
+                                            WHEN interval = 'month' THEN due_date + INTERVAL '1 month'
+                                            WHEN interval = 'year' THEN due_date + INTERVAL '1 year'
+                                        END)::date,
+                                        'YYYY-MM-DD'
+                                    ),
+                                    'occurred_at', to_char(
+                                        now() AT TIME ZONE 'UTC',
+                                        'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+                                    )
                                 ) AS payload
-                            FROM win
-                            WHERE due_local >= ? AND due_local < ?
+                            FROM events
                             ON CONFLICT (subscription_id, due_date) DO NOTHING;
                             """;
                     int inserted = jdbc.update(con -> {

@@ -15,7 +15,7 @@ Honesty table:
 | Property | Status |
 |---|---|
 | Transactional outbox (atomic scan + publish intent) | Demonstrated |
-| Idempotent redelivery handling | Partially — same-day only, see [G2](invariants.md#g2) → [R4](roadmap.md#r4) |
+| Idempotent redelivery handling | Demonstrated — payload-keyed; covered by a cross-midnight integration test, see [G2](invariants.md#g2) |
 | Bounded failure handling (DLQ) | Declared, not reachable — see [G5](invariants.md#g5) → [R5](roadmap.md#r5) |
 | Throughput at 330k/day | Extrapolated — demo seeds 15k; measured run is [R12](roadmap.md#r12) |
 | Horizontal producer scaling | Not yet — no `SKIP LOCKED`, see [R7](roadmap.md#r7) |
@@ -72,12 +72,12 @@ Two ways to launch, both build the identifying parameter `scheduleDate = today`:
   The endpoint is **synchronous**: it blocks until the whole job finishes ([R10](roadmap.md#r10)).
 
 **scanStep** — one tasklet, one transaction, one SQL statement:
-`INSERT INTO renewal_outbox (subscription_id, due_date, payload) SELECT ...` over active
+`INSERT INTO renewal_outbox (id, subscription_id, due_date, payload) SELECT ...` over active
 subscriptions whose `renewed_at + plan interval` falls in today's local-day window.
 `ON CONFLICT (subscription_id, due_date) DO NOTHING` (constraint `uniq_outbox_sub_due`)
-makes re-scans idempotent. Payload is `jsonb_build_object(subscription_id, customer_id,
-plan_id, interval, amount_cents, currency)` — note it does **not** carry
-`idempotency_key`, `due_date`, or the billing period yet ([R4](roadmap.md#r4)).
+makes re-scans idempotent. Each row's payload is the full
+[`renewal.requested` v1 contract](#message-contract--renewalrequested-v1), including
+the producer-minted identity, idempotency key, due date, and billing period.
 Single transaction over all active subscriptions is the 10M-scale bottleneck ([R11](roadmap.md#r11)).
 
 **publishStep** — tasklet re-run per page (`RepeatStatus.CONTINUABLE`), one page per
@@ -95,24 +95,49 @@ Producer declares only the exchange (`RabbitConfig`); the consumer owns the rest
 `BillingService.process`, which runs an upsert chain — each step backed by a DB
 unique constraint (this *is* the idempotency mechanism, [D2](decisions.md#d2)):
 
-| Step | Table | Backing constraint |
+| Step | Table | Payload material / backing constraint |
 |---|---|---|
-| `upsertInvoice` | `invoice` | `uniq_invoice_period (customer_id, period_start, period_end, currency)` |
-| `upsertCharge` | `charge` | `uniq_charge_period (subscription_id, due_date, amount_cents, currency)` |
-| `upsertPayment` | `payment` | `payment.idempotency_key UNIQUE` |
+| `upsertInvoice` | `invoice` | `period_start`, `period_end`; `uniq_invoice_period (customer_id, period_start, period_end, currency)` |
+| `upsertCharge` | `charge` | actual `due_date`; `uniq_charge_period (subscription_id, due_date, amount_cents, currency)` |
+| `upsertPayment` | `payment` | `idempotency_key`; `payment.idempotency_key UNIQUE` |
 | `markPaymentSucceeded` | `payment` | — (unconditional; no PSP call yet → [R8](roadmap.md#r8)) |
-| `finalizeBilling` | `charge`, `invoice`, `subscription` | sets settled/paid, advances `renewed_at` |
+| `finalizeBilling` | `charge`, `invoice`, `subscription` | sets settled/paid, advances `renewed_at` to `period_end` at 09:00 |
 
-**Known flaw** ([G2](invariants.md#g2), fixed by [R4](roadmap.md#r4)): because the payload
-lacks a key and period, the consumer derives both from `LocalDate.now()` at consume time.
-A redelivery after midnight gets a *different* key and period → duplicate
-invoice/charge/payment. Same-day redelivery is safe; any-time redelivery is not.
+The consumer uses validated payload values only and has no clock-derived fallbacks.
+Missing or invalid required fields throw `InvalidRenewalMessageException`. Today that
+exception still requeues forever; [R5](roadmap.md#r5) adds bounded retry and DLQ routing.
 
 **Topology** (`RabbitTopology`): main queue has `x-dead-letter-exchange:
 billing.renewals.dlx`, but **no `x-dead-letter-routing-key`** — dead letters would keep
 rk `renewal.requested` while the DLQ is bound with rk `dlq`, so they'd be *dropped*.
 Moreover there is no `spring.rabbitmq.listener` retry config, so failed messages requeue
 forever and never dead-letter at all. Both halves are [R5](roadmap.md#r5).
+
+## Message contract — renewal.requested v1
+
+The producer writes all contract fields into the outbox payload in the same scan
+transaction that creates the renewal intent ([D8](decisions.md#d8)).
+
+| Field | JSON type | Source (producer SQL) | Semantics |
+|---|---|---|---|
+| `schema_version` | number | literal `1` | Contract version. |
+| `event_id` | string | one `gen_random_uuid()` value generated in the event CTE | Event identity; exactly equal to the containing outbox row `id`. |
+| `subscription_id` | string | `subscription.id` | Subscription being renewed. |
+| `customer_id` | string | `subscription.customer_id` | Customer billed by the renewal. |
+| `plan_id` | string | `subscription.plan_id` | Plan snapshot identity at scan time. |
+| `interval` | string | `plan.interval` | Plan interval snapshot (`month` or `year`). |
+| `amount_cents` | number | `plan.price_cents` | Amount to bill in integer minor units. |
+| `currency` | string | `plan.currency` | Currency code paired with `amount_cents`. |
+| `idempotency_key` | string | subscription id plus formatted due date | Stable payment key: `sub-<subscription_id>\|<due_date>`. |
+| `due_date` | string | local `due_ts`, cast to date and ISO-formatted | Actual charge due date (`YYYY-MM-DD`). |
+| `period_start` | string | `due_date` | Billed period start; equal to `due_date`. |
+| `period_end` | string | `due_date` plus `plan.interval` | Billed period end: one month or one year after `due_date`. |
+| `occurred_at` | string | scan transaction `now()`, formatted in UTC | ISO-8601 event creation timestamp with zone information. |
+
+Per [G8](invariants.md#g8), changes within v1 are additive only. Consumers tolerate
+unknown fields explicitly through `@JsonIgnoreProperties(ignoreUnknown = true)` (and
+Spring Boot's default ObjectMapper behavior). Removing or re-typing a field requires a
+version bump and a decision entry; see [D8](decisions.md#d8).
 
 ## Data model (Flyway, `db-migrations/`)
 

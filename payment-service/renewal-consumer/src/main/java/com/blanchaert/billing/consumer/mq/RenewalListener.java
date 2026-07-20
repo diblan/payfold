@@ -25,11 +25,6 @@ public class RenewalListener {
     public void onMessage(Message msg) throws Exception {
         RenewalRequested evt = om.readValue(msg.getBody(),
                 RenewalRequested.class);
-        // Compute period if publisher did not include it
-        if (evt.period_start() == null || evt.period_end() == null) {
-            // Fallback: infer today’s cycle
-            // You can also send these from the producer; left here for resilience.
-        }
         billing.process(evt);
     }
 }

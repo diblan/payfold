@@ -26,8 +26,8 @@ processed-message table or an in-memory cache.
 **Why:** constraints survive restarts and concurrent consumers with zero extra
 infrastructure; the database is already the source of truth.
 **Trade-off:** constraint design is load-bearing — a wrong key derivation breaks
-idempotency invisibly, which is exactly the current [G2](invariants.md#g2) violation
-(key derived from consume-time clock; fixed by [R4](roadmap.md#r4)).
+idempotency invisibly. [R4](roadmap.md#r4) removed that risk from the consumer by
+making the producer-supplied key and period authoritative.
 
 ## D3 — Flyway as sole schema authority — pre-2026-07 — active
 <a id="d3"></a>
@@ -75,3 +75,17 @@ per session** with no drive-by fixes.
 and a verification ratchet, ballooning scope and doc rot are the default outcome.
 **Consequence:** code gaps found during adoption were *not* fixed — they became
 [roadmap items](roadmap.md) with acceptance criteria instead.
+
+## D8 — Message contract v1 — 2026-07-20 — active
+<a id="d8"></a>
+`renewal.requested` v1 carries identity (`event_id`, equal to the outbox row id), the
+stable `idempotency_key` (`sub-<subscription_id>|<due_date>`), `due_date`, the full
+billing period, `occurred_at`, and `schema_version: 1`, alongside the original billing
+fields. The consumer trusts payload values only and rejects missing or invalid billing
+material through `InvalidRenewalMessageException`; it never guesses a key or date.
+**Why:** idempotency material must be minted once by the single writer that owns the
+truth: the producer's scan transaction. Consumer-side derivation introduces a second
+clock and makes redelivery timing observable in billing identity.
+**Trade-off:** the payload is fatter, and producer and consumer must agree on the
+documented contract. Versioning follows [G8](invariants.md#g8): v1 evolves additively;
+removal or re-typing requires a version bump and another decision entry.
