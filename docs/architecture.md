@@ -20,7 +20,7 @@ Honesty table:
 | Bounded failure handling (DLQ) | Demonstrated — bounded listener retry + DLQ routing; poison-path integration test and `verify.sh` probe; see [G5](invariants.md#g5) |
 | Provider failure path (mock PSP) | Demonstrated — deterministic decline + timeout handling, failed payments quarantined unfinalized; exact-count verify.sh assertion |
 | Operational observability | Demonstrated — SLF4J logging, Prometheus counters + built-in job/listener timers, `verify.sh` cross-checks metric deltas against DB deltas |
-| Throughput at 330k/day | Extrapolated — demo seeds 15k; measured run is [R12](roadmap.md#r12) |
+| Throughput at 330k/day | Producer side measured — 1,015,000 due rows scanned + published in 459 s wall, peak heap 183 MiB (2026-07-21, see quality.md "Measured scale runs"); consumer-side sustained rate stays extrapolated until [R12](roadmap.md#r12) |
 | Horizontal producer scaling | Demonstrated — `FOR UPDATE SKIP LOCKED` page claims + advisory-lock cron guard; exactly-once under two concurrent publishers proven by test (compose still runs a single producer instance) |
 
 ## Component map
@@ -34,10 +34,10 @@ Honesty table:
                  └─────────────┘                   └──────┬───────┘
                                                           │
    cron 03:00 ──▶┌──────────────────────┐    scanStep     │
-   or POST       │   renewal-producer   │  INSERT..SELECT │
+   or POST       │   renewal-producer   │ keyset pages/tx │
    /actuator/    │   (Spring Batch)     ├────────────────▶│  renewal_outbox
    renewal-job   │   :8080              │    publishStep  │
-                 └──────────┬───────────┘  page 1000/tx   │
+                 └──────────┬───────────┘  page 10000/tx  │
                             │ publish + mark published_at │
                             ▼                             │
                  ┌──────────────────────┐                 │
@@ -98,17 +98,28 @@ Two ways to launch, both build the identifying parameter `scheduleDate = today`:
   The single launcher thread queues concurrent force-triggers so they run
   serially (a queued run reports `STARTING` until the thread frees).
 
-**scanStep** — one tasklet, one transaction, one SQL statement:
-`INSERT INTO renewal_outbox (id, subscription_id, due_date, payload) SELECT ...` over active
-subscriptions whose `renewed_at + plan interval` falls in today's local-day window.
-`ON CONFLICT (subscription_id, due_date) DO NOTHING` (constraint `uniq_outbox_sub_due`)
-makes re-scans idempotent. Each row's payload is the full
-[`renewal.requested` v1 contract](#message-contract--renewalrequested-v1), including
-the producer-minted identity, idempotency key, due date, and billing period.
-Single transaction over all active subscriptions is the 10M-scale bottleneck ([R11](roadmap.md#r11)).
+**scanStep** — a tasklet re-run per page (`RepeatStatus.CONTINUABLE`), one
+transaction per page, keyset-paginated over the primary key: each iteration
+selects the next `${app.scanPageSize}` (default 10000) active subscriptions with
+`s.id > cursor ORDER BY s.id LIMIT n`, applies the due-window filter
+(`renewed_at` + plan interval falling in today's local-day window) *inside* the
+page, and inserts the page's due rows into `renewal_outbox` with
+`ON CONFLICT (subscription_id, due_date) DO NOTHING` (constraint
+`uniq_outbox_sub_due`), so re-scans and crash-resumed scans stay idempotent
+across pages. The page query reports its own row count and last id regardless of
+how many rows were due, so all-not-due pages still advance the cursor; the loop
+ends when a page comes back short, never on `inserted == 0`. The cursor — and
+the due window, fixed at the first page so a scan crossing midnight keeps one
+consistent window — is carried in the step ExecutionContext, which Spring Batch
+persists in the same transaction as the page's inserts, so a restart resumes
+from the last committed page. Each row's payload is the full
+[`renewal.requested` v1 contract](#message-contract--renewalrequested-v1),
+including the producer-minted identity, idempotency key, due date, and billing
+period. Scanning keyset-over-all-actives instead of indexing the due predicate
+is [D10](decisions.md#d10).
 
 **publishStep** — tasklet re-run per page (`RepeatStatus.CONTINUABLE`), one page per
-transaction: select `LIMIT ${app.publishPageSize}` (default 1000) unpublished rows ordered
+transaction: select `LIMIT ${app.publishPageSize}` (default 10000, raised from 1000 by [R11](roadmap.md#r11) so 1M rows publish in ~100 page transactions instead of ~1000) unpublished rows ordered
 by `id` with `FOR UPDATE SKIP LOCKED`, so concurrent publishers claim disjoint pages,
 then publish each via `OutboxPublisher` with correlated publisher confirms
 (`spring.rabbitmq.publisher-confirm-type: correlated`) and the outbox row id as the
@@ -268,7 +279,7 @@ Every remaining `application.yaml` key has a real consumer.
 | `spring.jackson.time-zone` (both) | Spring Boot Jackson autoconfig | alive |
 | `spring.batch.jdbc.initialize-schema` (producer) | Spring Batch | alive |
 | `spring.rabbitmq.publisher-confirm-type` (producer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` confirm type); load-bearing: without it confirm futures never complete and every page times out | alive |
-| `app.timezone`, `app.scheduleCron`, `app.publishPageSize`, `app.confirmTimeoutMs` (producer) | `RenewalScheduler`, `RenewalJobConfig`, `RenewalJobEndpoint` | alive |
+| `app.timezone`, `app.scheduleCron`, `app.scanPageSize`, `app.publishPageSize`, `app.confirmTimeoutMs` (producer) | `RenewalScheduler`, `RenewalJobConfig`, `RenewalJobEndpoint` | alive |
 | `rabbitmq.exchange`, `rabbitmq.routingKey` (producer) | `RabbitConfig`, `OutboxPublisher` | alive |
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |
 | `payment.provider.base-url` (consumer) | `PaymentProviderProperties`, `PspClient`; compose overrides with `PAYMENT_PROVIDER_BASE_URL` | alive |

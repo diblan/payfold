@@ -18,7 +18,7 @@ Last full re-grade: **2026-07-21** (R13 entropy pass).
 
 | Module | Grade | Why | Tracked by |
 |---|---|---|---|
-| `billing-engine/renewal-producer` | **C** | Tested (smoke, confirm-gating, competing-publisher, and async-trigger suites), observable (eager counters + built-in batch timers), documented; the single-transaction scan remains the tracked scale gap | [R11](roadmap.md#r11), [R14](roadmap.md#r14) |
+| `billing-engine/renewal-producer` | **B** | Tested (smoke, confirm-gating, competing-publisher, async-trigger, and keyset-scan suites), observable (eager counters + built-in batch timers), documented; scan and publish both page in bounded memory and the 1M-row producer run is measured (see “Measured scale runs”); the remaining known gap is the machine-local Testcontainers pin | [R14](roadmap.md#r14) |
 | `payment-service/renewal-consumer` | **A** | Tested (real-broker integration suite including decline, timeout, and poison paths), observable (SLF4J, `renewals_processed_total{outcome}`, Prometheus endpoint, and listener timer), and documented (contract + architecture); no known behavior defects | [R14](roadmap.md#r14) |
 | `db-migrations` | **B** | Clean, ordered, sole schema authority; V1 carries aspirational tables (`bank_tx`, `recon_match`, `ledger_entry`) no code uses — harmless but reviewer-confusing | — |
 | `seed-data-gen` | **C** | Seeds 15k due-today customers idempotently; `SubscriptionSeeder.java` is dead code, seed size hardcoded, `.bat`/`.sh` drift | [R12](roadmap.md#r12) |
@@ -36,7 +36,12 @@ two simultaneous publishers claim disjoint pages, publish each row exactly once,
 leave none skipped.
 `AsyncTriggerEndpointTest` proves the endpoint trigger returns an execution id
 while the job is still gated mid-publish, and that the endpoint's read operation
-tracks the execution to COMPLETED. The consumer suite publishes real
+tracks the execution to COMPLETED.
+`ScanKeysetPaginationTest` drives the whole job through three keyset pages (page size
+2), proves a never-renewed subscription stays invisible to the scan, field-checks a
+sample payload against the v1 contract, and re-runs the job to prove cross-page
+re-scan dedup (zero new rows, zero inserted-counter delta, no re-publish).
+The consumer suite publishes real
 `renewal.requested` messages through RabbitMQ, covers cross-midnight redelivery
 idempotency, and covers provider decline, timeout, and no-retry-on-redelivery through
 the real broker and a WireMock container. It also covers the poison path: malformed
@@ -51,3 +56,27 @@ deltas against outbox database deltas.
 `scripts/verify.sh` remains the end-to-end black-box check for the full Compose stack,
 including the async trigger-then-poll happy path, same-day idempotency, a strict poison-message DLQ probe, and
 exact deterministic provider-failure assertions.
+
+## Measured scale runs
+
+- **2026-07-21 — 1M producer run (R11, the commit this section ships in; WSL2 Docker
+  Compose stack, no config overrides).** Seeded 1,015,000 active due-today
+  subscriptions (ad-hoc `generate_series` SQL on top of the 15k demo seed; tooling
+  deliberately uncommitted — [R12](roadmap.md#r12) owns the durable load script).
+  `renewalJob`, triggered through the async endpoint, **COMPLETED in 459 s wall**
+  (execution-status `endTime − startTime`, 10:49:23 → 10:57:02, corroborated by
+  external polling). **Peak producer heap 183 MiB** against a 3.9 GiB max
+  (page-shaped sawtooth; container RSS 654 MiB) — keyset scan pages (10k) and
+  publish pages (10k) hold memory flat at 68× demo scale.
+  `outbox_inserted_total` and `outbox_published_total` both ended at exactly
+  1,015,000 with zero unpublished rows: every page fully confirmed, no
+  zero-progress failures, `app.confirmTimeoutMs` untouched. RabbitMQ absorbed the
+  ~1M-deep queue at ~260 MiB broker memory (no flow control). Step split per the
+  batch timers: scan ≈ 23 s, publish ≈ 482 s — but note those monotonic-clock
+  timers summed to 505 s, ~10% above wall clock (WSL2 nanoTime drift); wall clock
+  is the recorded truth. The consumer was still draining (~41 msg/s sustained,
+  failed:succeeded ratio matching the 1/16 PSP rule) when the stack was reset —
+  consumer-side sustained rate is [R12](roadmap.md#r12)'s measurement.
+  15k parity after the reshape: scanStep 0.356 s / publishStep 2.775 s versus the
+  0.327 s / 3.008 s single-transaction baseline (commit a22cab3) — no regression
+  at demo scale.

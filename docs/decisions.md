@@ -114,3 +114,28 @@ ambiguous, so all sites qualify explicitly. The executor bean must not be named
 `taskExecutor` — `@EnableBatchProcessing` wires a bean of that name into the
 default launcher, which would make the cron path async too. The single launcher
 thread serializes concurrent force-triggers instead of stacking job threads.
+
+## D10 — Keyset scan over all actives, due filter in-page — 2026-07-21 — active
+<a id="d10"></a>
+[R11](roadmap.md#r11) replaced the scan's single `INSERT...SELECT` transaction with a
+keyset-paginated tasklet loop: one transaction per page of `app.scanPageSize` active
+subscriptions claimed by primary-key order, the due-window filter applied inside the
+page, and the cursor persisted in the step ExecutionContext atomically with the
+page's inserts.
+**Why keyset-over-all-actives:** the nightly scan reads every active subscription
+(10M at target scale) to find the due ~330k rather than indexing the due predicate:
+`due_ts` is `renewed_at + plan.interval` localized to a configurable timezone — a
+cross-table, timezone-dependent (hence non-IMMUTABLE) expression Postgres cannot put
+in an expression index — and a PK-ordered pass is sequential-friendly I/O that adds
+no write amplification to the hot subscription table.
+**Trade-off:** scan cost scales with the active base, not the due set. That makes the
+in-page filter contract load-bearing: the page query must report its row count and
+last id regardless of how many rows were due, so all-not-due pages advance the cursor
+and the loop ends on a short page, never on `inserted == 0`.
+**Publish side:** measured before deciding (15k baseline, 2026-07-21: publishStep
+3.0 s ≈ 5k msg/s single-channel, sends already pipelined within a page behind one
+batched confirm await). At that rate the nightly 330k publishes in ~66 s, so no new
+mechanism is justified; R11 only raises `app.publishPageSize` 1000 → 10000 to cut
+per-page claim/commit/confirm-await overhead ~10× at 1M scale. A
+`BatchingRabbitTemplate` was explicitly rejected: it changes the wire format and
+would break the v1 contract ([G8](invariants.md#g8)).

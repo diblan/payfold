@@ -129,7 +129,7 @@ a `@ReadOperation` reports execution status.
 long-blocking POST to trigger-then-poll-status.
 
 <a id="r11"></a>
-### [ ] R11 — Scale the scan and publish
+### [x] R11 — Scale the scan and publish
 **Scope:** `RenewalJobConfig`.
 Replace the single-transaction `INSERT...SELECT` with keyset-paginated chunks; batch or
 pipeline the publish side (today: one synchronous send per message).
@@ -175,3 +175,16 @@ message as unconfirmed so its outbox row stays unpublished. Mind the
 correlation subtlety: a returned message is also ack'ed, so the return must win.
 **Done when:** a test publishing to a binding-less exchange keeps the row's
 `published_at` NULL; [architecture.md](architecture.md) documents the semantics.
+
+<a id="r16"></a>
+### [ ] R16 — Month-end clamp days break "due today" seeding
+**Scope:** `seed-data-gen`, `ScanKeysetPaginationTest`.
+`renewed_at + INTERVAL '1 month'` can never land on a month-end day the previous
+month lacks (Postgres and java.time both clamp: Jun 30 + 1 month = Jul 30). On
+Mar 29–31 (non-leap), May 31, Jul 31, Oct 31, and Dec 31 the seeder cannot construct
+due-today subscriptions, so `verify.sh`'s "outbox contains renewals due today" check
+and the keyset-scan test's due-today seeds both go red. Pre-existing since the seeder
+was written; surfaced during [R11](#r11)'s test design.
+**Done when:** seeding (and the test seed) constructs due-today rows on every
+calendar day — e.g. via a year-interval plan for clamp days or an injectable clock —
+and a test covers a clamp date.

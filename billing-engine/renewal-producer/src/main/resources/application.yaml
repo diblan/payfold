@@ -16,7 +16,8 @@ spring:
 
 app:
   timezone: Europe/Brussels
-  publishPageSize: 1000
+  scanPageSize: 10000
+  publishPageSize: 10000
   confirmTimeoutMs: 10000
   scheduleCron: "0 0 3 * * *"   # 03:00 local by default
 

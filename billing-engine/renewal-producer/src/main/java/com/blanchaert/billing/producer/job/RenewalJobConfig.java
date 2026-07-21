@@ -11,6 +11,7 @@ import org.springframework.batch.core.launch.JobLauncher;
 import org.springframework.batch.core.launch.support.TaskExecutorJobLauncher;
 import org.springframework.batch.core.repository.JobRepository;
 import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.item.ExecutionContext;
 import org.springframework.batch.repeat.RepeatStatus;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
@@ -32,6 +33,9 @@ import java.util.concurrent.TimeoutException;
 @EnableBatchProcessing
 public class RenewalJobConfig {
     private static final Logger log = LoggerFactory.getLogger(RenewalJobConfig.class);
+    private static final String SCAN_CURSOR_KEY = "scanStep.cursor";
+    private static final String SCAN_WINDOW_KEY = "scanStep.window";
+    private static final String NIL_UUID = "00000000-0000-0000-0000-000000000000";
 
     @Bean
     public ThreadPoolTaskExecutor renewalJobTaskExecutor() {
@@ -78,29 +82,56 @@ public class RenewalJobConfig {
                          PlatformTransactionManager tx,
                          JdbcTemplate jdbc,
                          MeterRegistry meters,
-                         @Value("${app.timezone:Europe/Brussels}") String tz) {
+                         @Value("${app.timezone:Europe/Brussels}") String tz,
+                         @Value("${app.scanPageSize:10000}") int scanPageSize) {
         Counter insertedCounter = Counter.builder("outbox.inserted")
                 .description("Outbox rows inserted by scanStep")
                 .register(meters);
         return new StepBuilder("scanStep", repo)
                 .tasklet((contribution, chunkContext) -> {
+                    // Keyset-paginated scan: each iteration handles one PK-ordered page of active
+                    // subscriptions in its own transaction and re-runs via RepeatStatus.CONTINUABLE.
+                    // The scan deliberately reads every active subscription (10M at target scale) to
+                    // find the due ~330k: the due predicate (renewed_at + plan interval, localized to
+                    // a configurable timezone) is cross-table and non-IMMUTABLE, so Postgres cannot
+                    // carry it in an expression index, and a PK-ordered pass is sequential-friendly
+                    // I/O with no extra write amplification (D10). The due-window filter sits INSIDE
+                    // the page, so the page query reports its row count and last id no matter how
+                    // many rows were due — all-not-due pages still advance the cursor, and the loop
+                    // ends on a short page, never on inserted == 0. The cursor and the due window
+                    // (fixed on the first page so a scan crossing midnight keeps one consistent
+                    // window) live in the step ExecutionContext, which Spring Batch persists in the
+                    // same transaction as the page's inserts: a crash resumes from the last
+                    // committed page, and ON CONFLICT DO NOTHING absorbs the one re-scanned page.
+                    ExecutionContext stepCtx = chunkContext.getStepContext().getStepExecution().getExecutionContext();
                     ZoneId zone = ZoneId.of(tz);
-                    LocalDate today = LocalDate.now(zone);
+                    String windowDate = stepCtx.getString(SCAN_WINDOW_KEY, null);
+                    LocalDate today = windowDate == null ? LocalDate.now(zone) : LocalDate.parse(windowDate);
+                    if (windowDate == null) {
+                        stepCtx.putString(SCAN_WINDOW_KEY, today.toString());
+                    }
                     LocalDateTime start = today.atStartOfDay();
                     LocalDateTime end = today.plusDays(1).atStartOfDay();
-                    // Insert into outbox in the same tx; guard against duplicates via (subscription_id, due_date)
+                    UUID cursor = UUID.fromString(stepCtx.getString(SCAN_CURSOR_KEY, NIL_UUID));
+
                     String sql = """
-                            WITH due AS (
-                                SELECT s.id AS subscription_id, s.customer_id, s.plan_id,
-                                    p.interval, p.price_cents, p.currency,
-                                (CASE WHEN p.interval = 'year'
-                                    THEN (s.renewed_at + INTERVAL '1 year')
-                                    ELSE (s.renewed_at + INTERVAL '1 month')
-                                    END) AS due_ts
+                            WITH page AS (
+                                SELECT s.id, s.customer_id, s.plan_id, s.renewed_at
                                 FROM subscription s
-                                JOIN plan p ON p.id = s.plan_id
                                 WHERE s.status = 'active'
-                                AND s.renewed_at IS NOT NULL
+                                  AND s.renewed_at IS NOT NULL
+                                  AND s.id > ?
+                                ORDER BY s.id
+                                LIMIT ?
+                            ), due AS (
+                                SELECT p.id AS subscription_id, p.customer_id, p.plan_id,
+                                    pl.interval, pl.price_cents, pl.currency,
+                                    (CASE WHEN pl.interval = 'year'
+                                        THEN (p.renewed_at + INTERVAL '1 year')
+                                        ELSE (p.renewed_at + INTERVAL '1 month')
+                                        END) AS due_ts
+                                FROM page p
+                                JOIN plan pl ON pl.id = p.plan_id
                             ), win AS (
                                 SELECT *, due_ts AT TIME ZONE ? AS due_local
                                 FROM due
@@ -109,11 +140,11 @@ public class RenewalJobConfig {
                                     (due_local)::date AS due_date
                                 FROM win
                                 WHERE due_local >= ? AND due_local < ?
-                            )
-                            INSERT INTO renewal_outbox (id, subscription_id, due_date, payload)
-                            SELECT event_id,
-                                subscription_id,
-                                due_date,
+                            ), ins AS (
+                                INSERT INTO renewal_outbox (id, subscription_id, due_date, payload)
+                                SELECT event_id,
+                                    subscription_id,
+                                    due_date,
                                 jsonb_build_object(
                                     'schema_version', 1,
                                     'event_id', event_id,
@@ -138,19 +169,43 @@ public class RenewalJobConfig {
                                         'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
                                     )
                                 ) AS payload
-                            FROM events
-                            ON CONFLICT (subscription_id, due_date) DO NOTHING;
+                                FROM events
+                                ON CONFLICT (subscription_id, due_date) DO NOTHING
+                                RETURNING 1
+                            )
+                            SELECT count(*) AS page_rows,
+                                   (SELECT id FROM page ORDER BY id DESC LIMIT 1) AS last_id,
+                                   (SELECT count(*) FROM ins) AS inserted
+                            FROM page
                             """;
-                    int inserted = jdbc.update(con -> {
+
+                    record ScanPage(long pageRows, UUID lastId, long inserted) {
+                    }
+                    ScanPage page = jdbc.query(con -> {
                         var ps = con.prepareStatement(sql);
-                        ps.setString(1, zone.getId());
-                        ps.setObject(2, start);
-                        ps.setObject(3, end);
+                        ps.setObject(1, cursor);
+                        ps.setInt(2, scanPageSize);
+                        ps.setString(3, zone.getId());
+                        ps.setObject(4, start);
+                        ps.setObject(5, end);
                         return ps;
+                    }, rs -> {
+                        rs.next();
+                        return new ScanPage(
+                                rs.getLong("page_rows"),
+                                (UUID) rs.getObject("last_id"),
+                                rs.getLong("inserted")
+                        );
                     });
-                    insertedCounter.increment(inserted);
-                    log.info("Outbox rows inserted: {}", inserted);
-                    return RepeatStatus.FINISHED;
+
+                    insertedCounter.increment(page.inserted());
+                    log.info("Scan page: {} active subscriptions examined, {} outbox rows inserted",
+                            page.pageRows(), page.inserted());
+                    if (page.pageRows() < scanPageSize) {
+                        return RepeatStatus.FINISHED;
+                    }
+                    stepCtx.putString(SCAN_CURSOR_KEY, page.lastId().toString());
+                    return RepeatStatus.CONTINUABLE;
                 }, tx).build();
     }
 
@@ -160,7 +215,7 @@ public class RenewalJobConfig {
                             JdbcTemplate jdbc,
                             OutboxPublisher publisher,
                             MeterRegistry meters,
-                            @Value("${app.publishPageSize:1000}") int publishPageSize,
+                            @Value("${app.publishPageSize:10000}") int publishPageSize,
                             @Value("${app.confirmTimeoutMs:10000}") long confirmTimeoutMs) {
         Counter publishedCounter = Counter.builder("outbox.published")
                 .description("Outbox rows confirmed published")
