@@ -9,6 +9,9 @@ spring:
     time-zone: Europe/Brussels
   rabbitmq:
     publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
   batch:
     jdbc:
       initialize-schema: never

@@ -15,7 +15,7 @@ Honesty table:
 | Property | Status |
 |---|---|
 | Transactional outbox (atomic scan + publish intent) | Demonstrated |
-| Broker-acknowledged publish (publisher confirms) | Demonstrated — confirm-gated `published_at`, unconfirmed-repick test; unroutable-message detection is [R15](roadmap.md#r15) |
+| Broker-acknowledged publish (publisher confirms + returns) | Demonstrated — confirm-gated `published_at`, unconfirmed-repick test; mandatory publishing with publisher returns treats an unroutable (returned) message as unconfirmed, proven by a binding-less-exchange test ([R15](roadmap.md#r15)) |
 | Idempotent redelivery handling | Demonstrated — payload-keyed; covered by a cross-midnight integration test, see [G2](invariants.md#g2) |
 | Bounded failure handling (DLQ) | Demonstrated — bounded listener retry + DLQ routing; poison-path integration test and `verify.sh` probe; see [G5](invariants.md#g5) |
 | Provider failure path (mock PSP) | Demonstrated — deterministic decline + timeout handling, failed payments quarantined unfinalized; exact-count verify.sh assertion |
@@ -135,8 +135,15 @@ transaction and a later page or job run re-picks them. Unconfirmed rows stay NUL
 are re-picked by the next page or job run: delivery is at-least-once, and consumer
 idempotency absorbs duplicates ([G2](invariants.md#g2)). A page with zero confirmed rows
 fails the job, making the failure visible instead of tight-looping over the same page.
-A confirm means the exchange accepted the message; an unroutable message is confirmed
-and silently dropped until publisher returns add detection in [R15](roadmap.md#r15).
+A confirm alone only proves the exchange accepted the message: with no queue bound, the
+broker confirms and silently drops it. Publishing is therefore `mandatory` with
+publisher returns enabled ([R15](roadmap.md#r15)): the broker sends `basic.return`
+before the `basic.ack` for an unroutable message, spring-rabbit populates the
+correlation's returned message before completing the confirm future, and
+`OutboxPublisher` reports any returned message as unconfirmed — the return wins over
+the ack — so its row keeps `published_at` NULL and is re-picked. A fully-returned page
+ends in the zero-progress job failure above. Every returned message is logged at WARN
+with its routing key and counted by `outbox_returned_total`.
 
 Producer declares only the exchange (`RabbitConfig`); the consumer owns the rest of the topology.
 
@@ -196,8 +203,9 @@ payment status.
 ## Observability
 
 Both services log through SLF4J, with Logback supplied by Spring Boot's defaults.
-Normal batch progress and coordination skips are INFO; an unconfirmed publish page is
-WARN. A declined payment is INFO because it is an expected business outcome whose
+Normal batch progress and coordination skips are INFO; an unconfirmed publish page and
+each broker-returned (unroutable) message are WARN.
+A declined payment is INFO because it is an expected business outcome whose
 signal is the outcome counter.
 
 The Prometheus name is the external contract used by the roadmap and `verify.sh`.
@@ -208,6 +216,7 @@ Micrometer converts dots in meter names to underscores for Prometheus and append
 |---|---|---|---|---|
 | `outbox.inserted` | `outbox_inserted_total` | Counter | none | By the number of rows inserted immediately after the scan SQL update |
 | `outbox.published` | `outbox_published_total` | Counter | none | By the number of confirm-gated rows immediately after their `published_at` batch update |
+| `outbox.returned` | `outbox_returned_total` | Counter | none | Once per message the broker returned as unroutable, inside the confirm-future completion that reports the row unconfirmed |
 | `renewals.processed` | `renewals_processed_total{outcome="..."}` | Counter | `outcome=succeeded \| failed \| invalid` | Per processed delivery at its decision point: after successful finalization, at either terminal-failure return, or when validation rejects the message |
 
 All counter series are registered eagerly and therefore render as `0.0` from boot;
@@ -279,6 +288,8 @@ Every remaining `application.yaml` key has a real consumer.
 | `spring.jackson.time-zone` (both) | Spring Boot Jackson autoconfig | alive |
 | `spring.batch.jdbc.initialize-schema` (producer) | Spring Batch | alive |
 | `spring.rabbitmq.publisher-confirm-type` (producer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` confirm type); load-bearing: without it confirm futures never complete and every page times out | alive |
+| `spring.rabbitmq.publisher-returns` (producer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` returns support); load-bearing: without it the broker's `basic.return` is never delivered and an unroutable message is silently confirm-acked | alive |
+| `spring.rabbitmq.template.mandatory` (producer) | Spring Boot AMQP autoconfig (`RabbitTemplate` mandatory flag); makes the broker return unroutable messages instead of dropping them | alive |
 | `app.timezone`, `app.scheduleCron`, `app.scanPageSize`, `app.publishPageSize`, `app.confirmTimeoutMs` (producer) | `RenewalScheduler`, `RenewalJobConfig`, `RenewalJobEndpoint` | alive |
 | `rabbitmq.exchange`, `rabbitmq.routingKey` (producer) | `RabbitConfig`, `OutboxPublisher` | alive |
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |

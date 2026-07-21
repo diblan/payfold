@@ -166,7 +166,7 @@ Spring Boot version with Testcontainers 2 support.
 `~/.docker-java.properties` pin deleted.
 
 <a id="r15"></a>
-### [ ] R15 — Unroutable-message detection (publisher returns)
+### [x] R15 — Unroutable-message detection (publisher returns)
 **Scope:** producer `RabbitConfig`, `OutboxPublisher`, application.yaml.
 A publisher confirm only means the exchange accepted the message: if no queue is
 bound (e.g. the consumer never declared topology), the message is confirmed and

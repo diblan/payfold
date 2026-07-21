@@ -18,7 +18,7 @@ Last full re-grade: **2026-07-21** (R13 entropy pass).
 
 | Module | Grade | Why | Tracked by |
 |---|---|---|---|
-| `billing-engine/renewal-producer` | **A** | Tested (smoke, confirm-gating, competing-publisher, async-trigger, and keyset-scan suites, on Testcontainers 2.x with no machine-local Docker pins), observable (eager counters + built-in batch timers), documented; scan and publish both page in bounded memory and the 1M-row producer run is measured (see “Measured scale runs”); no known behavior defects | — |
+| `billing-engine/renewal-producer` | **A** | Tested (smoke, confirm-gating, return-gating, unroutable-return, competing-publisher, async-trigger, and keyset-scan suites, on Testcontainers 2.x with no machine-local Docker pins), observable (eager counters + built-in batch timers), documented; scan and publish both page in bounded memory and the 1M-row producer run is measured (see “Measured scale runs”); unroutable messages are returned, logged, counted, and re-picked instead of silently confirm-dropped; no known behavior defects | — |
 | `payment-service/renewal-consumer` | **A** | Tested (real-broker integration suite including decline, timeout, and poison paths, on Testcontainers 2.x with no machine-local Docker pins), observable (SLF4J, `renewals_processed_total{outcome}`, Prometheus endpoint, and listener timer), and documented (contract + architecture); no known behavior defects | — |
 | `db-migrations` | **B** | Clean, ordered, sole schema authority; V1 carries aspirational tables (`bank_tx`, `recon_match`, `ledger_entry`) no code uses — harmless but reviewer-confusing | — |
 | `seed-data-gen` | **B** | Seed size parameterized (`SEED_CUSTOMERS`, default 15k, all due today); emails numbered from the current row count so `customer_email_key` cannot collide at any size; dead `SubscriptionSeeder.java` deleted; the documented 100k run seeds in ~5 s and passed verify.sh. Remaining gaps: `run-seeder.bat` drift (cosmetic) and month-end clamp days | [R16](roadmap.md#r16) |
@@ -31,7 +31,14 @@ Last full re-grade: **2026-07-21** (R13 entropy pass).
 Both services have JUnit 5 integration coverage backed by Testcontainers 2.x and the
 real V1–V4 migrations. The producer has a context smoke test and a confirm-gating job test
 against a real-PostgreSQL container with publisher futures faked; the latter proves
-unconfirmed rows stay unpublished and are re-picked. `CompetingPublishersTest` proves
+unconfirmed rows stay unpublished and are re-picked.
+`PublisherReturnGatingTest` extends that recipe one level deeper — the
+`RabbitTemplate` itself is mocked, and a message that is acked but also returned
+resolves unconfirmed, so its row stays unpublished and is re-picked.
+`UnroutableReturnIntegrationTest` proves the same end to end: a real RabbitMQ broker
+with the exchange declared but no queue bound returns every publish, every row keeps
+`published_at` NULL, and the job fails on the zero-progress page.
+`CompetingPublishersTest` proves
 two simultaneous publishers claim disjoint pages, publish each row exactly once, and
 leave none skipped.
 `AsyncTriggerEndpointTest` proves the endpoint trigger returns an execution id

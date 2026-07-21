@@ -13,6 +13,10 @@ database as the business data it derives from. No code path may call
 `RabbitTemplate.convertAndSend` for renewals outside `OutboxPublisher` draining the outbox.
 Publishing is confirm-gated: `published_at` is set only after a broker confirm
 ([R6](roadmap.md#r6)).
+Publishing is mandatory with publisher returns enabled: a message the broker returns
+as unroutable is treated as unconfirmed even though the broker also acks it — the
+return wins — so `published_at` means routed to at least one queue, not merely
+accepted by the exchange ([R15](roadmap.md#r15)).
 A missing or timed-out confirm leaves the row unpublished and it is re-published, so
 outbox delivery is **at-least-once**. The broker may receive a message whose confirm was
 not seen in time, and that message is sent again; consumer idempotency absorbs this
@@ -22,7 +26,9 @@ duplicate window ([G2](invariants.md#g2)).
 payment service" — the transactional outbox pattern is the core of this project.
 *Enforced by:* code review; only `OutboxPublisher` touches the template; correlated
 publisher confirms gate `published_at`; `PublisherConfirmGatingTest` proves an
-unconfirmed row stays unpublished and is re-picked.
+unconfirmed row stays unpublished and is re-picked; `PublisherReturnGatingTest` and
+`UnroutableReturnIntegrationTest` prove a returned (unroutable) message never sets
+`published_at`.
 *Status:* **HELD**
 
 <a id="g2"></a>
