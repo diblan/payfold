@@ -154,7 +154,7 @@ updated. **No behavior changes allowed** in this session type.
 *Last run: 2026-07-21 (after R9, commit ecb935b).*
 
 <a id="r14"></a>
-### [ ] R14 — Migrate to Testcontainers 2.x
+### [x] R14 — Migrate to Testcontainers 2.x
 **Scope:** both module poms + test imports.
 Docker Engine 29 (min API 1.44) rejects the API-1.32 fallback in Testcontainers
 1.21.x's shaded docker-java; tests pass locally only via a machine-local

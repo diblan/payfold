@@ -18,8 +18,8 @@ Last full re-grade: **2026-07-21** (R13 entropy pass).
 
 | Module | Grade | Why | Tracked by |
 |---|---|---|---|
-| `billing-engine/renewal-producer` | **B** | Tested (smoke, confirm-gating, competing-publisher, async-trigger, and keyset-scan suites), observable (eager counters + built-in batch timers), documented; scan and publish both page in bounded memory and the 1M-row producer run is measured (see “Measured scale runs”); the remaining known gap is the machine-local Testcontainers pin | [R14](roadmap.md#r14) |
-| `payment-service/renewal-consumer` | **A** | Tested (real-broker integration suite including decline, timeout, and poison paths), observable (SLF4J, `renewals_processed_total{outcome}`, Prometheus endpoint, and listener timer), and documented (contract + architecture); no known behavior defects | [R14](roadmap.md#r14) |
+| `billing-engine/renewal-producer` | **A** | Tested (smoke, confirm-gating, competing-publisher, async-trigger, and keyset-scan suites, on Testcontainers 2.x with no machine-local Docker pins), observable (eager counters + built-in batch timers), documented; scan and publish both page in bounded memory and the 1M-row producer run is measured (see “Measured scale runs”); no known behavior defects | — |
+| `payment-service/renewal-consumer` | **A** | Tested (real-broker integration suite including decline, timeout, and poison paths, on Testcontainers 2.x with no machine-local Docker pins), observable (SLF4J, `renewals_processed_total{outcome}`, Prometheus endpoint, and listener timer), and documented (contract + architecture); no known behavior defects | — |
 | `db-migrations` | **B** | Clean, ordered, sole schema authority; V1 carries aspirational tables (`bank_tx`, `recon_match`, `ledger_entry`) no code uses — harmless but reviewer-confusing | — |
 | `seed-data-gen` | **B** | Seed size parameterized (`SEED_CUSTOMERS`, default 15k, all due today); emails numbered from the current row count so `customer_email_key` cannot collide at any size; dead `SubscriptionSeeder.java` deleted; the documented 100k run seeds in ~5 s and passed verify.sh. Remaining gaps: `run-seeder.bat` drift (cosmetic) and month-end clamp days | [R16](roadmap.md#r16) |
 | `mock-psp/` (WireMock) | **B** | Deterministic decline rule (last-hex-char class) rendered from inert `.json.tpl` templates by the compose entrypoint; healthchecked; exercised end-to-end by the consumer integration suite and `verify.sh`'s exact per-row assertions. The sed-render entrypoint itself has no direct test | — |
@@ -28,8 +28,8 @@ Last full re-grade: **2026-07-21** (R13 entropy pass).
 
 ## Test coverage
 
-Both services have JUnit 5 integration coverage backed by Testcontainers and the real
-V1–V4 migrations. The producer has a context smoke test and a confirm-gating job test
+Both services have JUnit 5 integration coverage backed by Testcontainers 2.x and the
+real V1–V4 migrations. The producer has a context smoke test and a confirm-gating job test
 against a real-PostgreSQL container with publisher futures faked; the latter proves
 unconfirmed rows stay unpublished and are re-picked. `CompetingPublishersTest` proves
 two simultaneous publishers claim disjoint pages, publish each row exactly once, and
