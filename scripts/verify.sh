@@ -3,9 +3,9 @@
 #
 # This script is the machine-checkable definition of "working" (see AGENTS.md and
 # docs/invariants.md G7): it may only ever be made stricter, never loosened.
-# It includes exact deterministic provider-failure assertions derived from the
-# PSP_FAIL_HEX environment variable and same-run Prometheus metric/DB delta
-# cross-checks.
+# It asserts the async renewal trigger returns an execution id in <1s,
+# polls that execution to completion, checks exact deterministic provider failures
+# derived from PSP_FAIL_HEX, and cross-checks same-run Prometheus/DB deltas.
 #
 # Usage:
 #   scripts/verify.sh [--no-up] [--timeout SECONDS] [--poison|--no-poison]
@@ -154,12 +154,51 @@ consumer_prometheus_ready() {
 }
 main_queue_empty() { [[ "$(queue_depth "$RMQ_QUEUE")" == "0" ]]; }
 
-trigger_job() { # -> echoes HTTP status code ("000" on timeout/conn error)
-  curl -sS -o /dev/null -w '%{http_code}' --max-time 240 \
+TRIGGER_CODE=""
+TRIGGER_TIME=""
+TRIGGER_EXEC_ID=""
+trigger_job() { # POST the force trigger; populates TRIGGER_CODE / TRIGGER_TIME / TRIGGER_EXEC_ID
+  local body_file meta
+  body_file="$(mktemp)"
+  meta="$(curl -sS -o "$body_file" -w '%{http_code} %{time_total}' --max-time 30 \
     -X POST "http://localhost:${PRODUCER_PORT}/actuator/renewal-job?force=true" \
     -H 'Content-Type: application/vnd.spring-boot.actuator.v3+json' \
-    -H 'Accept: application/json' -d '{}' 2>/dev/null
+    -H 'Accept: application/json' -d '{}' 2>/dev/null)"
+  TRIGGER_CODE="${meta%% *}"
+  TRIGGER_TIME="${meta#* }"
+  TRIGGER_EXEC_ID="$(grep -o '"executionId":[0-9]*' "$body_file" | head -1 | cut -d: -f2)"
+  rm -f "$body_file"
 }
+
+# assert_trigger <label> — three checks: HTTP 200, <1s wall time (the R10
+# ratchet: the POST must return immediately regardless of scale), executionId
+# present for the status poll.
+assert_trigger() {
+  local label="$1"
+  if [[ "$TRIGGER_CODE" == "200" ]]; then
+    pass "${label} returned 200"
+  else
+    fail "${label} returned 200" "HTTP ${TRIGGER_CODE:-none}"
+  fi
+  if awk -v t="${TRIGGER_TIME:-999}" 'BEGIN { exit !(t < 1.0) }'; then
+    pass "${label} returned in <1s (${TRIGGER_TIME}s)"
+  else
+    fail "${label} returned in <1s" "time_total=${TRIGGER_TIME:-unknown}s"
+  fi
+  if [[ "$TRIGGER_EXEC_ID" =~ ^[0-9]+$ ]]; then
+    pass "${label} response contains executionId (${TRIGGER_EXEC_ID})"
+  else
+    fail "${label} response contains executionId" "no executionId in response body"
+  fi
+}
+
+job_status() { # execution id -> status string, or "unreachable"
+  local body
+  body="$(curl -fsS "http://localhost:${PRODUCER_PORT}/actuator/renewal-job/$1" 2>/dev/null)" \
+    || { echo unreachable; return; }
+  echo "$body" | grep -o '"status":"[A-Z]*"' | head -1 | cut -d'"' -f4
+}
+job_completed() { [[ "$(job_status "$TRIGGER_EXEC_ID")" == "COMPLETED" ]]; }
 
 # --- run --------------------------------------------------------------------
 
@@ -196,14 +235,13 @@ M_PROC_BEFORE="$(prom_val "$CONSUMER_PORT" '^renewals_processed_total\{outcome="
 DB_OUTBOX_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox')"
 DB_PUB_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NOT NULL')"
 
-note "triggering renewal job (synchronous endpoint — may take a while)…"
-HTTP_CODE="$(trigger_job)"
-if [[ "$HTTP_CODE" == "200" ]]; then
-  pass "renewal job trigger returned 200"
-elif [[ "$HTTP_CODE" == "000" ]]; then
-  warn "renewal job trigger" "no response within 240s (endpoint blocks until job completes — R10); relying on DB polling"
+note "triggering renewal job (async endpoint — POST returns the execution id)…"
+trigger_job
+assert_trigger "renewal job trigger"
+if [[ "$TRIGGER_EXEC_ID" =~ ^[0-9]+$ ]]; then
+  wait_for "job execution ${TRIGGER_EXEC_ID} reached COMPLETED" job_completed
 else
-  fail "renewal job trigger" "HTTP ${HTTP_CODE}"
+  fail "job execution reached COMPLETED" "no executionId to poll"
 fi
 
 N_DUE="$(q 'SELECT count(*) FROM renewal_outbox WHERE due_date = current_date')"
@@ -316,11 +354,14 @@ fi
 note "same-day idempotency probe: re-triggering job, expecting zero new records…"
 SNAP_SQL="SELECT (SELECT count(*) FROM renewal_outbox) || '|' || (SELECT count(*) FROM payment) || '|' || (SELECT count(*) FROM charge) || '|' || (SELECT count(*) FROM invoice)"
 SNAP_BEFORE="$(q "$SNAP_SQL")"
-HTTP_CODE="$(trigger_job)"
-if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "000" ]]; then
-  fail "idempotency probe re-trigger" "HTTP ${HTTP_CODE}"
+trigger_job
+assert_trigger "idempotency re-trigger"
+if [[ "$TRIGGER_EXEC_ID" =~ ^[0-9]+$ ]]; then
+  wait_for "idempotency re-trigger execution ${TRIGGER_EXEC_ID} reached COMPLETED" job_completed
+else
+  fail "idempotency re-trigger execution reached COMPLETED" "no executionId to poll"
 fi
-sleep 5   # allow any (unexpected) messages to flow through
+sleep 5   # settle window for any (unexpected) in-flight messages
 SNAP_AFTER="$(q "$SNAP_SQL")"
 if [[ -n "$SNAP_BEFORE" && "$SNAP_BEFORE" == "$SNAP_AFTER" ]]; then
   pass "same-day idempotency: outbox/payment/charge/invoice counts unchanged (${SNAP_AFTER})"

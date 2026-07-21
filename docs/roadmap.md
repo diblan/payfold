@@ -121,7 +121,7 @@ and job/listener timers; expose the prometheus endpoint.
 verify.sh cross-checks `outbox_published_total` against the DB count.
 
 <a id="r10"></a>
-### [ ] R10 — Async job launch
+### [x] R10 — Async job launch
 **Scope:** `RenewalJobEndpoint`, launcher config.
 Task-executor-backed `JobLauncher`; `POST` returns immediately with the execution id;
 a `@ReadOperation` reports execution status.

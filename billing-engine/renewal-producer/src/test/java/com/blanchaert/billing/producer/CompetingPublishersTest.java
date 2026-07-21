@@ -7,6 +7,7 @@ import org.springframework.batch.core.Job;
 import org.springframework.batch.core.JobParametersBuilder;
 import org.springframework.batch.core.launch.JobLauncher;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -45,7 +46,10 @@ class CompetingPublishersTest {
     @ServiceConnection
     static final PostgreSQLContainer<?> postgres = postgresWithMigrations();
 
+    // The SYNC launcher: this test's assertions depend on run() returning only
+    // after the job finished.
     @Autowired
+    @Qualifier("jobLauncher")
     private JobLauncher jobLauncher;
 
     @Autowired

@@ -67,9 +67,10 @@ is unchanged.
 The renewal job is a two-step Spring Batch job rather than a hand-rolled scheduler loop.
 **Why:** job-instance identity on `scheduleDate` gives same-day re-run protection for
 free, plus execution metadata and restartability.
-**Trade-off:** the default synchronous `JobLauncher` makes the trigger endpoint block
-for the whole run ([R10](roadmap.md#r10)); job-instance identity only guards a single
-node ([R7](roadmap.md#r7)).
+**Trade-off:** job-instance identity only guards a single node ([R7](roadmap.md#r7)
+added the cross-instance guard); the default `JobLauncher` is synchronous, which
+blocked the trigger endpoint until [R10](roadmap.md#r10) gave the endpoint its own
+async launcher ([D9](#d9)).
 
 ## D7 — Harness adoption — 2026-07-18 — active
 <a id="d7"></a>
@@ -96,3 +97,20 @@ clock and makes redelivery timing observable in billing identity.
 **Trade-off:** the payload is fatter, and producer and consumer must agree on the
 documented contract. Versioning follows [G8](invariants.md#g8): v1 evolves additively;
 removal or re-typing requires a version bump and another decision entry.
+
+## D9 — Dual job launchers: async endpoint, sync scheduler — 2026-07-21 — active
+<a id="d9"></a>
+[R10](roadmap.md#r10) gives the actuator endpoint a dedicated
+`TaskExecutorJobLauncher` (`asyncJobLauncher`) on a single-thread executor:
+`POST /actuator/renewal-job` returns the `executionId` immediately and
+`GET /actuator/renewal-job/{executionId}` reports status from the `JobExplorer`.
+The cron scheduler keeps Spring Batch's default synchronous `jobLauncher`.
+**Why:** the scheduler releases its Postgres advisory lock when `run()` returns
+([R7](roadmap.md#r7)); an async launch there would release the lock while the job
+still runs and silently forfeit cross-instance serialization. Asynchrony is a
+property of the trigger endpoint, not of the job.
+**Trade-off:** two launcher beans make every unqualified `JobLauncher` injection
+ambiguous, so all sites qualify explicitly. The executor bean must not be named
+`taskExecutor` — `@EnableBatchProcessing` wires a bean of that name into the
+default launcher, which would make the cron path async too. The single launcher
+thread serializes concurrent force-triggers instead of stacking job threads.

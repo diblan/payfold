@@ -7,6 +7,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.batch.core.*;
 import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
 import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.launch.JobLauncher;
+import org.springframework.batch.core.launch.support.TaskExecutorJobLauncher;
 import org.springframework.batch.core.repository.JobRepository;
 import org.springframework.batch.core.step.builder.StepBuilder;
 import org.springframework.batch.repeat.RepeatStatus;
@@ -15,6 +17,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.transaction.PlatformTransactionManager;
 
 import java.time.*;
@@ -29,6 +32,34 @@ import java.util.concurrent.TimeoutException;
 @EnableBatchProcessing
 public class RenewalJobConfig {
     private static final Logger log = LoggerFactory.getLogger(RenewalJobConfig.class);
+
+    @Bean
+    public ThreadPoolTaskExecutor renewalJobTaskExecutor() {
+        // Single thread: concurrent force-triggers queue and run serially instead of
+        // stacking job threads; SKIP LOCKED already makes overlap row-safe, so this
+        // is hygiene, not correctness. NOT named "taskExecutor": @EnableBatchProcessing
+        // wires a bean of that name into the DEFAULT launcher, which would silently
+        // make the cron path async as well.
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(1);
+        executor.setThreadNamePrefix("renewal-job-");
+        return executor;
+    }
+
+    @Bean
+    public JobLauncher asyncJobLauncher(JobRepository repo,
+                                        @Qualifier("renewalJobTaskExecutor") ThreadPoolTaskExecutor executor) throws Exception {
+        // Endpoint-only launcher. The scheduler must keep Batch's default synchronous
+        // "jobLauncher": it releases the Postgres advisory lock when run() returns, so
+        // an async launch there would release the lock while the job still runs and
+        // destroy R7's cross-instance serialization.
+        TaskExecutorJobLauncher launcher = new TaskExecutorJobLauncher();
+        launcher.setJobRepository(repo);
+        launcher.setTaskExecutor(executor);
+        launcher.afterPropertiesSet();
+        return launcher;
+    }
 
     @Bean
     public Job renewalJob(

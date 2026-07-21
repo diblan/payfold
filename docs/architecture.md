@@ -87,7 +87,16 @@ Two ways to launch, both build the identifying parameter `scheduleDate = today`:
   The force path deliberately remains outside the scheduler guard: it is the
   operator's manual override, each force run is a distinct job instance, and
   `SKIP LOCKED` keeps concurrent runs row-safe.
-  The endpoint is **synchronous**: it blocks until the whole job finishes ([R10](roadmap.md#r10)).
+  Since [R10](roadmap.md#r10) the endpoint is **asynchronous**: the POST launches
+  the job on a dedicated single-thread executor via the endpoint-only
+  `asyncJobLauncher` bean and returns the `executionId` immediately;
+  `GET /actuator/renewal-job/{executionId}` reports live status from the
+  `JobExplorer` (unknown id → 404). The cron path keeps Batch's default
+  synchronous `jobLauncher` deliberately: the scheduler releases its advisory
+  lock when `run()` returns, so an async launch there would release the lock
+  mid-job and undo the cross-instance serialization above ([D9](decisions.md#d9)).
+  The single launcher thread queues concurrent force-triggers so they run
+  serially (a queued run reports `STARTING` until the thread frees).
 
 **scanStep** — one tasklet, one transaction, one SQL statement:
 `INSERT INTO renewal_outbox (id, subscription_id, due_date, payload) SELECT ...` over active
@@ -279,7 +288,7 @@ compose healthcheck hits `/actuator/health`, served by actuator since
 
 | Where | What |
 |---|---|
-| `localhost:8080` | producer — `/actuator/health`, `/actuator/prometheus`, `POST /actuator/renewal-job?force=true` |
+| `localhost:8080` | producer — `/actuator/health`, `/actuator/prometheus`, `POST /actuator/renewal-job?force=true`, `GET /actuator/renewal-job/{executionId}` |
 | `localhost:8081` | consumer — `/actuator/health` (since [R1](roadmap.md#r1)), `/actuator/prometheus`; container-internal 8080 |
 | `localhost:8082` | mock PSP (WireMock) — POST `/psp/charges`; admin/journal at `/__admin` |
 | `localhost:5672` / `15672` | RabbitMQ AMQP / management UI (creds from `.env`) |

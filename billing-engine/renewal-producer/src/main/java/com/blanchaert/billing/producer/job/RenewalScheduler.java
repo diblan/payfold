@@ -8,6 +8,7 @@ import org.springframework.batch.core.JobParametersBuilder;
 import org.springframework.batch.core.launch.JobLauncher;
 import org.springframework.batch.core.repository.JobExecutionAlreadyRunningException;
 import org.springframework.batch.core.repository.JobInstanceAlreadyCompleteException;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -28,7 +29,10 @@ public class RenewalScheduler {
     private final ZoneId zone;
     private final DataSource dataSource;
 
-    public RenewalScheduler(JobLauncher launcher, Job renewalJob,
+    // Explicitly the SYNC launcher (Batch's default "jobLauncher" bean): runDaily()
+    // releases the advisory lock when run() returns, so the launch must not outlive
+    // the lock. The async launcher (asyncJobLauncher) is endpoint-only — see D9.
+    public RenewalScheduler(@Qualifier("jobLauncher") JobLauncher launcher, Job renewalJob,
                             @Value("${app.timezone:Europe/Brussels}") String tz,
                             DataSource dataSource) {
         this.launcher = launcher;
