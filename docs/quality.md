@@ -3,7 +3,7 @@
 Coarse, honest, and **maintained**: any PR touching a module re-grades it in the same
 PR ([G6](invariants.md#g6)). The value of this file is currency, not precision.
 
-Last full re-grade: **2026-07-21** (R13 entropy pass).
+Last full re-grade: **2026-07-21** (R13 entropy pass, after R15).
 
 ## Rubric
 
@@ -21,10 +21,10 @@ Last full re-grade: **2026-07-21** (R13 entropy pass).
 | `billing-engine/renewal-producer` | **A** | Tested (smoke, confirm-gating, return-gating, unroutable-return, competing-publisher, async-trigger, and keyset-scan suites, on Testcontainers 2.x with no machine-local Docker pins), observable (eager counters + built-in batch timers), documented; scan and publish both page in bounded memory and the 1M-row producer run is measured (see “Measured scale runs”); unroutable messages are returned, logged, counted, and re-picked instead of silently confirm-dropped; no known behavior defects | — |
 | `payment-service/renewal-consumer` | **A** | Tested (real-broker integration suite including decline, timeout, and poison paths, on Testcontainers 2.x with no machine-local Docker pins), observable (SLF4J, `renewals_processed_total{outcome}`, Prometheus endpoint, and listener timer), and documented (contract + architecture); no known behavior defects | — |
 | `db-migrations` | **B** | Clean, ordered, sole schema authority; V1 carries aspirational tables (`bank_tx`, `recon_match`, `ledger_entry`) no code uses — harmless but reviewer-confusing | — |
-| `seed-data-gen` | **B** | Seed size parameterized (`SEED_CUSTOMERS`, default 15k, all due today); emails numbered from the current row count so `customer_email_key` cannot collide at any size; dead `SubscriptionSeeder.java` deleted; the documented 100k run seeds in ~5 s and passed verify.sh. Remaining gaps: `run-seeder.bat` drift (cosmetic) and month-end clamp days | [R16](roadmap.md#r16) |
+| `seed-data-gen` | **B** | Seed size parameterized (`SEED_CUSTOMERS`, default 15k, all due today); emails numbered from the current row count so `customer_email_key` cannot collide at any size; dead `SubscriptionSeeder.java` and the broken, unreferenced `run-seeder.bat` deleted; the documented 100k run seeds in ~5 s and passed verify.sh. Remaining gap: month-end clamp days | [R16](roadmap.md#r16) |
 | `mock-psp/` (WireMock) | **B** | Deterministic decline rule (last-hex-char class) rendered from inert `.json.tpl` templates by the compose entrypoint; healthchecked; exercised end-to-end by the consumer integration suite and `verify.sh`'s exact per-row assertions. The sed-render entrypoint itself has no direct test | — |
 | `docker-compose.yaml` + config | **B** | Stack ordering and healthchecks pass; app-specific env names use relaxed binding, yaml contains only consumed keys, and declared named-volume defaults preserve path overrides | — |
-| `docs/` + harness | **B** | CI uses pinned Maven wrappers and runs real-container integration tests for both services; `verify.sh` covers the happy path via the async trigger (<1s POST assert + execution-status polling), same-day idempotency, poison probe, per-row predicted PSP outcomes with an exact failed count, and same-run metric/DB delta cross-checks | — |
+| `docs/` + harness | **B** | CI uses pinned Maven wrappers and runs real-container integration tests for both services; `verify.sh` covers the happy path via the async trigger (<1s POST assert + execution-status polling), same-day idempotency, poison probe, per-row predicted PSP outcomes with an exact failed count, and same-run metric/DB delta cross-checks. Known gap: the poison probe's main-queue check reads the management API's eventually-consistent counter once, so it can flake at scale | [R17](roadmap.md#r17) |
 
 ## Test coverage
 

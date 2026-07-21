@@ -23,9 +23,9 @@ understanding to human reviewers as much as they guide agents.
 | `scripts/verify.sh` | End-to-end check; **the definition of "working"** |
 | `docs/architecture.md` | System map, message flow, scale math, config truth table |
 | `docs/invariants.md` | Golden rules G1–G8 with HELD/VIOLATED status |
-| `docs/decisions.md` | Decision log D1–D8 |
+| `docs/decisions.md` | Decision log |
 | `docs/quality.md` | Module grades A–D, re-graded on touch |
-| `docs/roadmap.md` | Non-goals + the ordered work queue R1–R15 |
+| `docs/roadmap.md` | Non-goals + the ordered work queue |
 | `notes/` | Gitignored private scratch (source articles); **never commit or quote verbatim** |
 
 ## Run & verify

@@ -105,8 +105,8 @@ under "Measured scale runs".
   100,000 renewals in ~30 minutes — ~55/s overall, **~48/s sustained** after a
   ~2-minute warm-up burst — with every renewal reaching its exact predicted
   terminal state, mock-PSP HTTP call and idempotent upsert chain included.
-  Adjacent runs measured 53/s (same day) and 42/s (against a 1M-deep queue).
-- **Extrapolation:** at the measured 42–48/s, a 330k nightly batch drains in
+  Adjacent runs measured 53/s (same day) and 41/s (against a 1M-deep queue).
+- **Extrapolation:** at the measured 41–48/s, a 330k nightly batch drains in
   1.9–2.2 hours — **11–13× the 3.8/s average** the 10M/month target requires.
 
 The consumer is the binding constraint. Untested levers, listed as future work
