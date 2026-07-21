@@ -20,7 +20,7 @@ Honesty table:
 | Bounded failure handling (DLQ) | Demonstrated — bounded listener retry + DLQ routing; poison-path integration test and `verify.sh` probe; see [G5](invariants.md#g5) |
 | Provider failure path (mock PSP) | Demonstrated — deterministic decline + timeout handling, failed payments quarantined unfinalized; exact-count verify.sh assertion |
 | Operational observability | Demonstrated — SLF4J logging, Prometheus counters + built-in job/listener timers, `verify.sh` cross-checks metric deltas against DB deltas |
-| Throughput at 330k/day | Producer side measured — 1,015,000 due rows scanned + published in 459 s wall, peak heap 183 MiB (2026-07-21, see quality.md "Measured scale runs"); consumer-side sustained rate stays extrapolated until [R12](roadmap.md#r12) |
+| Throughput at 330k/day | Measured end to end — producer: 1,015,000 due rows scanned + published in 459 s wall, peak heap 183 MiB; consumer: 100,000 due-today renewals drained in ~30 min (~48/s sustained) in [R12](roadmap.md#r12)'s documented run, so a 330k night is ~2.5 min of publishing plus 1.9–2.2 h of draining — 11–13× the 3.8/s requirement average. Single-node WSL2 dev-laptop numbers; the consumer is the binding constraint (2026-07-21, see quality.md "Measured scale runs") |
 | Horizontal producer scaling | Demonstrated — `FOR UPDATE SKIP LOCKED` page claims + advisory-lock cron guard; exactly-once under two concurrent publishers proven by test (compose still runs a single producer instance) |
 
 ## Component map
@@ -29,7 +29,7 @@ Honesty table:
                  ┌─────────────┐   Flyway V1–V4    ┌──────────────┐
                  │   flyway    ├──────────────────▶│              │
                  └─────────────┘                   │  postgres:18 │
-                 ┌─────────────┐   15k customers   │   (payfold)  │
+                 ┌─────────────┐  SEED_CUSTOMERS   │   (payfold)  │
                  │  seed-data  ├──────────────────▶│              │
                  └─────────────┘                   └──────┬───────┘
                                                           │
@@ -294,6 +294,13 @@ Spring relaxed-binding underscore names and added named-volume defaults for Post
 and RabbitMQ; local `.env` values can still select bind-mount paths. The consumer's
 compose healthcheck hits `/actuator/health`, served by actuator since
 [R1](roadmap.md#r1).
+
+Seed size is compose-only configuration, deliberately absent from the table above
+(the table covers `application.yaml` keys): `SEED_CUSTOMERS` (default 15000) is read
+by `CustomerSeeder` in the seed container ([R12](roadmap.md#r12)). Every seeded
+subscription is due on the seed day, so the value directly sets the size of the
+day's renewal batch; `scripts/load-test.sh` adds more due-today volume to a running
+stack without a reseed.
 
 ## Ports & endpoints
 

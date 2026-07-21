@@ -41,8 +41,12 @@ public class CustomerSeeder {
     public static void main(String[] args) throws Exception {
         // ---- Config ----
         String dataDir = args.length > 0 ? args[0] : "data";
-        int howMany = args.length > 1 ? Integer.parseInt(args[1]) : 15000;   // number of customers to insert
+        int howMany = args.length > 1 ? Integer.parseInt(args[1]) : seedTarget();   // number of customers to insert
 
+        // Email numbering starts at the current row count: every run draws from a
+        // fresh, disjoint number range, so customer_email_key (UNIQUE) cannot trip
+        // at any seed size or across top-up runs.
+        int offset;
         try (Connection conn = DriverManager.getConnection(url, user, pass)) {
             // count
             int have = 0;
@@ -55,6 +59,7 @@ public class CustomerSeeder {
                 System.out.println("Seed skip: customers=" + have);
                 return;
             } else {
+                offset = have;
                 howMany -= have;
             }
         }
@@ -89,8 +94,8 @@ public class CustomerSeeder {
                     String last = pickRandom(lastNames.get(loc), rnd);
                     String fullName = first + " " + last;
 
-                    // email: first.last + short unique suffix @example.<tld>
-                    String localPart = slugify(first) + "." + slugify(last) + randomSuffix(rnd);
+                    // email: first.last-<seq> @example.<tld>; <seq> is globally unique
+                    String localPart = slugify(first) + "." + slugify(last) + "-" + (offset + i);
                     String domain = "example." + loc.code; // be/nl/fr/en
                     String email = (localPart + "@" + domain).toLowerCase(Locale.ROOT);
 
@@ -100,6 +105,7 @@ public class CustomerSeeder {
                     ps.setString(4, loc.code);
                     ps.setString(5, STATUSES[rnd.nextInt(STATUSES.length)]);
                     ps.addBatch();
+                    if ((i + 1) % 1000 == 0) ps.executeBatch();   // bounded batch, same cadence as SubscriptionSeederDueToday
 
                     // Optional: uncomment for verbose progress
                     // System.out.println("[" + loc.code + "] " + fullName + " <" + email + ">");
@@ -111,6 +117,15 @@ public class CustomerSeeder {
         }
 
         System.out.println("✅ Inserted " + howMany + " customers with locale-aware names & emails.");
+    }
+
+    // Seed target: CLI arg wins, then the SEED_CUSTOMERS env var (passed through by
+    // docker-compose), then the 15000 demo default. A malformed value fails the seed
+    // container loudly (NumberFormatException) instead of silently shrinking the run.
+    private static int seedTarget() {
+        String v = System.getenv("SEED_CUSTOMERS");
+        if (v == null || v.isBlank()) return 15000;
+        return Integer.parseInt(v.trim());
     }
 
     // Read weight overrides from -Dw.be=.. etc.
@@ -176,11 +191,4 @@ public class CustomerSeeder {
         return norm.replaceAll("[^A-Za-z0-9._-]", "");
     }
 
-    // Small unique suffix to avoid email collisions while remaining readable
-    private static String randomSuffix(Random rnd) {
-        // 3 base36 chars => ~46k combos
-        int n = rnd.nextInt(36 * 36 * 36);
-        String base36 = Integer.toString(n, 36);
-        return "-" + "000".substring(base36.length()) + base36;
-    }
 }

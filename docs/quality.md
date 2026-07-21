@@ -21,7 +21,7 @@ Last full re-grade: **2026-07-21** (R13 entropy pass).
 | `billing-engine/renewal-producer` | **B** | Tested (smoke, confirm-gating, competing-publisher, async-trigger, and keyset-scan suites), observable (eager counters + built-in batch timers), documented; scan and publish both page in bounded memory and the 1M-row producer run is measured (see “Measured scale runs”); the remaining known gap is the machine-local Testcontainers pin | [R14](roadmap.md#r14) |
 | `payment-service/renewal-consumer` | **A** | Tested (real-broker integration suite including decline, timeout, and poison paths), observable (SLF4J, `renewals_processed_total{outcome}`, Prometheus endpoint, and listener timer), and documented (contract + architecture); no known behavior defects | [R14](roadmap.md#r14) |
 | `db-migrations` | **B** | Clean, ordered, sole schema authority; V1 carries aspirational tables (`bank_tx`, `recon_match`, `ledger_entry`) no code uses — harmless but reviewer-confusing | — |
-| `seed-data-gen` | **C** | Seeds 15k due-today customers idempotently; `SubscriptionSeeder.java` is dead code, seed size hardcoded, `.bat`/`.sh` drift | [R12](roadmap.md#r12) |
+| `seed-data-gen` | **B** | Seed size parameterized (`SEED_CUSTOMERS`, default 15k, all due today); emails numbered from the current row count so `customer_email_key` cannot collide at any size; dead `SubscriptionSeeder.java` deleted; the documented 100k run seeds in ~5 s and passed verify.sh. Remaining gaps: `run-seeder.bat` drift (cosmetic) and month-end clamp days | [R16](roadmap.md#r16) |
 | `mock-psp/` (WireMock) | **B** | Deterministic decline rule (last-hex-char class) rendered from inert `.json.tpl` templates by the compose entrypoint; healthchecked; exercised end-to-end by the consumer integration suite and `verify.sh`'s exact per-row assertions. The sed-render entrypoint itself has no direct test | — |
 | `docker-compose.yaml` + config | **B** | Stack ordering and healthchecks pass; app-specific env names use relaxed binding, yaml contains only consumed keys, and declared named-volume defaults preserve path overrides | — |
 | `docs/` + harness | **B** | CI uses pinned Maven wrappers and runs real-container integration tests for both services; `verify.sh` covers the happy path via the async trigger (<1s POST assert + execution-status polling), same-day idempotency, poison probe, per-row predicted PSP outcomes with an exact failed count, and same-run metric/DB delta cross-checks | — |
@@ -80,3 +80,23 @@ exact deterministic provider-failure assertions.
   15k parity after the reshape: scanStep 0.356 s / publishStep 2.775 s versus the
   0.327 s / 3.008 s single-transaction baseline (commit a22cab3) — no regression
   at demo scale.
+
+- **2026-07-21 — 100k end-to-end run (R12, the commit this entry ships in; WSL2
+  Docker Compose stack, no config overrides).** Fresh reset, then
+  `SEED_CUSTOMERS=100000 docker compose up -d --build`: the seed container compiled
+  and inserted 100,000 customers + 100,000 due-today subscriptions in **5.2 s**.
+  `scripts/verify.sh --no-up --timeout 3600` **passed every check**: `renewalJob`
+  COMPLETED in **21.6 s wall** (~4.6k msg/s publish; execution timestamps), and the
+  consumer drained all 100,000 renewals in **~30 min — ~55/s overall, ~48/s
+  sustained** after a ~2-minute ~150/s warm-up burst (`renewals_processed_total`
+  sampled every 60 s against wall clock), with the failed count exactly
+  6225/100000 per the PSP_FAIL_HEX=0 rule. A first, otherwise-identical run the
+  same day measured a 53/s steady drain and failed only "main queue empty after
+  poison message" on a stale management-API read (the live queue was empty) —
+  filed as [R17](roadmap.md#r17); the re-run passed clean.
+  `scripts/load-test.sh 50000`, exercised against the running 15k stack: seeded
+  50k extra due-today subscriptions in 1 s, job COMPLETED in 9 s (5,556 msg/s),
+  peak producer heap 77 MiB. The consumer is the binding constraint; untested
+  levers are listener concurrency and additional consumer instances (safe under
+  [G2](invariants.md#g2)'s constraint-based idempotency). Extrapolation math lives
+  in README "Scale: measured, not claimed".

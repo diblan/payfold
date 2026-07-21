@@ -137,7 +137,7 @@ pipeline the publish side (today: one synchronous send per message).
 duration and heap recorded in [quality.md](quality.md).
 
 <a id="r12"></a>
-### [ ] R12 — Seed & load story
+### [x] R12 — Seed & load story
 **Scope:** `seed-data-gen`, README, [architecture.md](architecture.md).
 Parameterize seed size (`SEED_CUSTOMERS` env); delete dead `SubscriptionSeeder.java`;
 add a load-test script; replace the bare 10M claim with measured-rate + extrapolation math.
@@ -188,3 +188,18 @@ was written; surfaced during [R11](#r11)'s test design.
 **Done when:** seeding (and the test seed) constructs due-today rows on every
 calendar day — e.g. via a year-interval plan for clamp days or an injectable clock —
 and a test covers a clamp date.
+
+<a id="r17"></a>
+### [ ] R17 — verify.sh: poison probe's main-queue check races the management API
+**Scope:** `scripts/verify.sh` only.
+The "main queue empty after poison message" assertion reads the management API's
+`messages` counter exactly once, immediately after the DLQ-depth poll succeeds. That
+counter refreshes on a ~5s stats interval, so the single read can return the
+pre-dead-letter value while the queue is actually empty — the sibling "DLQ empty
+after poison probe" check already polls for exactly this reason ([R5](#r5)). First
+observed failing during [R12](#r12)'s 100k run (2026-07-21): reported depth=1 while
+a live query showed `messages=0, ready=0, unacked=0`; the immediately following
+DLQ-drain steps passed. Converting the read to a bounded poll fixes the measurement
+race without weakening the asserted condition, so it is [G7](invariants.md#g7)-compatible.
+**Done when:** the check polls with a bounded timeout like its DLQ siblings and a
+100k-scale verify run passes it.

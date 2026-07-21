@@ -85,6 +85,7 @@ services:
       POSTGRES_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SEED_CUSTOMERS: ${SEED_CUSTOMERS:-15000}
     volumes:
       - ./seed-data-gen:/app:ro
     # invoked via bash: the /app mount is read-only, so chmod +x would fail (EROFS)

@@ -52,8 +52,8 @@ This README stays a quickstart; everything deeper belongs in `docs/`.
 
    - `postgres`: PostgreSQL 18 with the credentials supplied in `.env`
    - `flyway`: runs schema migrations stored in `db-migrations`
-   - `seed-data`: executes the Java seed scripts in `seed-data-gen` to populate
-     reference data
+   - `seed-data`: executes the Java seed scripts in `seed-data-gen`, seeding
+     `SEED_CUSTOMERS` customers (default 15000), each with a subscription due today
    - `rabbitmq`: RabbitMQ 3.13 with the management UI exposed locally
    - `mock-psp`: WireMock mock payment provider (port `8082`), declining a
      deterministic `PSP_FAIL_HEX` slice of renewals
@@ -88,6 +88,42 @@ This README stays a quickstart; everything deeper belongs in `docs/`.
    A `200 OK` response indicates the job was enqueued. You can watch the
    consumer logs (`docker compose logs -f renewal-consumer`) to see the payment
    processing in action.
+
+## Scale: measured, not claimed
+
+The design target is 10M subscription renewals a month — ≈330k/day, a 3.8/s
+sustained average. Renewals are billed in one nightly batch, so the real requirement
+is: scan and publish ~330k due renewals in one run, then drain the queue well before
+the next run. Both sides are measured on a single-node WSL2 dev laptop running the
+unmodified Compose stack; run details live in [docs/quality.md](docs/quality.md)
+under "Measured scale runs".
+
+- **Producer (scan + publish):** 1,015,000 due renewals scanned and published in
+  459 s wall at 183 MiB peak heap (1M-row run). At 100k the whole job takes ~22 s —
+  a 330k night is roughly 2.5 minutes of publishing.
+- **Consumer (bill + settle):** the documented 100k-due-today run drained all
+  100,000 renewals in ~30 minutes — ~55/s overall, **~48/s sustained** after a
+  ~2-minute warm-up burst — with every renewal reaching its exact predicted
+  terminal state, mock-PSP HTTP call and idempotent upsert chain included.
+  Adjacent runs measured 53/s (same day) and 42/s (against a 1M-deep queue).
+- **Extrapolation:** at the measured 42–48/s, a 330k nightly batch drains in
+  1.9–2.2 hours — **11–13× the 3.8/s average** the 10M/month target requires.
+
+The consumer is the binding constraint. Untested levers, listed as future work
+rather than claims: listener concurrency and additional consumer instances — both
+safe by design, because idempotency lives in database unique constraints, not in
+consumer state.
+
+Reproduce it yourself:
+
+```bash
+# the documented run: 100k due-today subscriptions from a fresh boot
+SEED_CUSTOMERS=100000 docker compose up -d --build
+scripts/verify.sh --no-up --timeout 3600
+
+# or: add due-today load to an already-running stack and measure the producer job
+scripts/load-test.sh 50000
+```
 
 ## Stopping and cleaning up
 
