@@ -187,7 +187,7 @@ volume before redeclaration; [D4](decisions.md#d4) records why the queue name st
 
 ## Mock PSP
 
-The mock provider runs WireMock `3.13.2-alpine`. Its source mappings live as inert
+The mock provider runs WireMock `3.13.2`. Its source mappings live as inert
 templates in `mock-psp/mappings/*.json.tpl`; the Compose entrypoint renders them with
 `sed`, substituting `PSP_FAIL_HEX` into the decline rule before WireMock starts. A
 subscription is declined exactly when the last hex character of its UUID belongs to
@@ -199,6 +199,31 @@ Testcontainers `GenericContainer`, then adds a test-only delayed response mappin
 the timeout path. `verify.sh` recomputes the exact expected failed set in SQL with the
 same last-character predicate and asserts every due renewal has its predicted terminal
 payment status.
+
+The wire contract, documented so a third party (e.g. the platform repo's
+in-cluster stub) can implement it without reading payfold source:
+
+**Request** — `POST /psp/charges`, `Content-Type: application/json`:
+
+| Field | JSON type | Semantics |
+|---|---|---|
+| `idempotency_key` | string | The payment's stable key (`sub-<subscription_id>\|<due_date>`); a real PSP would deduplicate on it |
+| `subscription_id` | string | Subscription UUID; the decline rule keys on its last hex character |
+| `amount_cents` | number | Amount in integer minor units ([G4](invariants.md#g4)) |
+| `currency` | string | Currency code paired with `amount_cents` |
+
+**Response** — always `200` with `Content-Type: application/json`:
+
+| Body | Meaning |
+|---|---|
+| `{"status": "succeeded"}` | Charge accepted; the consumer finalizes billing |
+| `{"status": "declined", "reason": "card_declined"}` | Business decline; payment becomes `failed`, nothing finalized |
+
+The consumer accepts unknown extra fields (`@JsonIgnoreProperties`), treats any
+`status` other than `succeeded` as a failure carrying `reason` (default
+`declined`), an empty body as `empty_provider_response`, and any timeout,
+connection error, or non-2xx as `provider_error:<cause>` — all business
+failures, never dead-lettered ([G5](invariants.md#g5)).
 
 ## Observability
 
@@ -354,7 +379,13 @@ and seed-data services) instead of bind-mounting host paths, so the local stack
 and `verify.sh` exercise the same artifact shape a cluster runs. The coupling
 surface the platform repo consumes is exactly: these images, the
 [configuration truth table](#configuration-truth-table), ports 8080/8081, and
-`/actuator/health` — a change to any of them must be flagged loudly, and R18
-changes nothing in the truth table itself. GHCR packages created by a first
-publish default to private; they must be made public (or given a pull secret)
-before a cluster can pull them.
+`/actuator/health` (readiness) and `/actuator/health/liveness` (liveness) — a
+change to any of them must be flagged loudly, and R18 changes nothing in the
+truth table itself. GHCR packages created by an Actions workflow via
+`GITHUB_TOKEN` are linked to the repository and inherit its visibility — payfold
+is public, so its packages publish public (observed at `v0.1.0`); a private
+repo's packages would need a visibility change or a pull secret.
+Spring Boot auto-enables the liveness/readiness probe groups when it detects
+Kubernetes, so `/actuator/health/liveness` exists in-cluster without extra
+configuration; the platform's liveness probes consume it (app-internal state
+only — an infrastructure outage degrades readiness, never liveness).

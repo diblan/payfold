@@ -59,7 +59,7 @@ services:
   # The entrypoint renders the mapping templates, substituting the PSP_FAIL_HEX
   # char class into the decline rule's regex; see docs/architecture.md#mock-psp.
   mock-psp:
-    image: wiremock/wiremock:3.13.2-alpine
+    image: wiremock/wiremock:3.13.2
     container_name: mock-psp
     environment:
       PSP_FAIL_HEX: ${PSP_FAIL_HEX:-0}

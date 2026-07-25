@@ -227,7 +227,7 @@ coupling surface unchanged; the publish workflow itself is exercised on the next
 manual tag push (out of session scope per the no-CI-push policy).
 
 <a id="r19"></a>
-### [ ] R19 — Platform-flagged contract debt: PSP wire schema + amd64-only WireMock
+### [x] R19 — Platform-flagged contract debt: PSP wire schema + amd64-only WireMock
 The platform repo's P8 onboarding had to author its own stub of the mock PSP
 because the **response** schema of `POST /psp/charges` is not documented contract
 (its P8 notes flag this to payfold explicitly), and its multi-arch audit found

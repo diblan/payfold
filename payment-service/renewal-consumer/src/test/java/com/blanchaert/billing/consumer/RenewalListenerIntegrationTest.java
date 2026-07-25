@@ -62,7 +62,7 @@ class RenewalListenerIntegrationTest {
 
     @Container
     static final GenericContainer<?> mockPsp = new GenericContainer<>(
-            DockerImageName.parse("wiremock/wiremock:3.13.2-alpine"))
+            DockerImageName.parse("wiremock/wiremock:3.13.2"))
             .withExposedPorts(8080)
             .withCopyToContainer(Transferable.of(renderPspTemplate("psp-charge-decline.json.tpl")), "/home/wiremock/mappings/psp-charge-decline.json")
             .withCopyToContainer(Transferable.of(renderPspTemplate("psp-charge-success.json.tpl")), "/home/wiremock/mappings/psp-charge-success.json")
