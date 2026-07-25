@@ -179,7 +179,7 @@ correlation subtlety: a returned message is also ack'ed, so the return must win.
 `published_at` NULL; [architecture.md](architecture.md) documents the semantics.
 
 <a id="r16"></a>
-### [ ] R16 — Month-end clamp days break "due today" seeding
+### [x] R16 — Month-end clamp days break "due today" seeding
 **Scope:** `seed-data-gen`, `ScanKeysetPaginationTest`.
 `renewed_at + INTERVAL '1 month'` can never land on a month-end day the previous
 month lacks (Postgres and java.time both clamp: Jun 30 + 1 month = Jul 30). On

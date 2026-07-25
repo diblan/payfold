@@ -11,9 +11,10 @@ public class SubscriptionSeederDueToday {
 
     // Default plan weights (override with -Dw.basic=0.30 etc.)
     private static final Map<String, Double> DEFAULT_WEIGHTS = Map.of(
-        "basic",    0.35,
-        "standard", 0.45,
-        "premium",  0.20
+        "basic",         0.35,
+        "standard",      0.45,
+        "premium",       0.20,
+        "premiumannual", 0.0
     );
 
     // Brussels timezone
@@ -54,7 +55,7 @@ public class SubscriptionSeederDueToday {
             }
 
             // 4) Insert subscriptions with due dates around today
-            int inserted = insertSubscriptionsWithDueWindow(conn, targets, picker, dueTodayRatio);
+            int inserted = insertSubscriptionsWithDueWindow(conn, targets, plans, picker, dueTodayRatio);
 
             conn.commit();
             System.out.println("✅ Inserted " + inserted + " subscriptions. dueTodayRatio=" + dueTodayRatio);
@@ -123,7 +124,8 @@ public class SubscriptionSeederDueToday {
     /* ---------------- Insert logic (due around today) ---------------- */
 
     private static int insertSubscriptionsWithDueWindow(Connection conn, List<UUID> customerIds,
-                                                       WeightedPicker<Plan> picker, double dueTodayRatio) throws SQLException {
+                                                       List<Plan> plans, WeightedPicker<Plan> picker,
+                                                       double dueTodayRatio) throws SQLException {
         LocalDate today = LocalDate.now(ZONE);
         Random rnd = new Random();
 
@@ -135,8 +137,6 @@ public class SubscriptionSeederDueToday {
         int count = 0;
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             for (UUID cid : customerIds) {
-                Plan plan = picker.pick();
-
                 // Decide the due day bucket: today / yesterday / tomorrow
                 LocalDate dueDate;
                 double r = rnd.nextDouble();
@@ -153,6 +153,24 @@ public class SubscriptionSeederDueToday {
 
                 // Use 09:00 local time so you don't hit midnight edge-cases
                 LocalDateTime dueAt = dueDate.atTime(9, 0);
+
+                Plan plan = picker.pick();
+                if (!intervalRoundTrips(plan.interval(), dueAt)) {
+                    Plan fallback = null;
+                    for (Plan candidate : plans) {
+                        if (!candidate.interval().equals(plan.interval())
+                                && intervalRoundTrips(candidate.interval(), dueAt)) {
+                            fallback = candidate;
+                            break;
+                        }
+                    }
+                    if (fallback == null) {
+                        throw new IllegalStateException(
+                                "No plan interval has a valid renewal preimage for " + dueDate
+                                        + " — is the yearly plan from migration V5 present?");
+                    }
+                    plan = fallback;
+                }
 
                 // Set renewed_at so that renewed_at + interval == dueAt
                 LocalDateTime renewedAt;
@@ -222,6 +240,17 @@ public class SubscriptionSeederDueToday {
     }
 
     /* ---------------- Helpers ---------------- */
+
+    // A plan interval is usable for a due date only if subtracting and re-adding
+    // it reproduces that date: calendar addition clamps (Jun 30 + 1 month =
+    // Jul 30), so on the day after a clamp no monthly preimage exists, and on
+    // Feb 29 no yearly one does. ClampDayDuePreimageTest (producer suite) proves
+    // the rule total and Postgres-equivalent.
+    static boolean intervalRoundTrips(String interval, LocalDateTime dueAt) {
+        return "year".equals(interval)
+                ? dueAt.minusYears(1).plusYears(1).equals(dueAt)
+                : dueAt.minusMonths(1).plusMonths(1).equals(dueAt);
+    }
 
     private static double parseDouble(String s, double def) {
         if (s == null) return def;

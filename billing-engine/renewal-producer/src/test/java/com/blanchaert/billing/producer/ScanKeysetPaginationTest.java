@@ -75,19 +75,25 @@ class ScanKeysetPaginationTest {
 
     @Test
     void scansInKeysetPagesAndDeduplicatesAFullRescan() throws Exception {
+        Boolean monthRoundTrips = jdbc.queryForObject(
+                "SELECT (now() - interval '1 month') + interval '1 month' = now()",
+                Boolean.class);
+        String seedInterval = Boolean.TRUE.equals(monthRoundTrips) ? "month" : "year";
+
         Plan plan = jdbc.queryForObject(
-                "SELECT id, price_cents, currency FROM plan WHERE interval = 'month' ORDER BY name LIMIT 1",
+                "SELECT id, price_cents, currency FROM plan WHERE interval = ? ORDER BY name LIMIT 1",
                 (rs, rowNum) -> new Plan(
                         (UUID) rs.getObject("id"),
                         rs.getLong("price_cents"),
                         rs.getString("currency")
-                )
+                ),
+                seedInterval
         );
 
         jdbc.update("INSERT INTO customer (id, email) VALUES (?, ?)", CUSTOMER_ID, "keyset-probe@example.test");
         jdbc.batchUpdate(
                 "INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at) "
-                        + "VALUES (?, ?, ?, 'active', now() - INTERVAL '1 month')",
+                        + "VALUES (?, ?, ?, 'active', now() - INTERVAL '1 " + seedInterval + "')",
                 DUE_SUBSCRIPTIONS,
                 DUE_SUBSCRIPTIONS.size(),
                 (statement, subscriptionId) -> {
@@ -169,7 +175,9 @@ class ScanKeysetPaginationTest {
                 .isEqualTo("sub-" + SUBSCRIPTION_1 + "|" + dueDate);
         assertThat(payload.get("period_start").asText()).isEqualTo(dueDate);
         assertThat(payload.get("period_end").asText())
-                .isEqualTo(LocalDate.parse(dueDate).plusMonths(1).toString());
+                .isEqualTo(("year".equals(seedInterval)
+                        ? LocalDate.parse(dueDate).plusYears(1)
+                        : LocalDate.parse(dueDate).plusMonths(1)).toString());
         assertThat(payload.get("occurred_at").asText())
                 .matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z");
 

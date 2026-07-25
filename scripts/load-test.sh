@@ -70,8 +70,11 @@ RUN_TAG="$(date +%s)-$$"
 note "seeding ${N} extra due-today subscriptions (emails load-${RUN_TAG}-<n>@example.test)…"
 SEED_START=$SECONDS
 SEED_OUT="$(docker compose exec -T postgres psql -U "$PGUSER" -d "$PGDB" -v ON_ERROR_STOP=1 <<SQL
-WITH monthly_plan AS (
-    SELECT id FROM plan WHERE interval = 'month' ORDER BY name LIMIT 1
+WITH seed_plan AS (
+    SELECT id, interval FROM plan
+    WHERE interval = CASE WHEN (now() - interval '1 month') + interval '1 month' = now()
+                          THEN 'month' ELSE 'year' END
+    ORDER BY name LIMIT 1
 ), new_customers AS (
     INSERT INTO customer (id, email)
     SELECT gen_random_uuid(), 'load-${RUN_TAG}-' || g || '@example.test'
@@ -79,8 +82,9 @@ WITH monthly_plan AS (
     RETURNING id
 )
 INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
-SELECT gen_random_uuid(), c.id, (SELECT id FROM monthly_plan), 'active',
-       now() - INTERVAL '1 month'
+SELECT gen_random_uuid(), c.id, (SELECT id FROM seed_plan), 'active',
+       CASE WHEN (SELECT interval FROM seed_plan) = 'year'
+            THEN now() - INTERVAL '1 year' ELSE now() - INTERVAL '1 month' END
 FROM new_customers c;
 ANALYZE customer;
 ANALYZE subscription;

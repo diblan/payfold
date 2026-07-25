@@ -16,7 +16,7 @@ understanding to human reviewers as much as they guide agents.
 |---|---|
 | `billing-engine/renewal-producer/` | Spring Batch job: scan due renewals → `renewal_outbox` → publish to RabbitMQ |
 | `payment-service/renewal-consumer/` | Listener → `BillingService` upsert chain (invoice/charge/payment) |
-| `db-migrations/` | Flyway V1–V4 — the **only** place schema changes happen |
+| `db-migrations/` | Flyway migrations — the **only** place schema changes happen |
 | `seed-data-gen/` | JDBC seeders run by compose (`SEED_CUSTOMERS` customers, default 15k, all due today) |
 | `mock-psp/` | WireMock mock PSP: decline-rule mapping templates (`.json.tpl`) rendered by the compose entrypoint |
 | `docker-compose.yaml` | Full local stack: postgres, flyway, seed, rabbitmq, mock-psp, both services |

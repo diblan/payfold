@@ -26,7 +26,7 @@ Honesty table:
 ## Component map
 
 ```
-                 ┌─────────────┐   Flyway V1–V4    ┌──────────────┐
+                 ┌─────────────┐   Flyway V1–V5    ┌──────────────┐
                  │   flyway    ├──────────────────▶│              │
                  └─────────────┘                   │  postgres:18 │
                  ┌─────────────┐  SEED_CUSTOMERS   │   (payfold)  │
@@ -273,6 +273,7 @@ version bump and a decision entry; see [D8](decisions.md#d8).
 | V2 | 3 `plan` rows (Basic/Standard/Premium, cents + EUR, monthly) |
 | V3 | `renewal_outbox` + the unique constraints in the table above + supporting indexes |
 | V4 | Spring Batch 5 metadata schema (producer sets `spring.batch.jdbc.initialize-schema: never`; Flyway is the sole schema authority, [G3](invariants.md#g3)) |
+| V5 | one yearly `plan` row ('Premium Annual') so due-today seeding has a valid renewal preimage on month-end clamp days ([R16](roadmap.md#r16)); weighted 0 in the seeder — used only via the clamp fallback |
 
 `renewal_outbox`: `id, subscription_id, due_date, payload jsonb, created_at, published_at`.
 Unpublished = `published_at IS NULL`.
@@ -312,6 +313,9 @@ by `CustomerSeeder` in the seed container ([R12](roadmap.md#r12)). Every seeded
 subscription is due on the seed day, so the value directly sets the size of the
 day's renewal batch; `scripts/load-test.sh` adds more due-today volume to a running
 stack without a reseed.
+On month-end clamp days (Jul 31, Dec 31, …) every seeding path falls back to the
+V5 yearly plan, whose one-year preimage exists on all such days; the monthly path
+covers Feb 29, where only the one-month preimage exists.
 The deploy images' env contracts (`FLYWAY_*`, `POSTGRES_*`) are catalogued under
 [Deploy artifacts](#deploy-artifacts).
 
