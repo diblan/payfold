@@ -163,3 +163,43 @@ exactly: the published images, the
 [config truth table](architecture.md#configuration-truth-table), ports 8080/8081,
 and `/actuator/health` — any change to that surface is a loud, flagged event, never
 an incidental edit.
+
+## D12 — Ops visualization via Grafana, not a custom UI — 2026-07-26 — active
+<a id="d12"></a>
+Carves one exception out of the "Any UI" non-goal for [R21](roadmap.md#r21):
+payfold gets dashboards, but as provisioned industry ops tooling — Prometheus +
+Grafana containers in compose, datasources and dashboards checked in as code —
+never a hand-built webpage.
+**Why:** the system's story is operational (publish rates, outcome counts, queue
+and DLQ depths, drain speed), and [R9](roadmap.md#r9)'s metric names are already a
+documented contract, so dashboards consume an existing surface; using the tool the
+industry actually runs is worth more — to interviewers and to the user's own
+experience — than any custom page. The external platform repo independently
+reached the same conclusion (kube-prometheus-stack in-cluster, plus a payfold
+autoscaling dashboard since its P9); payfold's own dashboards cover the pipeline
+internals and must work standalone on compose, with panel queries reusable by the
+platform.
+**Boundary:** no custom frontend, no customer-facing pages. Grafana and Prometheus
+are infrastructure containers like WireMock — the "More services" non-goal is
+about business services and stays intact.
+
+## D13 — SEPA mock-bank: async settlement replaces the happy flow — 2026-07-26 — active
+<a id="d13"></a>
+Promotes two non-goal boundaries for [R23](roadmap.md#r23): a third (business)
+service, and a deliberate break of the instant-settlement fiction. Today a
+"payment" settles synchronously inside the PSP call — unrealistic for SEPA direct
+debits (domiciliëringen), where a collection is submitted and its outcome
+(settled, failed, charged back) arrives asynchronously, later, from the bank.
+R23 introduces a mock-bank service that accepts submissions and calls back over a
+webhook with configurable chaos — delay distributions, failure rates, chargebacks
+— potentially as multiple banks (Netflix-style per-country creditor accounts, each
+webhooking back). Confirmed by the user twice (2026-07-19 and 2026-07-26) as the
+differentiator: it turns the pipeline from a happy-flow demo into a system that
+absorbs asynchronous, adversarial reality, and forces the code to scale beyond a
+single bank.
+**Consequences:** `payment` grows a submitted→terminal state machine; message and
+payload changes follow [G8](invariants.md#g8) (additive within v1, else v2 + a new
+decision entry); schema changes arrive via new migrations ([G3](invariants.md#g3));
+the item is an epic and is expected to split into sub-items at execution, each
+with its own acceptance criteria.
+**Boundary unchanged:** still no real PSP, no real bank, no real money movement.

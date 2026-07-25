@@ -60,7 +60,11 @@ stricter (G7).
    - both modules build; `scripts/verify.sh` exits 0;
    - the item's acceptance criteria hold;
    - `docs/quality.md` re-graded for touched modules; roadmap item checked off;
-   - `docs/architecture.md` updated if flow/schema/config changed (G6).
+   - `docs/architecture.md` updated if flow/schema/config changed (G6);
+   - if the diff changes what a published image runs (service code, Dockerfiles,
+     baked migrations SQL, the seeder), the session summary says so and proposes
+     the next `vX.Y.Z` tag — the user pushes tags manually, and an existing tag
+     is never re-pointed (see `docs/architecture.md`, "Deploy artifacts").
 4. **Exemption:** sessions touching only `docs/`, `AGENTS.md`, or `README.md` with no
    behavior change need no roadmap slot.
 5. **Scope pressure?** If a task seems to require breaking a non-goal

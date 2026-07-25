@@ -19,16 +19,18 @@ Scope insurance. Promoting any of these onto the roadmap requires a
 | Kubernetes / cloud deploy | Compose demonstrates the architecture; orchestration adds ops surface, not distributed-systems insight. [D11](decisions.md#d11) sanctions one epilogue — publishing versioned images for the external platform repo ([R18](#r18)); orchestration itself stays out |
 | Real PSP or money movement | Mock PSP ([R8](#r8)) exercises every interesting failure path without credentials or compliance |
 | Auth / multi-tenancy | Orthogonal to the billing pipeline story |
-| Any UI | The consumers of this system are curl, psql, and the RabbitMQ console |
+| Any UI | The consumers of this system are curl, psql, and the RabbitMQ console. [D12](decisions.md#d12) carves out provisioned Grafana ([R21](#r21)) — industry ops tooling as code, not a custom page |
 | Dunning, proration, refunds, tax | Each is a project of its own; the renewal happy path + failure path is the thesis |
 | Event-sourcing rewrite | The outbox pattern *is* the demonstration; rewriting the persistence model restarts the project |
-| More services | Two services already demonstrate cross-service delivery semantics; a third must earn its place via a decision entry |
+| More services | Two services already demonstrate cross-service delivery semantics; a third must earn its place via a decision entry — [D13](decisions.md#d13) grants exactly one: the mock-bank settlement service ([R23](#r23)) |
 | Reconciliation / ledger flows | `bank_tx`, `recon_match`, `ledger_entry` stay dormant until promoted |
 
 ## Items
 
 Ordering principle: *repair the feedback loop → correctness → resilience → scale → story*.
 Dependencies: R1, R2 → R3 → R4–R8; R4 → R5; R10 → R11, R12.
+Story phase (2026-07-26): R20 → R22; R21 → R22; R22 → R24 ([R17](#r17) pairs
+naturally with [R20](#r20)'s scale runs; [R23](#r23) re-triggers [R24](#r24)).
 
 <a id="r1"></a>
 ### [x] R1 — Consumer bootstrap hygiene
@@ -223,3 +225,90 @@ live stack (a tightening, [G7](invariants.md#g7)); architecture.md documents the
 image catalogue, env contracts, and tag scheme with the truth-table/ports/health
 coupling surface unchanged; the publish workflow itself is exercised on the next
 manual tag push (out of session scope per the no-CI-push policy).
+
+<a id="r19"></a>
+### [ ] R19 — Platform-flagged contract debt: PSP wire schema + amd64-only WireMock
+The platform repo's P8 onboarding had to author its own stub of the mock PSP
+because the **response** schema of `POST /psp/charges` is not documented contract
+(its P8 notes flag this to payfold explicitly), and its multi-arch audit found
+compose's `wiremock/wiremock:3.13.2-alpine` is **amd64-only** (verified 2026-07-26:
+the plain `3.13.2` variant publishes amd64+arm64+arm/v7).
+**Scope:** `docs/architecture.md` (mock-PSP section + coupling surface),
+`docker-compose.yaml` (one image line), consumer integration test image ref if it
+names the alpine variant.
+**Done when:** architecture.md documents the full PSP request *and* response
+schema exactly as the templates render (the wire contract a third party can stub
+from); the deploy-artifacts coupling note also records `/actuator/health/liveness`
+as platform-consumed (Spring Boot auto-enables probe groups on Kubernetes; the
+platform's livenessProbe already uses it); compose and the consumer test run the
+multi-arch WireMock variant; verify.sh green.
+
+<a id="r20"></a>
+### [ ] R20 — Consumer scaling levers: measured, not assumed
+The consumer is the binding constraint (~48/s sustained, [R12](#r12)) and its two
+scaling levers are untested: listener concurrency (in-process) and multiple
+consumer instances (G2's constraint-based idempotency makes N parallel consumers
+safe — the platform's KEDA showpiece already scales pods 1→5 on queue depth, but
+payfold has never measured what that buys).
+**Scope:** consumer `application.yaml` (concurrency as env-tunable config),
+`docker-compose.yaml` (scale-safe consumer: fixed `container_name` and host-port
+mapping both block `--scale renewal-consumer=N` — resolve without breaking
+verify.sh's consumer checks), `docs/quality.md`, README math.
+**Done when:** documented ≥100k runs measure drain rate at baseline, raised
+listener concurrency, and ×3 instances; rates land in quality.md "Measured scale
+runs" and the README extrapolation; the architecture honesty table row for
+consumer scaling flips to measured; verify.sh green at scale ([R17](#r17)'s poll
+fix should land first or ride along — its acceptance needs exactly this run).
+
+<a id="r21"></a>
+### [ ] R21 — Grafana dashboards as code ([D12](decisions.md#d12))
+**Scope:** `docker-compose.yaml` (Prometheus + Grafana containers; RabbitMQ's
+built-in prometheus plugin exposed for queue/DLQ depth), provisioning files +
+dashboard JSON checked in, `.env.example`, docs.
+The pipeline story in one provisioned dashboard: outbox insert/publish rates,
+`renewals_processed_total` by outcome, listener timer, queue + DLQ depth, drain
+rate — consuming only [R9](#r9)'s documented metric names. Zero manual clicks:
+datasource and dashboards provisioned from files. Panel queries written to be
+reusable by the platform repo's Grafana (which covers autoscaling; this covers
+pipeline internals).
+**Done when:** a fresh `docker compose up` serves the dashboard immediately;
+metric names used are exactly the documented contract; docs updated (G6); how the
+observability containers affect verify.sh decided at execution under
+[G7](invariants.md#g7) (tighten or leave, never loosen).
+
+<a id="r22"></a>
+### [ ] R22 — Scripted chaos demo
+**Scope:** `scripts/chaos-demo.sh`, README section; no service changes.
+One command, scene-based, each scene *asserting* the invariant it demonstrates
+(not just showing it): poison → DLQ within 30s while good messages keep flowing
+([G5](invariants.md#g5)); kill the consumer mid-drain → backlog accumulates →
+restart → drains with zero loss (DB counts prove it); scale consumers ×N → drain
+rate multiplies ([R20](#r20)'s numbers make the claim honest); broker restart →
+confirm-gated publishing re-picks unpublished rows ([G1](invariants.md#g1)).
+Honesty guardrail from the direction discussion: auto-respawn is orchestration
+(non-goal) — the demonstrable claim is "worker dies → nothing lost → backlog
+drains on recovery".
+**Done when:** the demo runs green end-to-end on a fresh stack with the
+[R21](#r21) dashboard telling the same story live; README documents how to run it.
+
+<a id="r23"></a>
+### [ ] R23 — SEPA mock-bank: async settlement ([D13](decisions.md#d13)) *(epic — split at execution)*
+**Scope (promotion-level):** new mock-bank service; payment flow redesign:
+submission → `submitted`, terminal state arrives later via the bank's webhook
+(settled / failed / chargeback), bank-side chaos parameters (delays, failure and
+chargeback rates), multiple per-country banks; schema via new migrations
+([G3](invariants.md#g3)); payload evolution per [G8](invariants.md#g8).
+**Done when (epic-level):** a renewal is only `succeeded` after asynchronous bank
+confirmation; chaos parameters demonstrably shift outcomes; verify.sh models the
+async settlement deterministically (the [R8](#r8) recomputable-rule precedent);
+detailed sub-item acceptance criteria are written when the epic is split.
+
+<a id="r24"></a>
+### [ ] R24 — README screen recording
+**Scope:** README + a recording asset/link; no code.
+The primary interviewer-facing artifact: a 3–5 minute recording of the
+[R22](#r22) chaos demo with the [R21](#r21) dashboard visible — interviewers
+don't clone repos. The demo script makes recording reproducible, so re-recording
+after [R23](#r23) reshapes the flow is cheap and expected.
+**Done when:** the README embeds (or links) the recording near the top and every
+claim shown matches the measured numbers in quality.md/README.
