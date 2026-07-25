@@ -139,3 +139,27 @@ mechanism is justified; R11 only raises `app.publishPageSize` 1000 → 10000 to 
 per-page claim/commit/confirm-await overhead ~10× at 1M scale. A
 `BatchingRabbitTemplate` was explicitly rejected: it changes the wire format and
 would break the v1 contract ([G8](invariants.md#g8)).
+
+## D11 — Deploy epilogue: publish versioned multi-arch images to GHCR — 2026-07-25 — active
+<a id="d11"></a>
+The external platform repo (k3s + Flux GitOps, managing the portfolio cluster) is
+ready to onboard payfold, and a GitOps cluster may only pull artifacts from Git or a
+registry — never from a dev-machine path or a local compose build. That crosses the
+"Kubernetes / cloud deploy" non-goal boundary, so this entry sanctions exactly one
+epilogue, [R18](roadmap.md#r18): a manually pushed `vX.Y.Z` git tag publishes four
+images to `ghcr.io/diblan/` — the two services, plus `payfold-migrations` (Flyway
+with `db-migrations/*.sql` baked in: compose's host bind mount has no Kubernetes
+equivalent) and `payfold-seed-data-gen` (same host-mount problem; the platform's
+demo runs require the seed story), both runnable as run-to-completion Jobs.
+Tags are immutable semver, never `latest` or any mutable tag — the platform pins
+exact tags in Git and orders upgrades by semver. Every tag is a linux/amd64 +
+linux/arm64 manifest list (buildx): the target cluster schedules on an arm64 Pi
+node that cannot run amd64-only images. Compose's flyway and seed-data services
+switch to building the same images, so `verify.sh` exercises the artifact shape the
+cluster will run instead of letting demo stack and deploy artifact drift apart.
+**What stays out (the non-goal otherwise holds):** no k8s manifests, no helm chart,
+no orchestration in this repo. The coupling surface the platform consumes is
+exactly: the published images, the
+[config truth table](architecture.md#configuration-truth-table), ports 8080/8081,
+and `/actuator/health` — any change to that surface is a loud, flagged event, never
+an incidental edit.

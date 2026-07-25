@@ -16,7 +16,7 @@ Scope insurance. Promoting any of these onto the roadmap requires a
 
 | Non-goal | Why not |
 |---|---|
-| Kubernetes / cloud deploy | Compose demonstrates the architecture; orchestration adds ops surface, not distributed-systems insight |
+| Kubernetes / cloud deploy | Compose demonstrates the architecture; orchestration adds ops surface, not distributed-systems insight. [D11](decisions.md#d11) sanctions one epilogue — publishing versioned images for the external platform repo ([R18](#r18)); orchestration itself stays out |
 | Real PSP or money movement | Mock PSP ([R8](#r8)) exercises every interesting failure path without credentials or compliance |
 | Auth / multi-tenancy | Orthogonal to the billing pipeline story |
 | Any UI | The consumers of this system are curl, psql, and the RabbitMQ console |
@@ -203,3 +203,23 @@ DLQ-drain steps passed. Converting the read to a bounded poll fixes the measurem
 race without weakening the asserted condition, so it is [G7](invariants.md#g7)-compatible.
 **Done when:** the check polls with a bounded timeout like its DLQ siblings and a
 100k-scale verify run passes it.
+
+<a id="r18"></a>
+### [x] R18 — Deploy epilogue: publish versioned multi-arch images to GHCR
+**Scope:** sanctioned by [D11](decisions.md#d11). New `db-migrations/Dockerfile` and
+`seed-data-gen/Dockerfile` (with a strict-exit `run-seeder.sh` — a Job must fail
+loudly); `$BUILDPLATFORM`-pinned build stages in both service Dockerfiles; compose's flyway and seed-data services build those images instead of
+bind-mounting host paths; new `.github/workflows/publish.yml`; `scripts/verify.sh`;
+`docs/architecture.md` + `docs/quality.md`.
+A manually pushed `vX.Y.Z` git tag publishes `payfold-renewal-producer`,
+`payfold-renewal-consumer`, `payfold-migrations` (Flyway + baked `V*.sql`,
+configured via `FLYWAY_URL`/`FLYWAY_USER`/`FLYWAY_PASSWORD`, run-to-completion,
+exit 0 = success, re-run = no-op), and `payfold-seed-data-gen` (seed source + JDBC
+driver + name data baked, same Job pattern) to `ghcr.io/diblan/` — each tag an
+immutable linux/amd64 + linux/arm64 manifest list, never `latest`.
+**Done when:** all four images multi-arch-build locally via buildx;
+`scripts/verify.sh` gains a migrations-image no-op-Job re-run check against the
+live stack (a tightening, [G7](invariants.md#g7)); architecture.md documents the
+image catalogue, env contracts, and tag scheme with the truth-table/ports/health
+coupling surface unchanged; the publish workflow itself is exercised on the next
+manual tag push (out of session scope per the no-CI-push policy).

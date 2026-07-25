@@ -17,17 +17,19 @@ services:
       timeout: 3s
       retries: 20
 
+  # Schema migrations run from the same payfold-migrations image CI publishes
+  # (D11/R18): the SQL is baked in at build time and the container is configured
+  # via Flyway's native FLYWAY_* env vars — the same contract a Kubernetes Job
+  # uses. FLYWAY_CONNECT_RETRIES defaults to 30 inside the image.
   flyway:
-    image: flyway/flyway:11
+    build:
+      context: ./db-migrations
+    image: payfold-migrations:latest
     container_name: flyway-payfold
-    command:
-      - -url=jdbc:postgresql://postgres:5432/${POSTGRES_DB}
-      - -user=${POSTGRES_USER}
-      - -password=${POSTGRES_PASSWORD}
-      - -connectRetries=30
-      - migrate
-    volumes:
-      - ./db-migrations:/flyway/sql:ro
+    environment:
+      FLYWAY_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      FLYWAY_USER: ${POSTGRES_USER}
+      FLYWAY_PASSWORD: ${POSTGRES_PASSWORD}
     depends_on:
       postgres:
         condition: service_healthy
@@ -75,21 +77,20 @@ services:
       timeout: 3s
       retries: 20
 
-  # Seed data (Java seed generators)
+  # Seed data runs from the same payfold-seed-data-gen image CI publishes
+  # (D11/R18): seeder source, JDBC driver, and name data are baked in at build
+  # time; entrypoint and working dir come from the image.
   seed-data:
-    image: eclipse-temurin:17-jdk
+    build:
+      context: ./seed-data-gen
+    image: payfold-seed-data-gen:latest
     container_name: billing-seed
-    working_dir: /app
     environment:
       TZ: ${TZ}
       POSTGRES_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       SEED_CUSTOMERS: ${SEED_CUSTOMERS:-15000}
-    volumes:
-      - ./seed-data-gen:/app:ro
-    # invoked via bash: the /app mount is read-only, so chmod +x would fail (EROFS)
-    entrypoint: [ "bash","./run-seeder.sh" ]
     depends_on:
       postgres:
         condition: service_healthy

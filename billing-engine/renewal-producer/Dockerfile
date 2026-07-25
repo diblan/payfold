@@ -1,5 +1,8 @@
 # ====== Build stage ======
-FROM maven:3.9-eclipse-temurin-17 AS build
+# Build stage pinned to the build host's platform: the jar is architecture-
+# independent, so a multi-arch build compiles once and copies the jar into each
+# platform's run stage instead of emulating Maven under QEMU.
+FROM --platform=$BUILDPLATFORM maven:3.9-eclipse-temurin-17 AS build
 WORKDIR /workspace
 COPY pom.xml .
 RUN --mount=type=cache,target=/root/.m2 mvn -q -e -DskipTests dependency:go-offline

@@ -312,6 +312,8 @@ by `CustomerSeeder` in the seed container ([R12](roadmap.md#r12)). Every seeded
 subscription is due on the seed day, so the value directly sets the size of the
 day's renewal batch; `scripts/load-test.sh` adds more due-today volume to a running
 stack without a reseed.
+The deploy images' env contracts (`FLYWAY_*`, `POSTGRES_*`) are catalogued under
+[Deploy artifacts](#deploy-artifacts).
 
 ## Ports & endpoints
 
@@ -322,3 +324,33 @@ stack without a reseed.
 | `localhost:8082` | mock PSP (WireMock) — POST `/psp/charges`; admin/journal at `/__admin` |
 | `localhost:5672` / `15672` | RabbitMQ AMQP / management UI (creds from `.env`) |
 | `localhost:5432` | Postgres (creds from `.env`) |
+
+## Deploy artifacts (published images)
+
+<a id="deploy-artifacts"></a>
+Per [D11](decisions.md#d11)/[R18](roadmap.md#r18), a manually pushed `vX.Y.Z` git
+tag runs `.github/workflows/publish.yml`, which publishes four images to GHCR.
+Tags are immutable semver — never `latest`, never a mutable tag: the external
+platform repo pins exact tags in Git, and ordered semver is what lets its image
+automation bump them commit-by-commit. Every tag is a linux/amd64 + linux/arm64
+manifest list (buildx; check with `docker manifest inspect` — BuildKit's
+`unknown/unknown` attestation entries are expected). The service build stages are
+pinned to `$BUILDPLATFORM`, so a multi-arch build compiles the
+architecture-independent jar once instead of emulating Maven under QEMU.
+
+| Image (`ghcr.io/diblan/…`) | Contents | Run pattern | Config (env) |
+|---|---|---|---|
+| `payfold-renewal-producer` | producer Spring Boot jar | long-running service; port 8080, `/actuator/health` | the compose `renewal-producer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_ROUTINGKEY`, `APP_TIMEZONE`, `APP_SCHEDULECRON`, `TZ` |
+| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, `PAYMENT_PROVIDER_BASE_URL`, `TZ` |
+| `payfold-migrations` | `flyway/flyway:11` + `db-migrations/V*.sql`, `CMD ["migrate"]` | run-to-completion Job; exit 0 = success; re-run on a current schema is a no-op (asserted by `verify.sh`) | `FLYWAY_URL`, `FLYWAY_USER`, `FLYWAY_PASSWORD`, `FLYWAY_CONNECT_RETRIES` (image default 30) |
+| `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS` |
+
+Compose builds `payfold-migrations` and `payfold-seed-data-gen` itself (the flyway
+and seed-data services) instead of bind-mounting host paths, so the local stack
+and `verify.sh` exercise the same artifact shape a cluster runs. The coupling
+surface the platform repo consumes is exactly: these images, the
+[configuration truth table](#configuration-truth-table), ports 8080/8081, and
+`/actuator/health` — a change to any of them must be flagged loudly, and R18
+changes nothing in the truth table itself. GHCR packages created by a first
+publish default to private; they must be made public (or given a pull secret)
+before a cluster can pull them.

@@ -6,6 +6,7 @@
 # It asserts the async renewal trigger returns an execution id in <1s,
 # polls that execution to completion, checks exact deterministic provider failures
 # derived from PSP_FAIL_HEX, and cross-checks same-run Prometheus/DB deltas.
+# It also re-runs the payfold-migrations image as a no-op run-to-completion Job.
 #
 # Usage:
 #   scripts/verify.sh [--no-up] [--timeout SECONDS] [--poison|--no-poison]
@@ -58,6 +59,7 @@ env_val() {
 
 PGUSER="$(env_val POSTGRES_USER admin)"
 PGDB="$(env_val POSTGRES_DB payfold)"
+PGPASS="$(env_val POSTGRES_PASSWORD admin)"
 PRODUCER_PORT="$(env_val PRODUCER_HTTP_PORT 8080)"
 CONSUMER_PORT="$(env_val CONSUMER_HTTP_PORT 8081)"
 RMQ_USER="$(env_val RABBITMQ_USER guest)"
@@ -214,6 +216,37 @@ fi
 
 wait_for "postgres reachable"        pg_ready      || summary
 wait_for "seed data present"         seeded        || summary
+# R18: the migrations image must work as a run-to-completion Job (the Kubernetes
+# pattern): configured only by FLYWAY_* env vars, exit 0 on success, and a re-run
+# against the already-migrated stack database is a no-op. The image was just
+# built by compose (flyway service); "postgres" resolves on the stack network.
+MIG_JOB_DETAIL=""
+migrations_job_rerun() {
+  local net out
+  net="$(docker inspect pg_payfold --format '{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}' 2>/dev/null | head -1)"
+  if [[ -z "$net" ]]; then
+    MIG_JOB_DETAIL="cannot determine the pg_payfold container network"
+    return 1
+  fi
+  if ! out="$(docker run --rm --network "$net" \
+      -e FLYWAY_URL="jdbc:postgresql://postgres:5432/${PGDB}" \
+      -e FLYWAY_USER="$PGUSER" \
+      -e FLYWAY_PASSWORD="$PGPASS" \
+      payfold-migrations:latest 2>&1)"; then
+    MIG_JOB_DETAIL="nonzero exit: $(echo "$out" | tail -2 | tr '\n' ' ')"
+    return 1
+  fi
+  if ! echo "$out" | grep -q "No migration necessary"; then
+    MIG_JOB_DETAIL="exit 0 but not a no-op re-run"
+    return 1
+  fi
+  return 0
+}
+if migrations_job_rerun; then
+  pass "migrations image re-runs as a no-op Job (exit 0)"
+else
+  fail "migrations image re-runs as a no-op Job (exit 0)" "$MIG_JOB_DETAIL"
+fi
 wait_for "producer /actuator/health UP" producer_up || summary
 
 if [[ "$STRICT_CONSUMER" == "1" ]]; then
