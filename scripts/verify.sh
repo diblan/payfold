@@ -435,11 +435,23 @@ if (( POISON )); then
       "if the broker carries pre-R5 queue args, wipe the RabbitMQ volume (docker compose down -v) so the queue is redeclared"
   fi
 
-  MAIN_DEPTH="$(queue_depth "$RMQ_QUEUE")"
-  if [[ "$MAIN_DEPTH" == "0" ]]; then
+  # The management API's message counter refreshes on a ~5s stats interval; poll
+  # briefly instead of trusting a single read — the queue is typically already
+  # empty when this check runs, but the counter may still show the
+  # pre-dead-letter value (first observed at 100k scale during R12).
+  POISON_MAIN_EMPTY=0
+  POISON_MAIN_START=$SECONDS
+  while (( SECONDS - POISON_MAIN_START < 30 )); do
+    if [[ "$(queue_depth "$RMQ_QUEUE")" == "0" ]]; then
+      POISON_MAIN_EMPTY=1
+      break
+    fi
+    sleep 2
+  done
+  if (( POISON_MAIN_EMPTY )); then
     pass "main queue empty after poison message"
   else
-    fail "main queue empty after poison message" "depth=${MAIN_DEPTH}"
+    fail "main queue empty after poison message" "depth=$(queue_depth "$RMQ_QUEUE")"
   fi
 
   if ! DRAIN_RESPONSE="$(curl -fsS -u "${RMQ_USER}:${RMQ_PASS}" \

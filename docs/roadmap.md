@@ -192,7 +192,7 @@ calendar day — e.g. via a year-interval plan for clamp days or an injectable c
 and a test covers a clamp date.
 
 <a id="r17"></a>
-### [ ] R17 — verify.sh: poison probe's main-queue check races the management API
+### [x] R17 — verify.sh: poison probe's main-queue check races the management API
 **Scope:** `scripts/verify.sh` only.
 The "main queue empty after poison message" assertion reads the management API's
 `messages` counter exactly once, immediately after the DLQ-depth poll succeeds. That
