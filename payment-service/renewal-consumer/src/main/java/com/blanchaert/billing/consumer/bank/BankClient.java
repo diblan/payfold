@@ -2,6 +2,7 @@ package com.blanchaert.billing.consumer.bank;
 
 import com.blanchaert.billing.consumer.config.BankProperties;
 import com.blanchaert.billing.consumer.config.BankRegistry;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
@@ -48,15 +49,57 @@ public class BankClient {
                     .retrieve()
                     .toBodilessEntity();
         } catch (RestClientException exception) {
-            // A PSP failure is a payment verdict. A bank submission failure is the
-            // absence of a verdict, so it must ride bounded listener retry to the DLQ.
             throw new BankSubmissionException(
                     "bank collection submission failed for " + collectionId, exception);
+        }
+    }
+
+    public record CardVerdict(boolean authorized, String reason) {
+    }
+
+    public CardVerdict submitCardAuthorization(
+            String bankId, String collectionId, long amountCents,
+            String currency, String cardToken, String dueDate) {
+        if (bankRegistry.byId(bankId) == null) {
+            throw new IllegalStateException("unknown bank id " + bankId);
+        }
+        RestClient restClient = clients.get(bankId);
+        try {
+            CardResponse response = restClient.post()
+                    .uri("/collections")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(new CardSubmission(
+                            collectionId, amountCents, currency, cardToken, dueDate))
+                    .retrieve()
+                    .body(CardResponse.class);
+            if (response != null && "authorized".equals(response.status())) {
+                return new CardVerdict(true, null);
+            }
+            if (response != null && "declined".equals(response.status())) {
+                return new CardVerdict(false, response.reason());
+            }
+            // Unlike the retired PSP client, an auth timeout or malformed response
+            // is the absence of a verdict and must ride bounded retry to the DLQ.
+            throw new BankSubmissionException(
+                    "card authorization returned no recognized verdict for " + collectionId,
+                    new IllegalStateException(
+                            response == null ? "empty response" : "unknown status " + response.status()));
+        } catch (RestClientException exception) {
+            throw new BankSubmissionException(
+                    "card authorization submission failed for " + collectionId, exception);
         }
     }
 
     record CollectionSubmission(String collection_id, long amount_cents,
                                 String currency, String debtor_iban,
                                 String mandate_reference, String due_date) {
+    }
+
+    record CardSubmission(String collection_id, long amount_cents,
+                          String currency, String card_token, String due_date) {
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    record CardResponse(String status, String reason) {
     }
 }

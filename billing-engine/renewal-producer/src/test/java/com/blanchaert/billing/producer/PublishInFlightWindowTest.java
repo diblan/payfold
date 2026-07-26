@@ -164,7 +164,7 @@ class PublishInFlightWindowTest {
         jdbc.update("DELETE FROM renewal_outbox");
         UUID customerId = UUID.randomUUID();
         UUID planId = jdbc.queryForObject("SELECT id FROM plan ORDER BY name LIMIT 1", UUID.class);
-        jdbc.update("INSERT INTO customer (id, email) VALUES (?, ?)", customerId, email);
+        jdbc.update("INSERT INTO customer (id, email, card_token) VALUES (?, ?, 'tok-producer-probe-01')", customerId, email);
         for (int i = 0; i < count; i++) {
             UUID subscriptionId = UUID.randomUUID();
             jdbc.update(

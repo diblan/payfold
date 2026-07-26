@@ -1,0 +1,28 @@
+{
+  "mappings": [
+    {
+      "priority": 6,
+      "request": {
+        "method": "POST", "urlPath": "/cardnet/collections",
+        "bodyPatterns": [{ "matchesJsonPath": { "expression": "$.card_token", "matches": ".*99$" } }]
+      },
+      "response": { "status": 200, "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "status": "declined", "reason": "insufficient_funds" } }
+    },
+    {
+      "priority": 6,
+      "request": {
+        "method": "POST", "urlPath": "/cardnet/collections",
+        "bodyPatterns": [{ "matchesJsonPath": { "expression": "$.card_token", "matches": ".*98$" } }]
+      },
+      "response": { "status": 200, "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "status": "declined", "reason": "do_not_honor" } }
+    },
+    {
+      "priority": 10,
+      "request": { "method": "POST", "urlPath": "/cardnet/collections" },
+      "response": { "status": 202, "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "status": "authorized" } }
+    }
+  ]
+}

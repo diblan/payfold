@@ -90,7 +90,7 @@ class ScanKeysetPaginationTest {
                 seedInterval
         );
 
-        jdbc.update("INSERT INTO customer (id, email) VALUES (?, ?)", CUSTOMER_ID, "keyset-probe@example.test");
+        jdbc.update("INSERT INTO customer (id, email, card_token) VALUES (?, ?, 'tok-producer-probe-01')", CUSTOMER_ID, "keyset-probe@example.test");
         jdbc.batchUpdate(
                 "INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at) "
                         + "VALUES (?, ?, ?, 'active', now() - INTERVAL '1 " + seedInterval + "')",

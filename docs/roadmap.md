@@ -317,7 +317,7 @@ count under delayed confirms; a slow-confirm scenario completes without
 unchanged.
 
 <a id="r23"></a>
-### [ ] R23 — SEPA mock-bank: async settlement ([D13](decisions.md#d13), design [D15](decisions.md#d15)/[D17](decisions.md#d17)) *(epic — split 2026-07-26 into R23a–R23f below; check when all six are checked)*
+### [x] R23 — SEPA mock-bank: async settlement ([D13](decisions.md#d13), design [D15](decisions.md#d15)/[D17](decisions.md#d17)) *(epic — split 2026-07-26 into R23a–R23f below; check when all six are checked)*
 **Done when (epic-level):** a renewal is only `succeeded` after asynchronous
 confirmation — for **both** payment methods ([D17](decisions.md#d17)): SDD via
 the mock bank, cards via a sync auth verdict + async settlement on the same
@@ -427,7 +427,7 @@ fast one on the same load; the [R22](#r22) demo gains a slow-bank backlog-drain
 beat.
 
 <a id="r23f"></a>
-### [ ] R23f — Cards join the async spine; WireMock retires ([D17](decisions.md#d17))
+### [x] R23f — Cards join the async spine; WireMock retires ([D17](decisions.md#d17))
 **Scope:** the mock-counterparty service grows a `scheme` config
 (`sepa_core` | `card`): a card instance answers submission with a
 **synchronous auth verdict** — mirroring the real card network's auth round
@@ -477,6 +477,30 @@ the scene's cohort size (not the poll) is the lever.
 **Done when:** the precondition polls with a bounded timeout like its
 verify.sh siblings and a full `chaos-demo.sh --auto` run passes it on a fresh
 stack.
+
+<a id="r28"></a>
+### [ ] R28 — Webhook exhaustion strands submitted payments (no re-delivery path)
+**Scope:** design first — likely consumer-side (a scheduled sweeper that
+re-queries counterparties for stale `submitted` payments via
+`GET /collections/{id}`), possibly with a counterparty-side resend endpoint.
+When a counterparty exhausts its bounded webhook retry (loud give-up by
+design, [R23a](#r23a)), the collection's outcome exists at the bank but never
+reaches the consumer: the payment parks in `submitted` forever. Surfaced
+2026-07-26 by [R23f](#r23f)'s acceptance: chaos scenes that hold the consumer
+down longer than the retry envelope stranded their cohorts. Mitigated same
+day by widening the shared envelope (`BANK_WEBHOOK_RETRY_*`, 8 × 2s-base ≈
+4 min) past any demo outage — a real system needs a recovery story, not a
+longer fuse: real SEPA reporting is pull-shaped (EBICS files) precisely so
+missed pushes cannot strand state. The same gap has a second face: pending
+deliveries are in-memory asyncio tasks, so RECREATING a counterparty
+container (e.g. reprofiling delays via `docker compose up -d`) silently
+drops every not-yet-fired notification — 1638 collections stranded that way
+during R23f acceptance before the demo stopped reprofiling mid-scene. Pairs
+naturally with the dormant reconciliation tables and/or [R26](#r26)'s
+lifecycle work.
+**Done when:** a payment whose settlement webhook was fully exhausted
+demonstrably reaches its bank-side terminal state without manual
+intervention, bounded-time; verify.sh models the recovery deterministically.
 
 <a id="r26"></a>
 ### [ ] R26 — Dunning: failed collections get a lifecycle ([D16](decisions.md#d16)) *(epic — blocked on [R23](#r23); split at execution)*

@@ -4,8 +4,6 @@ import com.blanchaert.billing.consumer.bank.BankClient;
 import com.blanchaert.billing.consumer.config.BankProperties;
 import com.blanchaert.billing.consumer.config.BankRegistry;
 import com.blanchaert.billing.consumer.model.RenewalRequested;
-import com.blanchaert.billing.consumer.psp.PspChargeOutcome;
-import com.blanchaert.billing.consumer.psp.PspClient;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
@@ -13,9 +11,10 @@ import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
-import java.sql.Timestamp;
 import java.time.*;
 import java.time.format.DateTimeParseException;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
 
 @Service
@@ -23,36 +22,35 @@ public class BillingService {
     private static final Logger log = LoggerFactory.getLogger(BillingService.class);
 
     private final JdbcTemplate jdbc;
-    private final PspClient psp;
     private final BankClient bank;
     private final BankRegistry bankRegistry;
-    private final Counter processedSucceeded;
-    private final Counter processedFailed;
-    private final Counter processedInvalid;
-    private final Counter processedSubmitted;
+    private final Map<String, Counter> processedCounters;
 
-    public BillingService(JdbcTemplate jdbc, PspClient psp, BankClient bank,
+    public BillingService(JdbcTemplate jdbc, BankClient bank,
                           BankRegistry bankRegistry, MeterRegistry meters) {
         this.jdbc = jdbc;
-        this.psp = psp;
         this.bank = bank;
         this.bankRegistry = bankRegistry;
-        this.processedSucceeded = processedCounter(meters, "succeeded");
-        this.processedFailed = processedCounter(meters, "failed");
-        this.processedInvalid = processedCounter(meters, "invalid");
-        this.processedSubmitted = processedCounter(meters, "submitted");
+        Map<String, Counter> counters = new HashMap<>();
+        for (String method : new String[]{"card", "sdd", "unknown"}) {
+            for (String outcome : new String[]{"succeeded", "failed", "invalid", "submitted"}) {
+                counters.put(counterKey(outcome, method), processedCounter(meters, outcome, method));
+            }
+        }
+        this.processedCounters = Map.copyOf(counters);
     }
 
     public void process(RenewalRequested evt) {
         try {
             validate(evt);
         } catch (InvalidRenewalMessageException e) {
-            processedInvalid.increment();
+            incrementProcessed("invalid", "unknown");
             throw e;
         }
 
         CustomerBilling customerBilling = jdbc.query("""
-                        SELECT payment_method, debtor_iban, mandate_reference, country
+                        SELECT payment_method, debtor_iban, mandate_reference, country,
+                               card_token
                         FROM customer
                         WHERE id = ?
                         """,
@@ -61,11 +59,12 @@ public class BillingService {
                                 rs.getString("payment_method"),
                                 rs.getString("debtor_iban"),
                                 rs.getString("mandate_reference"),
-                                rs.getString("country"))
+                                rs.getString("country"),
+                                rs.getString("card_token"))
                         : null,
                 evt.customer_id());
         if (customerBilling == null) {
-            processedInvalid.increment();
+            incrementProcessed("invalid", "unknown");
             throw invalid(evt, "customer_id", "customer not found");
         }
 
@@ -73,7 +72,7 @@ public class BillingService {
         if ("sdd".equals(customerBilling.paymentMethod())) {
             bankEntry = bankRegistry.byCountry(customerBilling.country());
             if (bankEntry == null) {
-                processedInvalid.increment();
+                incrementProcessed("invalid", customerBilling.paymentMethod());
                 throw invalid(evt, "customer_id",
                         "no bank routes country " + customerBilling.country());
             }
@@ -109,36 +108,69 @@ public class BillingService {
             }
             // Parked or already handled: settlement finalizes via the R23c inbox
             // spine, never here. Nothing is finalized on the submission path.
-            processedSubmitted.increment();
+            incrementProcessed("submitted", "sdd");
             return;
         }
-        // 5) Call the PSP only for a pending payment; failed payments are terminal.
-        String status = jdbc.queryForObject("SELECT status FROM payment WHERE id = ?", String.class, paymentId);
-        if ("failed".equals(status)) {
-            // Terminal: dunning is a non-goal (D5); redelivery must not re-attempt the charge.
-            processedFailed.increment();
-            return;
-        }
-        if ("pending".equals(status)) {
-            PspChargeOutcome outcome = psp.charge(idem, evt.subscription_id(), evt.amount_cents(), evt.currency());
-            if (!outcome.succeeded()) {
-                markPaymentFailed(paymentId);
-                log.info("Payment failed for {}: {}", idem, outcome.reason());
-                processedFailed.increment();
+
+        // card (D17): authorization is the one genuinely synchronous hop in the
+        // card network, so a decline is terminal immediately; fulfillment-grade
+        // confirmation arrives later as a settlement event on the same spine.
+        BankProperties.BankEntry cardEntry = bankRegistry.cardEntry();
+        String cardStatus = jdbc.queryForObject(
+                "SELECT status FROM payment WHERE id = ?", String.class, paymentId);
+        if ("pending".equals(cardStatus)) {
+            BankClient.CardVerdict verdict = bank.submitCardAuthorization(
+                    cardEntry.id(), idem, evt.amount_cents(), evt.currency(),
+                    customerBilling.cardToken(), evt.due_date());
+            if (!verdict.authorized()) {
+                jdbc.update("""
+                                UPDATE payment
+                                SET status = 'failed', failure_reason = ?,
+                                    completed_at = now()
+                                WHERE id = ? AND status = 'pending'
+                                """,
+                        verdict.reason(), paymentId);
+                log.info("Card authorization declined for {}: {}", idem, verdict.reason());
+                incrementProcessed("failed", "card");
                 return;
             }
-            markPaymentSucceeded(paymentId);
+            jdbc.update("""
+                            UPDATE payment
+                            SET status = 'submitted', bank_id = ?, collection_id = ?
+                            WHERE id = ? AND status = 'pending'
+                            """,
+                    cardEntry.id(), idem, paymentId);
+            incrementProcessed("submitted", "card");
+            return;
         }
-        // 6) Finalize only a succeeded payment; failed outcomes return above unfinalized.
-        finalizeBilling(invoiceId, chargeId, evt.subscription_id(), pe);
-        processedSucceeded.increment();
+        if ("failed".equals(cardStatus)) {
+            incrementProcessed("failed", "card");
+            return;
+        }
+        if ("submitted".equals(cardStatus)) {
+            incrementProcessed("submitted", "card");
+            return;
+        }
+        // succeeded / charged_back: settlement already finalized this renewal.
+        incrementProcessed("succeeded", "card");
     }
 
-    private Counter processedCounter(MeterRegistry meters, String outcome) {
+    private Counter processedCounter(MeterRegistry meters, String outcome, String method) {
         return Counter.builder("renewals.processed")
                 .description("Renewal messages by processing outcome")
                 .tag("outcome", outcome)
+                .tag("method", method)
                 .register(meters);
+    }
+
+    private void incrementProcessed(String outcome, String method) {
+        String normalizedMethod = "card".equals(method) || "sdd".equals(method)
+                ? method : "unknown";
+        processedCounters.get(counterKey(outcome, normalizedMethod)).increment();
+    }
+
+    private String counterKey(String outcome, String method) {
+        return outcome + "|" + method;
     }
 
     private void validate(RenewalRequested evt) {
@@ -231,27 +263,8 @@ public class BillingService {
         return jdbc.queryForObject("SELECT id FROM payment WHERE idempotency_key = ? ", UUID.class, idempotencyKey);
     }
 
-    private void markPaymentSucceeded(UUID paymentId) {
-        jdbc.update("UPDATE payment SET status = 'succeeded', completed_at = now()WHERE id = ? ", paymentId);
-    }
-
-    private void markPaymentFailed(UUID paymentId) {
-        jdbc.update("UPDATE payment SET status = 'failed', completed_at = now() WHERE id = ?", paymentId);
-    }
-
-    private void finalizeBilling(UUID invoiceId, UUID chargeId, UUID
-            subscriptionId, LocalDate newRenewalDate) {
-        jdbc.update("UPDATE charge SET status = 'settled' WHERE id = ?",
-                chargeId);
-        jdbc.update("UPDATE invoice SET status = 'paid' WHERE id = ?",
-                invoiceId);
-        // advance renewed_at to period end at 09:00 local (column is TIMESTAMPTZ)
-        LocalDateTime ldt = newRenewalDate.atTime(9, 0);
-        jdbc.update("UPDATE subscription SET renewed_at = ? WHERE id = ?",
-                Timestamp.valueOf(ldt), subscriptionId);
-    }
-
     record CustomerBilling(
-            String paymentMethod, String debtorIban, String mandateReference, String country) {
+            String paymentMethod, String debtorIban, String mandateReference,
+            String country, String cardToken) {
     }
 }

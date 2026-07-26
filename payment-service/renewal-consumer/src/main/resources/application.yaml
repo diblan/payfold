@@ -24,22 +24,23 @@ rabbitmq:
   queue: billing.renewals.main
   routingKey: renewal.requested
 
-payment:
-  provider:
-    base-url: http://localhost:8082
-    timeout-ms: 2000
-
 bank:
   timeout-ms: 2000
   registry:
     - id: bank-a
+      scheme: sepa_core
       base-url: http://localhost:8085
       webhook-secret: payfold-dev-secret
       countries: BE,FR
     - id: bank-b
+      scheme: sepa_core
       base-url: http://localhost:8086
       webhook-secret: payfold-dev-secret-b
       countries: NL,IE
+    - id: cardnet
+      scheme: card
+      base-url: http://localhost:8087
+      webhook-secret: payfold-dev-secret-card
 
 management:
   endpoints:

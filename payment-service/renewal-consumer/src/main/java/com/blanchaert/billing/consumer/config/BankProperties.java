@@ -6,7 +6,7 @@ import java.util.List;
 
 @ConfigurationProperties(prefix = "bank")
 public record BankProperties(int timeoutMs, List<BankEntry> registry) {
-    public record BankEntry(String id, String baseUrl, String webhookSecret,
+    public record BankEntry(String id, String scheme, String baseUrl, String webhookSecret,
                             List<String> countries) {
     }
 }

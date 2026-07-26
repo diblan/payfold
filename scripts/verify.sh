@@ -4,8 +4,9 @@
 # This script is the machine-checkable definition of "working" (see AGENTS.md and
 # docs/invariants.md G7): it may only ever be made stricter, never loosened.
 # It asserts the async renewal trigger returns an execution id in <1s,
-# polls that execution to completion, checks exact deterministic provider failures
-# derived from PSP_FAIL_HEX, and cross-checks same-run Prometheus/DB deltas; consumer
+# polls that execution to completion, checks exact deterministic outcomes for BOTH
+# payment methods from stored customer data (card tokens, debtor IBANs), and
+# cross-checks same-run Prometheus/DB deltas; consumer
 # counters are summed across the replica port range.
 # It also re-runs the payfold-migrations image as a no-op run-to-completion Job.
 # It also requires Prometheus to be scraping both services and Grafana to serve
@@ -76,9 +77,9 @@ RMQ_MGMT_PORT="$(env_val RABBITMQ_MGMT_PORT 15672)"
 RMQ_QUEUE="$(env_val RABBITMQ_QUEUE billing.renewals.main)"
 RMQ_EXCHANGE="$(env_val RABBITMQ_EXCHANGE billing.renewals)"
 RMQ_RK="$(env_val RABBITMQ_ROUTINGKEY renewal.requested)"
-PSP_FAIL_HEX="$(env_val PSP_FAIL_HEX 0)"
 BANK_PORT="$(env_val BANK_HTTP_PORT 8085)"
 BANK_B_PORT="$(env_val BANK_B_HTTP_PORT 8086)"
+CARDNET_PORT="$(env_val CARDNET_HTTP_PORT 8087)"
 RMQ_DLQ="billing.renewals.dlq"
 SETTLEMENT_MAIN="billing.settlements.main"
 SETTLEMENT_DLQ="billing.settlements.dlq"
@@ -135,14 +136,13 @@ consumer_up() {
 consumer_running() { docker compose ps --status running --services 2>/dev/null | grep -qx renewal-consumer; }
 bank_up() { curl -fsS "http://localhost:${BANK_PORT}/health" 2>/dev/null | grep -q '"status":"ok"'; }
 bank_b_up() { curl -fsS "http://localhost:${BANK_B_PORT}/health" 2>/dev/null | grep -q '"status":"ok"'; }
+cardnet_up() { curl -fsS "http://localhost:${CARDNET_PORT}/health" 2>/dev/null | grep -q '"status":"ok"'; }
 
 outbox_drained() { [[ "$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NULL')" == "0" ]]; }
 
-# A today-due card outbox row is correctly billed when a payment exists under
-# its derived idempotency key with EXACTLY the terminal status the deterministic
-# mock-PSP rule predicts: 'failed' when the subscription id's last hex char is
-# in [$PSP_FAIL_HEX], 'succeeded' otherwise.
-MISMATCHED_SQL="SELECT count(*) FROM renewal_outbox o
+# A today-due card outbox row is correctly billed when the stored card token
+# predicts its exact terminal status, reason, channel, and settlement attribution.
+CARD_TERMINAL_MISMATCH_SQL="SELECT count(*) FROM renewal_outbox o
 JOIN subscription s ON s.id = o.subscription_id
 JOIN customer c ON c.id = s.customer_id
 WHERE o.due_date = current_date
@@ -150,10 +150,16 @@ WHERE o.due_date = current_date
   AND NOT EXISTS (
     SELECT 1 FROM payment p
     WHERE p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
-      AND p.status = CASE WHEN right(o.subscription_id::text, 1) ~ '[${PSP_FAIL_HEX}]'
-                          THEN 'failed' ELSE 'succeeded' END
+      AND p.channel = 'CARD'
+      AND p.status = CASE WHEN right(c.card_token, 2) IN ('99','98') THEN 'failed'
+                          WHEN right(c.card_token, 2) = '96' THEN 'charged_back'
+                          ELSE 'succeeded' END
+      AND (p.status = 'succeeded' OR p.failure_reason = CASE right(c.card_token, 2)
+                          WHEN '99' THEN 'insufficient_funds' WHEN '98' THEN 'do_not_honor'
+                          WHEN '96' THEN 'fraud_dispute' END)
+      AND (p.status = 'failed' OR (p.bank_id IS NOT NULL AND p.collection_id IS NOT NULL))
   )"
-all_billed() { [[ "$(q "$MISMATCHED_SQL")" == "0" ]]; }
+all_cards_terminal() { [[ "$(q "$CARD_TERMINAL_MISMATCH_SQL")" == "0" ]]; }
 
 # R23d closes the loop: every due SDD renewal must reach the terminal state
 # the IBAN rule predicts (docs/architecture.md#mock-bank) after the bank's
@@ -218,7 +224,7 @@ producer_prometheus_ready() {
 }
 consumer_prometheus_ready() {
   local processed
-  processed="$(consumer_prom_sum '^renewals_processed_total\{outcome="(succeeded|failed|submitted)"\}')"
+  processed="$(consumer_prom_sum '^renewals_processed_total\{.*outcome="(succeeded|failed|submitted)"')"
   [[ "$processed" != "absent" && "$processed" != "unreachable" ]]
 }
 main_queue_empty() { [[ "$(queue_depth "$RMQ_QUEUE")" == "0" ]]; }
@@ -331,6 +337,7 @@ fi
 # R23a: the mock bank is part of the stack's definition of working.
 wait_for "mock-bank /health ok" bank_up
 wait_for "mock-bank-b /health ok" bank_b_up
+wait_for "mock-card /health ok" cardnet_up
 
 wait_for "producer /actuator/prometheus serves outbox counters" producer_prometheus_ready || summary
 wait_for "consumer /actuator/prometheus serves renewals counter" consumer_prometheus_ready || summary
@@ -356,7 +363,7 @@ wait_for "grafana serves the provisioned pipeline dashboard" grafana_dashboard_p
 
 M_INS_BEFORE="$(prom_val "$PRODUCER_PORT" '^outbox_inserted_total ')"
 M_PUB_BEFORE="$(prom_val "$PRODUCER_PORT" '^outbox_published_total ')"
-M_PROC_BEFORE="$(consumer_prom_sum '^renewals_processed_total\{outcome="(succeeded|failed|submitted)"\}')"
+M_PROC_BEFORE="$(consumer_prom_sum '^renewals_processed_total\{.*outcome="(succeeded|failed|submitted)"')"
 DB_OUTBOX_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox')"
 DB_PUB_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NOT NULL')"
 
@@ -390,7 +397,7 @@ else
 fi
 
 wait_for "outbox fully published"                outbox_drained
-wait_for "every due card renewal reached its predicted terminal payment (PSP rule [${PSP_FAIL_HEX}])" all_billed
+wait_for "every due card renewal reached its token-predicted terminal payment" all_cards_terminal
 wait_for "every due SDD renewal reached its bank-predicted terminal payment" all_sdd_terminal
 
 DB_OUTBOX_AFTER="$(q 'SELECT count(*) FROM renewal_outbox')"
@@ -416,7 +423,7 @@ published_metric_delta_matches() {
 }
 processed_metric_delta_matches() {
   local current
-  current="$(consumer_prom_sum '^renewals_processed_total\{outcome="(succeeded|failed|submitted)"\}')"
+  current="$(consumer_prom_sum '^renewals_processed_total\{.*outcome="(succeeded|failed|submitted)"')"
   [[ "$current" =~ ^[0-9]+$ ]] && (( current - M_PROC_BEFORE == DB_PUB_DELTA ))
 }
 batch_job_timer_recorded() {
@@ -445,19 +452,35 @@ else
 fi
 wait_for "spring_batch_job_seconds recorded on producer" batch_job_timer_recorded
 
-EXPECTED_FAILED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(o.subscription_id::text, 1) ~ '[${PSP_FAIL_HEX}]'")"
-ACTUAL_FAILED="$(q "SELECT count(*) FROM payment WHERE status = 'failed' AND channel = 'CARD' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
-if [[ -n "$EXPECTED_FAILED" && "$ACTUAL_FAILED" == "$EXPECTED_FAILED" ]]; then
-  pass "failed payment count matches deterministic PSP rule exactly (PSP_FAIL_HEX=[${PSP_FAIL_HEX}], failed=${ACTUAL_FAILED}/${N_DUE})"
+EXPECTED_CARD_FAILED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(c.card_token, 2) IN ('99','98')")"
+ACTUAL_CARD_FAILED="$(q "SELECT count(*) FROM payment WHERE status = 'failed' AND channel = 'CARD' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
+if [[ -n "$EXPECTED_CARD_FAILED" && "$ACTUAL_CARD_FAILED" == "$EXPECTED_CARD_FAILED" ]]; then
+  pass "card failed count matches the token rule exactly (${ACTUAL_CARD_FAILED}/${N_CARD_DUE})"
 else
-  fail "failed payment count matches deterministic PSP rule exactly" "expected=${EXPECTED_FAILED:-error} actual=${ACTUAL_FAILED:-error}"
+  fail "card failed count matches the token rule exactly" "expected=${EXPECTED_CARD_FAILED:-error} actual=${ACTUAL_CARD_FAILED:-error}"
+fi
+CARD_REASON_MISMATCH="$(q "SELECT count(*) FROM payment p JOIN charge ch ON ch.id = p.charge_id JOIN subscription s ON s.id = ch.subscription_id JOIN customer c ON c.id = s.customer_id
+WHERE p.status = 'failed' AND p.channel = 'CARD'
+  AND p.idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')
+  AND p.failure_reason IS DISTINCT FROM CASE right(c.card_token, 2) WHEN '99' THEN 'insufficient_funds' WHEN '98' THEN 'do_not_honor' END")"
+if [[ "$CARD_REASON_MISMATCH" == "0" ]]; then
+  pass "every failed card payment carries its token-predicted reason"
+else
+  fail "every failed card payment carries its token-predicted reason" "count=${CARD_REASON_MISMATCH:-error}"
+fi
+EXPECTED_CARD_CHARGED_BACK="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(c.card_token, 2) = '96'")"
+ACTUAL_CARD_CHARGED_BACK="$(q "SELECT count(*) FROM payment WHERE status = 'charged_back' AND channel = 'CARD' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
+if [[ -n "$EXPECTED_CARD_CHARGED_BACK" && "$ACTUAL_CARD_CHARGED_BACK" == "$EXPECTED_CARD_CHARGED_BACK" ]]; then
+  pass "card charged-back count matches the token rule exactly (${ACTUAL_CARD_CHARGED_BACK}/${EXPECTED_CARD_CHARGED_BACK})"
+else
+  fail "card charged-back count matches the token rule exactly" "expected=${EXPECTED_CARD_CHARGED_BACK:-error} actual=${ACTUAL_CARD_CHARGED_BACK:-error}"
 fi
 
 STUCK_SUBMITTED="$(q "SELECT count(*) FROM payment WHERE status = 'submitted' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
 if [[ "$STUCK_SUBMITTED" == "0" ]]; then
-  pass "zero SDD payments stuck submitted after settlement"
+  pass "zero payments stuck submitted after settlement"
 else
-  fail "zero SDD payments stuck submitted after settlement" "count=${STUCK_SUBMITTED:-error}"
+  fail "zero payments stuck submitted after settlement" "count=${STUCK_SUBMITTED:-error}"
 fi
 EXPECTED_SDD_FAILED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND right(c.debtor_iban, 2) IN ('99','98','97')")"
 ACTUAL_SDD_FAILED="$(q "SELECT count(*) FROM payment WHERE status = 'failed' AND channel = 'SEPA_DD' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
@@ -480,7 +503,9 @@ fi
 # applied chargeback), everything else one. Chargebacks lag by
 # BANK_CHARGEBACK_LAG_SECONDS, so this is a bounded wait, not a single read.
 N_96_DUE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '96'")"
-EXPECTED_INBOX=$((N_SDD_DUE + N_96_DUE))
+N_CARD_AUTH="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(c.card_token, 2) NOT IN ('99','98')")"
+N_CARD_96="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(c.card_token, 2) = '96'")"
+EXPECTED_INBOX=$((N_SDD_DUE + N_96_DUE + N_CARD_AUTH + N_CARD_96))
 inbox_complete() { [[ "$(q 'SELECT count(*) FROM settlement_inbox')" -ge "$EXPECTED_INBOX" ]] 2>/dev/null; }
 wait_for "settlement inbox received every predicted notification (${EXPECTED_INBOX})" inbox_complete
 INBOX_TOTAL="$(q 'SELECT count(*) FROM settlement_inbox')"
@@ -511,13 +536,16 @@ if [[ "$CHARGEBACK_ROLLBACKS" == "0" ]]; then
 else
   fail "no chargeback rolled a subscription back (recorded fact, D16)" "count=${CHARGEBACK_ROLLBACKS:-error}"
 fi
-UNTRACED="$(q "SELECT count(*) FROM payment p WHERE p.channel = 'SEPA_DD' AND p.status IN ('succeeded','failed','charged_back')
+UNTRACED="$(q "SELECT count(*) FROM payment p WHERE (
+    (p.channel = 'SEPA_DD' AND p.status IN ('succeeded','failed','charged_back'))
+    OR (p.channel = 'CARD' AND p.status IN ('succeeded','charged_back'))
+  )
   AND p.idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')
   AND NOT EXISTS (SELECT 1 FROM settlement_inbox i WHERE i.bank_id = p.bank_id AND i.notification_id = p.collection_id || ':1')")"
 if [[ "$UNTRACED" == "0" ]]; then
-  pass "every terminal SDD payment traces to an inbox notification"
+  pass "every asynchronously terminal payment traces to an inbox notification"
 else
-  fail "every terminal SDD payment traces to an inbox notification" "count=${UNTRACED:-error}"
+  fail "every asynchronously terminal payment traces to an inbox notification" "count=${UNTRACED:-error}"
 fi
 
 # R23e: per-bank attribution. The compose default routing is bank-a: BE,FR;
@@ -531,10 +559,14 @@ if [[ "$ROUTING_MISMATCH" == "0" ]]; then
 else
   fail "every SDD payment routed to its country's bank" "count=${ROUTING_MISMATCH:-error}"
 fi
-for BANK in bank-a bank-b; do
-  if [[ "$BANK" == "bank-a" ]]; then COUNTRIES="('BE','FR')"; else COUNTRIES="('NL','IE')"; fi
-  EXPECTED_BANK_INBOX="$(q "SELECT count(*) + count(*) FILTER (WHERE right(c.debtor_iban, 2) = '96') FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id
+for BANK in bank-a bank-b cardnet; do
+  if [[ "$BANK" == "cardnet" ]]; then
+    EXPECTED_BANK_INBOX=$((N_CARD_AUTH + N_CARD_96))
+  else
+    if [[ "$BANK" == "bank-a" ]]; then COUNTRIES="('BE','FR')"; else COUNTRIES="('NL','IE')"; fi
+    EXPECTED_BANK_INBOX="$(q "SELECT count(*) + count(*) FILTER (WHERE right(c.debtor_iban, 2) = '96') FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id
 WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND c.country IN ${COUNTRIES}")"
+  fi
   ACTUAL_BANK_INBOX="$(q "SELECT count(*) FROM settlement_inbox WHERE bank_id = '${BANK}'")"
   if [[ -n "$EXPECTED_BANK_INBOX" && "$ACTUAL_BANK_INBOX" == "$EXPECTED_BANK_INBOX" ]]; then
     pass "${BANK} inbox rows match its routed cohort exactly (${ACTUAL_BANK_INBOX})"
@@ -543,7 +575,7 @@ WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND c.country IN ${
   fi
 done
 
-for BANK_AND_PORT in "bank-a:${BANK_PORT}" "bank-b:${BANK_B_PORT}"; do
+for BANK_AND_PORT in "bank-a:${BANK_PORT}" "bank-b:${BANK_B_PORT}" "cardnet:${CARDNET_PORT}"; do
   BANK="${BANK_AND_PORT%%:*}"
   PORT="${BANK_AND_PORT#*:}"
   BANK_GIVEUPS="$(curl -fsS "http://localhost:${PORT}/metrics" 2>/dev/null | grep '^bank_webhook_giveups_total ' | awk '{print $2}')"
@@ -564,7 +596,7 @@ fi
 FAILED_ADVANCED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id
 WHERE o.due_date = current_date
   AND c.payment_method = 'card'
-  AND right(o.subscription_id::text, 1) ~ '[${PSP_FAIL_HEX}]'
+  AND right(c.card_token, 2) IN ('99','98')
   AND s.renewed_at >= current_date")"
 if [[ "$FAILED_ADVANCED" == "0" ]]; then
   pass "no failed renewal advanced its subscription"

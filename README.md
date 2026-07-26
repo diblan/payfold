@@ -55,11 +55,12 @@ This README stays a quickstart; everything deeper belongs in `docs/`.
    - `seed-data`: executes the Java seed scripts in `seed-data-gen`, seeding
      `SEED_CUSTOMERS` customers (default 15000), each with a subscription due today
    - `rabbitmq`: RabbitMQ 3.13 with the management UI exposed locally
-   - `mock-psp`: WireMock mock payment provider (port `8084`), declining a
-     deterministic `PSP_FAIL_HEX` slice of renewals
    - `mock-bank` / `mock-bank-b`: two instances of the same SEPA counterparty
      image; bank-a serves BE+FR on port `8085`, while deliberately slow bank-b
      serves NL+IE on port `8086`
+   - `mock-card`: the same counterparty image in its card scheme (port `8087`);
+     it returns token-derived authorization verdicts synchronously and sends
+     settlement/chargeback events asynchronously
    - `renewal-producer`: Spring Boot billing engine (port `8080`)
    - `renewal-consumer`: Spring Boot payment service (port `8081`; scaled
      replicas bind up to `8083`)
@@ -107,8 +108,9 @@ under "Measured scale runs".
   a 330k night is roughly 2.5 minutes of publishing.
 - **Consumer (bill + settle):** the documented 100k-due-today run drained all
   100,000 renewals in ~30 minutes — ~55/s overall, **~48/s sustained** after a
-  ~2-minute warm-up burst — with every renewal reaching its exact predicted
-  terminal state, mock-PSP HTTP call and idempotent upsert chain included.
+  ~2-minute warm-up burst. The current verifier requires every renewal to reach
+  its token/IBAN-predicted terminal state through the shared asynchronous
+  settlement spine and idempotent upsert chain.
   Adjacent runs measured 53/s (same day) and 41/s (against a 1M-deep queue).
 - **Extrapolation:** at the measured 41–48/s, a 330k nightly batch drains in
   1.9–2.2 hours — **11–13× the 3.8/s average** the 10M/month target requires.
@@ -144,8 +146,11 @@ One command demonstrates the failure modes the architecture exists for —
 poison messages dead-lettering while good traffic flows, a killed worker
 losing nothing and draining its backlog on recovery, three competing
 consumers splitting the queue, and a broker restart absorbed without a
-double-billed cent. Scene 6 switches the mock bank to a slow profile so the
-submitted SDD backlog is visible, then proves MD06 chargebacks leave payments
+double-billed cent. Cards now authorize synchronously but settle asynchronously
+through the same inbox → queue → listener spine as SDD. Scenes 1–5 use clean
+card tokens so they isolate delivery behavior. Scene 6 switches the mock bank to
+a slow profile so the submitted SDD backlog is visible, then proves MD06
+chargebacks leave payments
 `charged_back`, invoices `disputed`, settled charges intact, and subscriptions
 advanced before restoring the fast profile. Scene 7 then sends equal clean SDD
 cohorts through the country registry: BE clears through fast bank-a while NL is
@@ -181,4 +186,4 @@ scripts/chaos-demo.sh --auto     # unattended, asserts everything
 - **Database access:** Connect to PostgreSQL via your favourite client using the
   `POSTGRES_*` settings defined in `.env`.
 - **Configuration tweaks:** Update `.env` and re-run `docker compose up` to
-  apply changes such as alternative ports or a different payment provider mock.
+  apply changes such as alternative counterparty ports, secrets, or delay profiles.

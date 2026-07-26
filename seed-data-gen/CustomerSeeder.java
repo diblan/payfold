@@ -25,8 +25,8 @@ public class CustomerSeeder {
 
     private static final String INSERT_SQL = """
             INSERT INTO customer (id, email, name, locale, status, payment_method,
-            debtor_iban, mandate_reference, country, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+            debtor_iban, mandate_reference, country, card_token, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
             """;
 
     // Adjust to your taste (must sum ~1.0; code normalizes anyway)
@@ -45,10 +45,15 @@ public class CustomerSeeder {
         int howMany = args.length > 1 ? Integer.parseInt(args[1]) : seedTarget();   // number of customers to insert
         int sddPercent = seedPercent("SEED_SDD_PERCENT", 20);
         int sddRulePercent = seedPercent("SEED_SDD_RULE_PERCENT", 4);
+        int cardRulePercent = seedPercent("SEED_CARD_RULE_PERCENT", 4);
         if (sddRulePercent < 0 || sddPercent < sddRulePercent || sddPercent > 100) {
             throw new IllegalStateException(
                     "Seed payment-method percentages must satisfy 0 <= "
                             + "SEED_SDD_RULE_PERCENT <= SEED_SDD_PERCENT <= 100");
+        }
+        if (cardRulePercent < 0 || cardRulePercent > 100) {
+            throw new IllegalStateException(
+                    "SEED_CARD_RULE_PERCENT must satisfy 0 <= value <= 100");
         }
 
         // Email numbering starts at the current row count: every run draws from a
@@ -92,6 +97,7 @@ public class CustomerSeeder {
         // ---- Generate + insert ----
         Random rnd = new Random();
         int sddCount = 0;
+        int cardRuleCount = 0;
         try (Connection conn = DriverManager.getConnection(url, user, pass)) {
             conn.setAutoCommit(false);
             try (PreparedStatement ps = conn.prepareStatement(INSERT_SQL)) {
@@ -112,6 +118,7 @@ public class CustomerSeeder {
                     String debtorIban = null;
                     String mandateReference = null;
                     String country = null;
+                    String cardToken = null;
                     if (sdd) {
                         String suffix = n % 100 < sddRulePercent
                                 ? new String[]{"99", "98", "97", "96"}[n % 4]
@@ -120,6 +127,13 @@ public class CustomerSeeder {
                         mandateReference = "MNDT-" + n;
                         country = countryFor(loc);
                         sddCount++;
+                    } else {
+                        boolean cardRule = n % 100 >= 100 - cardRulePercent;
+                        String suffix = cardRule
+                                ? new String[]{"99", "98", "96"}[n % 3]
+                                : "01";
+                        cardToken = "tok-" + String.format("%010d", n) + suffix;
+                        if (cardRule) cardRuleCount++;
                     }
 
                     ps.setObject(1, java.util.UUID.randomUUID());
@@ -131,6 +145,7 @@ public class CustomerSeeder {
                     ps.setString(7, debtorIban);
                     ps.setString(8, mandateReference);
                     ps.setString(9, country);
+                    ps.setString(10, cardToken);
                     ps.addBatch();
                     if ((i + 1) % 1000 == 0) ps.executeBatch();   // bounded batch, same cadence as SubscriptionSeederDueToday
 
@@ -144,7 +159,8 @@ public class CustomerSeeder {
         }
 
         System.out.println("✅ Inserted " + howMany
-                + " customers with locale-aware names & emails (" + sddCount + " SDD).");
+                + " customers with locale-aware names & emails (" + sddCount
+                + " SDD, " + cardRuleCount + " rule-bearing cards).");
     }
 
     // Seed target: CLI arg wins, then the SEED_CUSTOMERS env var (passed through by

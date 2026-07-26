@@ -3,14 +3,19 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from app.config import Settings, load_settings
 from app.delivery import BANK_COLLECTIONS_RECEIVED, deliver
-from app.rules import notification_plan, outcome_for
+from app.rules import (
+    card_notification_plan,
+    card_verdict_for,
+    notification_plan,
+    outcome_for,
+)
 
 
 class CollectionSubmission(BaseModel):
@@ -19,6 +24,14 @@ class CollectionSubmission(BaseModel):
     currency: str = Field(pattern=r"^[A-Z]{3}$")
     debtor_iban: str = Field(min_length=8)
     mandate_reference: str = Field(min_length=1)
+    due_date: date
+
+
+class CardSubmission(BaseModel):
+    collection_id: str = Field(min_length=1)
+    amount_cents: int = Field(strict=True, gt=0)
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    card_token: str = Field(min_length=8)
     due_date: date
 
 
@@ -84,35 +97,60 @@ def create_app(
         task.add_done_callback(tasks.discard)
 
     @application.post("/collections", status_code=202)
-    async def submit_collection(submission: CollectionSubmission):
+    async def submit_collection(request: Request):
+        model = CardSubmission if settings.scheme == "card" else CollectionSubmission
+        try:
+            submission = model.model_validate(await request.json())
+        except (ValidationError, ValueError) as exception:
+            raise HTTPException(status_code=422, detail=str(exception)) from exception
+
         existing = records.get(submission.collection_id)
         if existing is not None:
+            content = {
+                "collection_id": submission.collection_id,
+                "status": existing["response_status"],
+                "duplicate": True,
+            }
+            if existing["response_reason"] is not None:
+                content["reason"] = existing["response_reason"]
             return JSONResponse(
-                content={
-                    "collection_id": submission.collection_id,
-                    "status": "accepted",
-                    "duplicate": True,
-                },
+                content=content,
                 status_code=200,
             )
 
-        classified_outcome, classified_reason = outcome_for(
-            submission.debtor_iban
-        )
+        if settings.scheme == "card":
+            classified_outcome, classified_reason = card_verdict_for(
+                submission.card_token
+            )
+            response_status = (
+                "declined" if classified_outcome == "declined" else "authorized"
+            )
+            plan = card_notification_plan(submission.card_token)
+        else:
+            classified_outcome, classified_reason = outcome_for(
+                submission.debtor_iban
+            )
+            response_status = "accepted"
+            plan = notification_plan(
+                submission.collection_id, submission.debtor_iban
+            )
+
         notifications = [
             {
                 **planned,
                 "notification_id": f"{submission.collection_id}:{planned['seq']}",
                 "state": "scheduled",
             }
-            for planned in notification_plan(
-                submission.collection_id, submission.debtor_iban
-            )
+            for planned in plan
         ]
         record = {
             **submission.model_dump(mode="json"),
             "outcome": classified_outcome,
             "reason": classified_reason,
+            "response_status": response_status,
+            "response_reason": (
+                classified_reason if response_status == "declined" else None
+            ),
             "notifications": notifications,
         }
         records[submission.collection_id] = record
@@ -120,11 +158,17 @@ def create_app(
         for notification_record in notifications:
             schedule(record, notification_record)
 
-        return {
+        content = {
             "collection_id": submission.collection_id,
-            "status": "accepted",
+            "status": response_status,
             "duplicate": False,
         }
+        if response_status == "declined":
+            content["reason"] = classified_reason
+        return JSONResponse(
+            content=content,
+            status_code=200 if response_status == "declined" else 202,
+        )
 
     @application.get("/collections/{collection_id}")
     async def get_collection(collection_id: str) -> dict:

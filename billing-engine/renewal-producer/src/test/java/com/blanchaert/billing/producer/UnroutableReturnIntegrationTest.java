@@ -62,7 +62,7 @@ class UnroutableReturnIntegrationTest {
         UUID subscriptionC = UUID.fromString("00000000-0000-0000-0000-000000000303");
         UUID planId = jdbc.queryForObject("SELECT id FROM plan ORDER BY name LIMIT 1", UUID.class);
 
-        jdbc.update("INSERT INTO customer (id, email) VALUES (?, ?)", customerId, "unroutable-probe@example.test");
+        jdbc.update("INSERT INTO customer (id, email, card_token) VALUES (?, ?, 'tok-producer-probe-01')", customerId, "unroutable-probe@example.test");
         jdbc.batchUpdate(
                 "INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at) VALUES (?, ?, ?, 'active', NULL)",
                 java.util.List.of(subscriptionA, subscriptionB, subscriptionC),

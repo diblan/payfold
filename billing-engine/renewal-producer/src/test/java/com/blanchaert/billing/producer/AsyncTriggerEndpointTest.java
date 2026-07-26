@@ -56,7 +56,7 @@ class AsyncTriggerEndpointTest {
         UUID subscriptionId = UUID.fromString("00000000-0000-0000-0000-000000000301");
         UUID planId = jdbc.queryForObject("SELECT id FROM plan ORDER BY name LIMIT 1", UUID.class);
 
-        jdbc.update("INSERT INTO customer (id, email) VALUES (?, ?)",
+        jdbc.update("INSERT INTO customer (id, email, card_token) VALUES (?, ?, 'tok-producer-probe-01')",
                 customerId, "async-trigger-probe@example.test");
         jdbc.update(
                 "INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at) "

@@ -53,8 +53,10 @@ import static org.awaitility.Awaitility.await;
 class SettlementSpineIntegrationTest {
     private static final String BANK_A_ID = "bank-a";
     private static final String BANK_B_ID = "bank-b";
+    private static final String CARD_ID = "cardnet";
     private static final String BANK_A_SECRET = "bank-a-secret";
     private static final String BANK_B_SECRET = "bank-b-secret";
+    private static final String CARD_SECRET = "cardnet-secret";
 
     @Container
     @ServiceConnection
@@ -72,23 +74,30 @@ class SettlementSpineIntegrationTest {
             .withCopyToContainer(
                     Transferable.of(readTestResource("bank/bank-collections-accept.json")),
                     "/home/wiremock/mappings/bank-collections-accept.json")
+            .withCopyToContainer(
+                    Transferable.of(readTestResource("bank/card-collections.json")),
+                    "/home/wiremock/mappings/card-collections.json")
             .waitingFor(Wait.forHttp("/__admin/health").forStatusCode(200));
 
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
         String wireMockUrl = "http://" + wireMock.getHost() + ":"
                 + wireMock.getMappedPort(8080);
-        registry.add("payment.provider.base-url", () -> wireMockUrl);
-        registry.add("payment.provider.timeout-ms", () -> "1000");
         registry.add("bank.timeout-ms", () -> "1000");
         registry.add("bank.registry[0].id", () -> BANK_A_ID);
+        registry.add("bank.registry[0].scheme", () -> "sepa_core");
         registry.add("bank.registry[0].base-url", () -> wireMockUrl + "/bank-a");
         registry.add("bank.registry[0].webhook-secret", () -> BANK_A_SECRET);
         registry.add("bank.registry[0].countries", () -> "BE");
         registry.add("bank.registry[1].id", () -> BANK_B_ID);
+        registry.add("bank.registry[1].scheme", () -> "sepa_core");
         registry.add("bank.registry[1].base-url", () -> wireMockUrl + "/bank-b");
         registry.add("bank.registry[1].webhook-secret", () -> BANK_B_SECRET);
         registry.add("bank.registry[1].countries", () -> "NL");
+        registry.add("bank.registry[2].id", () -> CARD_ID);
+        registry.add("bank.registry[2].scheme", () -> "card");
+        registry.add("bank.registry[2].base-url", () -> wireMockUrl + "/cardnet");
+        registry.add("bank.registry[2].webhook-secret", () -> CARD_SECRET);
     }
 
     @LocalServerPort
@@ -378,6 +387,39 @@ class SettlementSpineIntegrationTest {
         });
     }
 
+    @Test
+    void cardSettlementFinalizesThroughTheSameSpine() throws Exception {
+        SubmittedPayment fixture = parkCardSubmitted("tok-000000000001");
+        byte[] settled = webhook(
+                CARD_ID, fixture.collectionId(), 1, "settled", null);
+
+        assertThat(postWebhook(CARD_ID, settled, sign(settled, CARD_SECRET)))
+                .isEqualTo(200);
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(paymentStatus(fixture)).isEqualTo("succeeded"));
+        assertFinalized(fixture);
+
+        byte[] chargedBack = webhook(
+                CARD_ID, fixture.collectionId(), 2,
+                "charged_back", "fraud_dispute");
+        assertThat(postWebhook(
+                CARD_ID, chargedBack, sign(chargedBack, CARD_SECRET)))
+                .isEqualTo(200);
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            assertThat(paymentStatus(fixture)).isEqualTo("charged_back");
+            assertThat(jdbc.queryForObject("""
+                    SELECT failure_reason FROM payment WHERE collection_id = ?
+                    """, String.class, fixture.collectionId()))
+                    .isEqualTo("fraud_dispute");
+            assertThat(jdbc.queryForObject(
+                    "SELECT status FROM invoice WHERE customer_id = ?",
+                    String.class, fixture.customerId())).isEqualTo("disputed");
+            assertThat(renewedAt(fixture.subscriptionId()))
+                    .isEqualTo(expectedRenewedAt(fixture.periodEnd()));
+        });
+    }
+
     private SubmittedPayment parkSubmitted(String ibanSuffix) throws Exception {
         return parkSubmitted(ibanSuffix, "BE");
     }
@@ -418,6 +460,49 @@ class SettlementSpineIntegrationTest {
 
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(collectionId)).isEqualTo("submitted"));
+        return new SubmittedPayment(
+                customerId, subscriptionId, collectionId, periodEnd, originalRenewedAt);
+    }
+
+    private SubmittedPayment parkCardSubmitted(String cardToken) throws Exception {
+        UUID customerId = UUID.randomUUID();
+        UUID subscriptionId = UUID.randomUUID();
+        UUID planId = jdbc.queryForObject(
+                "SELECT id FROM plan WHERE name = 'Standard'", UUID.class);
+        LocalDate dueDate = LocalDate.of(2031, 1, 1);
+        LocalDate periodEnd = dueDate.plusMonths(1);
+        Instant originalRenewedAt = dueDate.minusMonths(1)
+                .atTime(9, 0).atOffset(ZoneOffset.UTC).toInstant();
+        String collectionId = "sub-" + subscriptionId + "|" + dueDate;
+
+        jdbc.update("""
+                INSERT INTO customer (
+                    id, email, name, status, payment_method, card_token
+                )
+                VALUES (?, ?, ?, 'active', 'card', ?)
+                """, customerId, "card-spine-" + customerId + "@example.com",
+                "Card Spine Customer", cardToken);
+        jdbc.update("""
+                INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
+                VALUES (?, ?, ?, 'active', ?)
+                """, subscriptionId, customerId, planId,
+                dueDate.minusMonths(1).atTime(9, 0).atOffset(ZoneOffset.UTC));
+
+        RenewalRequested renewal = new RenewalRequested(
+                1, UUID.randomUUID(), subscriptionId, customerId, planId, "month",
+                1499, "EUR", collectionId, dueDate.toString(), dueDate.toString(),
+                periodEnd.toString(), "2031-01-01T00:00:00.000Z");
+        rabbitTemplate.convertAndSend(
+                "billing.renewals",
+                "renewal.requested",
+                jsonMessage(objectMapper.writeValueAsBytes(renewal)));
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            assertThat(paymentStatus(collectionId)).isEqualTo("submitted");
+            assertThat(jdbc.queryForObject(
+                    "SELECT bank_id FROM payment WHERE collection_id = ?",
+                    String.class, collectionId)).isEqualTo(CARD_ID);
+        });
         return new SubmittedPayment(
                 customerId, subscriptionId, collectionId, periodEnd, originalRenewedAt);
     }

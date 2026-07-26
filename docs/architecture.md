@@ -18,7 +18,7 @@ Honesty table:
 | Broker-acknowledged publish (publisher confirms + returns) | Demonstrated — confirm-gated `published_at`, unconfirmed-repick test; mandatory publishing with publisher returns treats an unroutable (returned) message as unconfirmed, proven by a binding-less-exchange test ([R15](roadmap.md#r15)) |
 | Idempotent redelivery handling | Demonstrated — payload-keyed; covered by a cross-midnight integration test, see [G2](invariants.md#g2) |
 | Bounded failure handling (DLQ) | Demonstrated — bounded listener retry + DLQ routing; poison-path integration test and `verify.sh` probe; see [G5](invariants.md#g5) |
-| Provider failure path (mock PSP) | Demonstrated — deterministic decline + timeout handling, failed payments quarantined unfinalized; exact-count verify.sh assertion |
+| Two-method counterparty path | Demonstrated — SDD and cards share one async settlement spine; card authorization declines synchronously while authorized cards and SDD finalize only from settlement events; exact token/IBAN outcome assertions |
 | Operational observability | Demonstrated — SLF4J logging, Prometheus counters + built-in job/listener timers, `verify.sh` cross-checks metric deltas against DB deltas |
 | Throughput at 330k/day | Measured end to end — producer: 1,015,000 due rows scanned + published in 459 s wall, peak heap 183 MiB; consumer: 100,000 due-today renewals drained in ~30 min (~48/s sustained) in [R12](roadmap.md#r12)'s documented run, so a 330k night is ~2.5 min of publishing plus 1.9–2.2 h of draining — 11–13× the 3.8/s requirement average. Single-node WSL2 dev-laptop numbers; the consumer is the binding constraint (2026-07-21, see quality.md "Measured scale runs") |
 | Horizontal producer scaling | Demonstrated — `FOR UPDATE SKIP LOCKED` page claims + advisory-lock cron guard; exactly-once under two concurrent publishers proven by test (compose still runs a single producer instance) |
@@ -27,7 +27,7 @@ Honesty table:
 ## Component map
 
 ```
-                 ┌─────────────┐   Flyway V1–V8    ┌──────────────┐
+                 ┌─────────────┐   Flyway V1–V9    ┌──────────────┐
                  │   flyway    ├──────────────────▶│              │
                  └─────────────┘                   │  postgres:18 │
                  ┌─────────────┐  SEED_CUSTOMERS   │   (payfold)  │
@@ -59,17 +59,17 @@ Honesty table:
                  │   renewal-consumer   ├─▶ payment / subscription
                  │   :8081-83 (host)    │   upserts via unique
                  └──────────┬───────────┘   constraints
-                            ├── POST /psp/charges ──▶ mock-psp (WireMock)
-                            │                         :8084; card verdict
-                            └── POST /collections ──▶ mock-bank ×2 (same FastAPI image)
-                                                      a :8085 — BE,FR / fast
-                                                      b :8086 — NL,IE / slow
+                            └── POST /collections ──▶ mock-counterparty ×3
+                                                      bank-a :8085 — SEPA / BE,FR
+                                                      bank-b :8086 — SEPA / NL,IE
+                                                      cardnet :8087 — card auth
+                                                        + async settlement
 ```
 
 ### Settlement spine (R23e)
 
 ```
-mock-bank ×2 ── signed POST /webhooks/bank/{id} ──▶ renewal-consumer
+mock-counterparty ×3 ── signed POST /webhooks/bank/{id} ──▶ renewal-consumer
                                                       │
                                                       ▼
                                              settlement_inbox
@@ -190,24 +190,28 @@ unique constraint (this *is* the idempotency mechanism, [D2](decisions.md#d2)):
 | `upsertInvoice` | `invoice` | `period_start`, `period_end`; `uniq_invoice_period (customer_id, period_start, period_end, currency)` |
 | `upsertCharge` | `charge` | actual `due_date`; `uniq_charge_period (subscription_id, due_date, amount_cents, currency)` |
 | `upsertPayment` | `payment` | `idempotency_key`; `payment.idempotency_key UNIQUE` |
-| `PspClient.charge` | — | HTTP `POST /psp/charges` to the mock PSP; called only while the payment is 'pending' |
-| `markPaymentSucceeded` / `markPaymentFailed` | `payment` | terminal status + `completed_at` from the PSP outcome; 'failed' returns without finalizing |
-| `finalizeBilling` | `charge`, `invoice`, `subscription` | sets settled/paid, advances `renewed_at` to `period_end` at 09:00 |
+| `BankClient` submission | — | HTTP `POST /collections` to the registry entry selected by method/country |
+| settlement listener | `payment`, `charge`, `invoice`, `subscription` | finalizes authorized cards and SDD only from `settlement.received` |
 
 After the shared invoice, charge, and payment upserts, the customer's payment
-method selects the counterparty. Cards keep the synchronous PSP path unchanged.
-For SDD, a fail-fast bank registry maps the customer's uppercase-normalized
-country to an entry containing bank id, base URL, webhook secret, and claimed
-countries. Startup rejects an empty registry, incomplete entries, duplicate bank
-ids, or duplicate country claims. An unroutable or null country is a deterministic
-renewal violation and takes the no-retry path to the DLQ. A routed SDD submits
-`POST /collections` through that bank's client with `collection_id` equal to the
-payment idempotency key; the bank's `200` duplicate contract deduplicates a
-resubmission after a crash. Acceptance marks the payment `submitted` with the
-routed `bank_id` and `collection_id`, finalizes nothing, and ACKs the renewal. A
-bank transport failure is the absence of a verdict, never a failed payment: it
-throws and rides the R5 bounded listener retry to the DLQ
-([G5](invariants.md#g5)).
+method selects a registry scheme. The fail-fast registry contains exactly one
+`card` entry and one or more `sepa_core` entries. SDD maps the customer's
+uppercase-normalized country to a SEPA entry; card uses the singleton card entry.
+Startup rejects incomplete entries, unsupported schemes, duplicate ids/country
+claims, missing SEPA countries, or zero/multiple card entries. An unroutable SDD
+country is a deterministic renewal violation and takes the no-retry path to the
+DLQ.
+
+Both methods submit `POST /collections` with `collection_id` equal to the payment
+idempotency key. SDD acceptance and card authorization mark the payment
+`submitted` with `bank_id` and `collection_id`, finalize nothing, and ACK the
+renewal. A card decline is the one terminal synchronous verdict: it marks the
+payment `failed` with the card reason and never receives a settlement leg. A
+transport failure or malformed response is the absence of a verdict, never a
+guessed decline; it throws and rides the R5 bounded listener retry to the DLQ
+([G5](invariants.md#g5)). Duplicate submissions return the counterparty's stored
+answer and schedule nothing, healing the crash window between submission and the
+payment status update.
 
 The payment status vocabulary is `pending`, `submitted`, `succeeded`, `failed`,
 and `charged_back`. The invoice vocabulary is `draft`, `posted`, `paid`,
@@ -246,14 +250,11 @@ untouched: a chargeback is a recorded fact, not compensation, and reacting
 belongs to dunning ([D16](decisions.md#d16)). Terminal status guards make every
 redelivery a no-op.
 
-Provider declines, timeouts, 5xx responses, and unreachable-provider errors are
-business failures: the payment becomes `failed`, the message is ACKed, and nothing is
-sent to the DLQ, which remains reserved for unprocessable messages ([G5](invariants.md#g5)).
-Failed payments are terminal and redelivery does not re-attempt them because dunning is
-a non-goal; a succeeded payment is replayed through `finalizeBilling` only. A crash
-between a provider 200 response and the payment-status write can call the PSP again on
-redelivery. A real PSP would deduplicate the transmitted `idempotency_key`; the
-stateless mock returns the same deterministic outcome.
+Card authorization declines are business failures: the payment becomes `failed`,
+the renewal is ACKed, and no settlement notification follows. Failed payments are
+terminal and redelivery does not re-attempt them because dunning is a non-goal.
+Authorized cards and SDD stay `submitted` until the settlement listener decides
+their terminal state.
 
 The consumer uses validated payload values only and has no clock-derived fallbacks.
 Missing or invalid required fields throw `InvalidRenewalMessageException`; deterministic
@@ -275,64 +276,22 @@ queue `billing.settlements.main`, DLX `billing.settlements.dlx`, and DLQ
 bounded retry customizer; deterministic renewal and settlement contract
 violations skip directly to their respective DLQ.
 
-## Mock PSP
-
-The mock provider runs WireMock `3.13.2`. Its source mappings live as inert
-templates in `mock-psp/mappings/*.json.tpl`; the Compose entrypoint renders them with
-`sed`, substituting `PSP_FAIL_HEX` into the decline rule before WireMock starts. A
-subscription is declined exactly when the last hex character of its UUID belongs to
-that set, so `k` configured hex characters decline exactly `k/16` subscriptions; a
-non-hex value such as `x` disables failures.
-
-The consumer integration test uses the same image and templates through a
-Testcontainers `GenericContainer`, then adds a test-only delayed response mapping for
-the timeout path. `verify.sh` recomputes the exact expected failed set in SQL with the
-same last-character predicate and asserts every due renewal has its predicted terminal
-payment status.
-
-The wire contract, documented so a third party (e.g. the platform repo's
-in-cluster stub) can implement it without reading payfold source:
-
-**Request** — `POST /psp/charges`, `Content-Type: application/json`:
-
-| Field | JSON type | Semantics |
-|---|---|---|
-| `idempotency_key` | string | The payment's stable key (`sub-<subscription_id>\|<due_date>`); a real PSP would deduplicate on it |
-| `subscription_id` | string | Subscription UUID; the decline rule keys on its last hex character |
-| `amount_cents` | number | Amount in integer minor units ([G4](invariants.md#g4)) |
-| `currency` | string | Currency code paired with `amount_cents` |
-
-**Response** — always `200` with `Content-Type: application/json`:
-
-| Body | Meaning |
-|---|---|
-| `{"status": "succeeded"}` | Charge accepted; the consumer finalizes billing |
-| `{"status": "declined", "reason": "card_declined"}` | Business decline; payment becomes `failed`, nothing finalized |
-
-The consumer accepts unknown extra fields (`@JsonIgnoreProperties`), treats any
-`status` other than `succeeded` as a failure carrying `reason` (default
-`declined`), an empty body as `empty_provider_response`, and any timeout,
-connection error, or non-2xx as `provider_error:<cause>` — all business
-failures, never dead-lettered ([G5](invariants.md#g5)).
-
 <a id="mock-bank"></a>
-## Mock bank
+## Mock counterparty (banks + card scheme)
 
-The FastAPI mock bank exists as the asynchronous SEPA SDD settlement
-counterparty selected by [D13](decisions.md#d13) and
-[D15](decisions.md#d15); the synchronous mock PSP continues to serve cards
-until [R23f](roadmap.md#r23f), when cards join the same settlement spine per
-[D17](decisions.md#d17).
+The FastAPI mock counterparty is the asynchronous settlement counterparty selected
+by [D15](decisions.md#d15) and generalized by [D17](decisions.md#d17). Compose
+runs three instances of the same image: `bank-a` serves BE/FR on a fast
+`sepa_core` profile, `bank-b` serves NL/IE on a deliberately slow `sepa_core`
+profile, and `cardnet` runs the `card` scheme on port 8087. Identity, callback
+URL, shared secret, and delays are per-instance environment only.
 
-Compose runs two instances of the same generic image. `bank-a` serves BE and FR
-on the fast profile (2 s settlement / 5 s chargeback lag); `bank-b` serves NL and
-IE on a deliberately slow profile (8 s / 10 s). Identity, callback URL, shared
-secret, and delays are per-instance environment only: adding bank N+1 is a
-compose registry entry plus another image instance, exactly the simplification
-accepted by D15. The slow profile is a chaos parameter that makes its submitted
-backlog and higher round-trip latency visible beside bank-a under the same load.
+The old WireMock PSP and its `/psp/charges` contract are retired. The one
+counterparty image now covers both methods, and both fulfillment paths emit the
+same signed settlement contract through the same durable spine. WireMock remains
+only a generic test-time HTTP stub in Java integration tests.
 
-`POST /collections` accepts this request:
+`POST /collections` selects a request model by scheme. `sepa_core` accepts:
 
 | Field | JSON type | Semantics |
 |---|---|---|
@@ -366,6 +325,33 @@ Each rule-bearing suffix is 1% of a uniform two-digit tail. More importantly,
 later verifier sub-items can predict every result directly in SQL as
 `right(debtor_iban, 2)` rather than trusting an aggregate percentage.
 
+The `card` scheme accepts:
+
+| Field | JSON type | Semantics |
+|---|---|---|
+| `collection_id` | string | Stable submission identity; duplicates return the stored verdict |
+| `amount_cents` | integer | Positive amount in integer minor units ([G4](invariants.md#g4)) |
+| `currency` | string | Three uppercase letters paired with `amount_cents` |
+| `card_token` | string | Tokenized card reference; the auth rule keys on its last two characters |
+| `due_date` | string | Due date in ISO `YYYY-MM-DD` form |
+
+Card submission answers with a synchronous authorization verdict. A decline is
+HTTP `200`, stored as the immutable verdict, schedules no notification, and
+becomes terminal immediately in the consumer. Authorization is HTTP `202`; the
+payment parks `submitted`, then settlement and any later chargeback arrive
+through the same webhook/inbox/queue/listener spine as SDD.
+
+| Last two token characters | Sync verdict | Async notification(s) | Reason |
+|---|---|---|---|
+| `99` | declined | none | `insufficient_funds` |
+| `98` | declined | none | `do_not_honor` |
+| `96` | authorized | `settled`, then `charged_back` | `fraud_dispute` on chargeback |
+| any other suffix | authorized | `settled` | none |
+
+Repeating a card `collection_id` returns HTTP `200` with the same stored
+`authorized` or `declined` verdict and `duplicate: true`; it never schedules an
+extra notification.
+
 Webhook delivery sends the exact compact JSON bytes that were signed. Headers
 are `Content-Type: application/json`, `X-Bank-Id: <bank_id>`, and
 `X-Bank-Signature: sha256=<hex HMAC-SHA256 of the exact raw body>`. The
@@ -396,7 +382,7 @@ environment variables; there is no `application.yaml`:
 | Environment variable | Default | Purpose |
 |---|---|---|
 | `BANK_ID` | `bank-a` | Bank identity included in notifications and headers |
-| `BANK_SCHEME` | `sepa_core` | Counterparty behavior scheme |
+| `BANK_SCHEME` | `sepa_core` | Counterparty behavior scheme (`sepa_core` or `card`) |
 | `BANK_WEBHOOK_URL` | `http://renewal-consumer:8080/webhooks/bank/bank-a` | Notification target |
 | `BANK_WEBHOOK_SECRET` | `payfold-dev-secret` | Per-bank HMAC shared secret |
 | `BANK_SETTLEMENT_DELAY_SECONDS` | `2.0` | Delay before sequence 1 |
@@ -404,12 +390,12 @@ environment variables; there is no `application.yaml`:
 | `BANK_WEBHOOK_RETRY_MAX_ATTEMPTS` | `5` | Bounded delivery-attempt cap |
 | `BANK_WEBHOOK_RETRY_BACKOFF_SECONDS` | `0.5` | Initial exponential-retry delay |
 
-This delivery surface is an explicit PSP-style fiction: real banks commonly
+The SEPA delivery surface is an explicit PSP-style fiction: real banks commonly
 report over file channels such as EBICS, with pain.002 and camt.054 batches.
 Payfold borrows that vocabulary while emitting JSON webhooks to keep the
-distributed-systems behavior inspectable. `BANK_SCHEME` is the reuse seam; only
-`sepa_core` exists today, and a `card` scheme joins the image in
-[R23f](roadmap.md#r23f) per [D17](decisions.md#d17).
+distributed-systems behavior inspectable. The exercised `BANK_SCHEME` seam is
+what lets cards and SDD share one image without pretending their first signal has
+the same semantics.
 
 ## Observability
 
@@ -428,16 +414,17 @@ Micrometer converts dots in meter names to underscores for Prometheus and append
 | `outbox.inserted` | `outbox_inserted_total` | Counter | none | By the number of rows inserted immediately after the scan SQL update |
 | `outbox.published` | `outbox_published_total` | Counter | none | By the number of confirm-gated rows immediately after their `published_at` batch update |
 | `outbox.returned` | `outbox_returned_total` | Counter | none | Once per message the broker returned as unroutable, inside the confirm-future completion that reports the row unconfirmed |
-| `renewals.processed` | `renewals_processed_total{outcome="..."}` | Counter | `outcome=succeeded \| failed \| invalid \| submitted` | Per processed delivery at its decision point: after successful finalization, at either terminal-failure return, when validation rejects the message, or after an SDD collection is parked submitted |
-| `settlements.processed` | `settlements_processed_total{outcome="...",bank="..."}` | Counter | `outcome=settled \| failed \| charged_back \| invalid`; `bank=bank-a \| bank-b \| unknown` | Per settlement delivery at validation or its accepted outcome; terminal redeliveries count as processings; invalid deliveries with no payment attribution use `unknown` |
-| `settlements.latency` | `settlements_latency_seconds_count/_sum/_max{bank="..."}` | Timer | `bank=bank-a \| bank-b` | Submission-to-terminal round trip, recorded once when a settled or failed guarded payment update succeeds |
+| `renewals.processed` | `renewals_processed_total{outcome="...",method="..."}` | Counter | `outcome=succeeded \| failed \| invalid \| submitted`; `method=card \| sdd \| unknown` | Per renewal delivery at its decision point; invalid messages without a known customer use `unknown`, and authorized card/SDD submissions count as submitted |
+| `settlements.processed` | `settlements_processed_total{outcome="...",bank="..."}` | Counter | `outcome=settled \| failed \| charged_back \| invalid`; `bank=bank-a \| bank-b \| cardnet \| unknown` | Per settlement delivery at validation or its accepted outcome; terminal redeliveries count as processings; invalid deliveries with no payment attribution use `unknown` |
+| `settlements.latency` | `settlements_latency_seconds_count/_sum/_max{bank="..."}` | Timer | `bank=bank-a \| bank-b \| cardnet` | Submission-to-terminal round trip, recorded once when a settled or failed guarded payment update succeeds |
 | `settlement.webhooks.received` | `settlement_webhooks_received_total{result="..."}` | Counter | `result=accepted \| duplicate \| unauthorized \| rejected` | Once per webhook request after its receiver decision |
 
 All counter series are registered eagerly and therefore render as `0.0` from boot;
 `verify.sh` depends on that property. Settlement outcome×bank pairs and each
-bank's latency timer are likewise registered at startup, so both bank series
+counterparty's latency timer are likewise registered at startup, so all three series
 exist before the first callback. The renewal outcome taxonomy is bounded to
-`succeeded`, `failed`, `invalid`, and `submitted`. Transient or unexpected failures
+`succeeded`, `failed`, `invalid`, and `submitted`, crossed with the bounded
+`card`, `sdd`, and `unknown` method dimension. Transient or unexpected failures
 increment no outcome counter because they have no decided business outcome;
 retries remain visible through the listener timer's `result="failure"` tag.
 
@@ -527,6 +514,7 @@ requires a version bump and decision entry.
 | V6 | customer payment method plus SDD debtor material; payment bank and collection attribution for submitted collections |
 | V7 | durable `settlement_inbox` with unique bank/notification identity and confirm-gated `published_at`; `payment.failure_reason` for terminal ISO outcomes |
 | V8 | `payment.charged_back_at`, separating the dispute timestamp from settlement completion |
+| V9 | tokenized card reference on `customer`, backfilled for legacy cards and required for every card customer |
 
 `renewal_outbox`: `id, subscription_id, due_date, payload jsonb, created_at, published_at`.
 Unpublished = `published_at IS NULL`.
@@ -549,10 +537,8 @@ Every remaining `application.yaml` key has a real consumer.
 | `app.timezone`, `app.scheduleCron`, `app.scanPageSize`, `app.publishPageSize`, `app.publishInFlightLimit`, `app.confirmTimeoutMs` (producer) | `RenewalScheduler`, `RenewalJobConfig`, `RenewalJobEndpoint` | alive |
 | `rabbitmq.exchange`, `rabbitmq.routingKey` (producer) | `RabbitConfig`, `OutboxPublisher` | alive |
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |
-| `payment.provider.base-url` (consumer) | `PaymentProviderProperties`, `PspClient`; compose overrides with `PAYMENT_PROVIDER_BASE_URL` | alive |
-| `payment.provider.timeout-ms` (consumer) | `PaymentProviderProperties`, `PspClient` connect + read timeout | alive |
 | `bank.timeout-ms` (consumer) | `BankProperties`, `BankClient` connect + read timeout | alive |
-| `bank.registry[]` id/base URL/webhook secret/countries (consumer) | `BankProperties`, `BankRegistry`, `BankClient`, `BillingService`, `BankWebhookController`; compose overrides entries through indexed `BANK_REGISTRY_*` env vars and each secret matches its mock-bank instance | alive |
+| `bank.registry[]` id/scheme/base URL/webhook secret/countries (consumer) | `BankProperties`, `BankRegistry`, `BankClient`, `BillingService`, `BankWebhookController`; `countries` is required only for `sepa_core`, and the registry requires exactly one `card` entry; compose overrides indexed `BANK_REGISTRY_*` env vars | alive |
 | `spring.rabbitmq.listener.simple.*` (consumer) | Spring Boot AMQP autoconfig + `ListenerRetryConfig` (`max-attempts`) | alive |
 | `management.endpoints.web.exposure.include` (producer) | actuator exposure for `health`, `info`, `metrics`, `prometheus`, and `renewal-job` | alive |
 | `management.endpoints.web.exposure.include` (consumer) | actuator exposure for `health`, `info`, `metrics`, and `prometheus`; the compose healthcheck relies on `health` | alive |
@@ -566,18 +552,19 @@ compose healthcheck hits `/actuator/health`, served by actuator since
 
 Seed configuration is compose-only, deliberately absent from the table above
 (the table covers `application.yaml` keys): `SEED_CUSTOMERS` (default 15000),
-`SEED_SDD_PERCENT` (default 20), and `SEED_SDD_RULE_PERCENT` (default 4) are
-read by `CustomerSeeder` in the seed container. The latter two deterministically
-partition customers and assign rule-bearing IBAN suffixes from the global
-customer number. Every seeded subscription is due on the seed day, so
+`SEED_SDD_PERCENT` (default 20), `SEED_SDD_RULE_PERCENT` (default 4), and
+`SEED_CARD_RULE_PERCENT` (default 4) are read by `CustomerSeeder` in the seed
+container. They deterministically partition customers and assign rule-bearing
+IBAN/card-token suffixes from the global customer number. Every seeded
+subscription is due on the seed day, so
 `SEED_CUSTOMERS` directly sets the size of the day's renewal batch;
 `scripts/load-test.sh` adds more due-today volume to a running stack without a
 reseed.
 
-The mock-bank instances are likewise configured entirely by compose-only envs,
-deliberately absent from the `application.yaml` table: bank-a uses the `BANK_*`
-variables and bank-b uses the corresponding `BANK_B_*` host-port, secret, and
-delay variables; each container receives its own `BANK_ID`, `BANK_SCHEME`,
+The mock-counterparty instances are likewise configured entirely by compose-only
+envs, deliberately absent from the `application.yaml` table: bank-a uses the
+`BANK_*` variables, bank-b uses the corresponding `BANK_B_*` values, and cardnet
+uses `CARDNET_*`; each container receives its own `BANK_ID`, `BANK_SCHEME`,
 `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`,
 `BANK_SETTLEMENT_DELAY_SECONDS`, and `BANK_CHARGEBACK_LAG_SECONDS`. The retry
 cap/backoff retain the image defaults.
@@ -600,9 +587,9 @@ The deploy images' env contracts (`FLYWAY_*`, `POSTGRES_*`) are catalogued under
 |---|---|
 | `localhost:8080` | producer — `/actuator/health`, `/actuator/prometheus`, `POST /actuator/renewal-job?force=true`, `GET /actuator/renewal-job/{executionId}` |
 | `localhost:8081` | consumer's first replica — `/actuator/health` (since [R1](roadmap.md#r1)), `/actuator/prometheus`, `POST /webhooks/bank/{bankId}`; scaled replicas bind 8082–8083 with the same endpoints; container-internal 8080 |
-| `localhost:8084` | mock PSP (WireMock) — POST `/psp/charges`; admin/journal at `/__admin`; moved off 8082 by [R20](roadmap.md#r20) (consumer replica range) |
 | `localhost:8085` | mock bank-a (FastAPI, BE+FR fast profile) — `POST /collections`, `GET /collections/{id}`, `/health`, `/metrics` |
 | `localhost:8086` | mock bank-b (same image, NL+IE slow profile) — `POST /collections`, `GET /collections/{id}`, `/health`, `/metrics` |
+| `localhost:8087` | mock cardnet (same FastAPI image, card scheme) — sync auth from `POST /collections`, then async settlement; `/health`, `/metrics` |
 | `localhost:9090` | Prometheus — targets, `/api/v1/query`, `/-/healthy` |
 | `localhost:3000` | Grafana — `payfold-pipeline` dashboard, anonymous viewer access |
 | `localhost:5672` / `15672` | RabbitMQ AMQP / management UI (creds from `.env`) |
@@ -624,10 +611,10 @@ architecture-independent jar once instead of emulating Maven under QEMU.
 | Image (`ghcr.io/diblan/…`) | Contents | Run pattern | Config (env) |
 |---|---|---|---|
 | `payfold-renewal-producer` | producer Spring Boot jar | long-running service; port 8080, `/actuator/health` | the compose `renewal-producer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_ROUTINGKEY`, `APP_TIMEZONE`, `APP_SCHEDULECRON`, `TZ` |
-| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, `PAYMENT_PROVIDER_BASE_URL`, indexed `BANK_REGISTRY_*`, `TZ` |
+| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, indexed `BANK_REGISTRY_*` including scheme, `TZ` |
 | `payfold-migrations` | `flyway/flyway:11` + `db-migrations/V*.sql`, `CMD ["migrate"]` | run-to-completion Job; exit 0 = success; re-run on a current schema is a no-op (asserted by `verify.sh`) | `FLYWAY_URL`, `FLYWAY_USER`, `FLYWAY_PASSWORD`, `FLYWAY_CONNECT_RETRIES` (image default 30) |
-| `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS`, `SEED_SDD_PERCENT`, `SEED_SDD_RULE_PERCENT` |
-| `payfold-mock-bank` | FastAPI mock bank (source + pinned pure-python deps) | long-running service; port 8080, `/health`; compose runs ×2 differently profiled instances | `BANK_ID`, `BANK_SCHEME`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `TZ` |
+| `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS`, `SEED_SDD_PERCENT`, `SEED_SDD_RULE_PERCENT`, `SEED_CARD_RULE_PERCENT` |
+| `payfold-mock-bank` | FastAPI mock counterparty (source + pinned pure-python deps) | long-running service; port 8080, `/health`; compose runs two SEPA instances and one card instance | `BANK_ID`, `BANK_SCHEME`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `TZ` |
 
 Compose builds `payfold-migrations` and `payfold-seed-data-gen` itself (the flyway
 and seed-data services) instead of bind-mounting host paths, so the local stack

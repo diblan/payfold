@@ -1,6 +1,8 @@
 package com.blanchaert.billing.consumer;
 
 import com.blanchaert.billing.consumer.model.RenewalRequested;
+import com.blanchaert.billing.consumer.model.SettlementReceived;
+import com.blanchaert.billing.consumer.config.SettlementTopology;
 import com.blanchaert.billing.consumer.service.BillingService;
 import com.blanchaert.billing.consumer.service.InvalidRenewalMessageException;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -61,30 +63,32 @@ class RenewalListenerIntegrationTest {
             DockerImageName.parse("rabbitmq:3.13-management"));
 
     @Container
-    static final GenericContainer<?> mockPsp = new GenericContainer<>(
+    static final GenericContainer<?> wireMock = new GenericContainer<>(
             DockerImageName.parse("wiremock/wiremock:3.13.2"))
             .withExposedPorts(8080)
-            .withCopyToContainer(Transferable.of(renderPspTemplate("psp-charge-decline.json.tpl")), "/home/wiremock/mappings/psp-charge-decline.json")
-            .withCopyToContainer(Transferable.of(renderPspTemplate("psp-charge-success.json.tpl")), "/home/wiremock/mappings/psp-charge-success.json")
-            .withCopyToContainer(Transferable.of(readTestResource("psp/psp-charge-timeout.json")), "/home/wiremock/mappings/psp-charge-timeout.json")
             .withCopyToContainer(Transferable.of(readTestResource("bank/bank-collections-accept.json")), "/home/wiremock/mappings/bank-collections-accept.json")
+            .withCopyToContainer(Transferable.of(readTestResource("bank/card-collections.json")), "/home/wiremock/mappings/card-collections.json")
             .waitingFor(Wait.forHttp("/__admin/health").forStatusCode(200));
 
     @DynamicPropertySource
-    static void pspProperties(DynamicPropertyRegistry registry) {
+    static void counterpartyProperties(DynamicPropertyRegistry registry) {
         String wireMockUrl =
-                "http://" + mockPsp.getHost() + ":" + mockPsp.getMappedPort(8080);
-        registry.add("payment.provider.base-url", () -> wireMockUrl);
-        registry.add("payment.provider.timeout-ms", () -> "1000");
+                "http://" + wireMock.getHost() + ":" + wireMock.getMappedPort(8080);
         registry.add("bank.timeout-ms", () -> "1000");
         registry.add("bank.registry[0].id", () -> "bank-a");
+        registry.add("bank.registry[0].scheme", () -> "sepa_core");
         registry.add("bank.registry[0].base-url", () -> wireMockUrl + "/bank-a");
         registry.add("bank.registry[0].webhook-secret", () -> "bank-a-secret");
         registry.add("bank.registry[0].countries", () -> "BE");
         registry.add("bank.registry[1].id", () -> "bank-b");
+        registry.add("bank.registry[1].scheme", () -> "sepa_core");
         registry.add("bank.registry[1].base-url", () -> wireMockUrl + "/bank-b");
         registry.add("bank.registry[1].webhook-secret", () -> "bank-b-secret");
         registry.add("bank.registry[1].countries", () -> "NL");
+        registry.add("bank.registry[2].id", () -> "cardnet");
+        registry.add("bank.registry[2].scheme", () -> "card");
+        registry.add("bank.registry[2].base-url", () -> wireMockUrl + "/cardnet");
+        registry.add("bank.registry[2].webhook-secret", () -> "cardnet-secret");
     }
 
     @Autowired
@@ -116,10 +120,7 @@ class RenewalListenerIntegrationTest {
         LocalDate periodEnd = periodStart.plusMonths(1);
         String idempotencyKey = "sub-" + subscriptionId + "|" + periodStart;
 
-        jdbcTemplate.update("""
-                INSERT INTO customer (id, email, name, status)
-                VALUES (?, ?, ?, 'active')
-                """, customerId, "listener-test-" + customerId + "@example.com", "Listener Test Customer");
+        insertCardCustomer(customerId, "tok-000000000001");
         jdbcTemplate.update("""
                 INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
                 VALUES (?, ?, ?, 'active', ?)
@@ -144,26 +145,33 @@ class RenewalListenerIntegrationTest {
                 .setContentType(MessageProperties.CONTENT_TYPE_JSON)
                 .build();
 
-        double succeededBefore = registry.get("renewals.processed")
-                .tag("outcome", "succeeded")
+        double submittedBefore = registry.get("renewals.processed")
+                .tag("outcome", "submitted")
+                .tag("method", "card")
                 .counter()
                 .count();
         rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", message);
 
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
-            Long succeededPayments = jdbcTemplate.queryForObject("""
+            Long submittedPayments = jdbcTemplate.queryForObject("""
                     SELECT count(*)
                     FROM payment
-                    WHERE idempotency_key = ? AND status = 'succeeded'
+                    WHERE idempotency_key = ? AND status = 'submitted'
                     """, Long.class, idempotencyKey);
-            assertThat(succeededPayments).isEqualTo(1L);
+            assertThat(submittedPayments).isEqualTo(1L);
         });
+        publishSettlement(idempotencyKey, "cardnet", "settled", null, 1);
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(jdbcTemplate.queryForObject(
+                        "SELECT status FROM payment WHERE idempotency_key = ?",
+                        String.class, idempotencyKey)).isEqualTo("succeeded"));
 
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(registry.get("renewals.processed")
-                        .tag("outcome", "succeeded")
+                        .tag("outcome", "submitted")
+                        .tag("method", "card")
                         .counter()
-                        .count() - succeededBefore).isEqualTo(1.0));
+                        .count() - submittedBefore).isEqualTo(1.0));
     }
 
     @Test
@@ -182,18 +190,12 @@ class RenewalListenerIntegrationTest {
         LocalDate sentinelDueDate = LocalDate.of(2026, 12, 1);
         String sentinelKey = "sub-" + sentinelSubscriptionId + "|" + sentinelDueDate;
 
-        jdbcTemplate.update("""
-                INSERT INTO customer (id, email, name, status)
-                VALUES (?, ?, ?, 'active')
-                """, failingCustomerId, "decline-test-" + failingCustomerId + "@example.com", "Decline Test Customer");
+        insertCardCustomer(failingCustomerId, "tok-000000000099");
         jdbcTemplate.update("""
                 INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
                 VALUES (?, ?, ?, 'active', ?)
                 """, failingSubscriptionId, failingCustomerId, planId, originalRenewedAt.atOffset(ZoneOffset.UTC));
-        jdbcTemplate.update("""
-                INSERT INTO customer (id, email, name, status)
-                VALUES (?, ?, ?, 'active')
-                """, sentinelCustomerId, "decline-sentinel-" + sentinelCustomerId + "@example.com", "Decline Sentinel Customer");
+        insertCardCustomer(sentinelCustomerId, "tok-000000000001");
         jdbcTemplate.update("""
                 INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
                 VALUES (?, ?, ?, 'active', ?)
@@ -245,10 +247,15 @@ class RenewalListenerIntegrationTest {
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             Long sentinelPayments = jdbcTemplate.queryForObject("""
                     SELECT count(*) FROM payment
-                    WHERE idempotency_key = ? AND status = 'succeeded'
+                    WHERE idempotency_key = ? AND status = 'submitted'
                     """, Long.class, sentinelKey);
             assertThat(sentinelPayments).isEqualTo(1L);
         });
+        publishSettlement(sentinelKey, "cardnet", "settled", null, 1);
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(jdbcTemplate.queryForObject(
+                        "SELECT status FROM payment WHERE idempotency_key = ?",
+                        String.class, sentinelKey)).isEqualTo("succeeded"));
 
         Long failedPayments = jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM payment WHERE idempotency_key = ?",
@@ -258,6 +265,9 @@ class RenewalListenerIntegrationTest {
                 "SELECT status FROM payment WHERE idempotency_key = ?",
                 String.class, failingKey);
         assertThat(paymentStatus).isEqualTo("failed");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT failure_reason FROM payment WHERE idempotency_key = ?",
+                String.class, failingKey)).isEqualTo("insufficient_funds");
         Boolean paymentCompleted = jdbcTemplate.queryForObject(
                 "SELECT completed_at IS NOT NULL FROM payment WHERE idempotency_key = ?",
                 Boolean.class, failingKey);
@@ -280,10 +290,11 @@ class RenewalListenerIntegrationTest {
         await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).until(
                 () -> amqpAdmin.getQueueInfo("billing.renewals.dlq").getMessageCount() == 0);
         assertThat(amqpAdmin.getQueueInfo("billing.renewals.main").getMessageCount()).isZero();
+        assertThat(bankRequestCount("cardnet", failingKey)).isEqualTo(1);
     }
 
     @Test
-    void providerTimeoutMarksPaymentFailed() throws JsonProcessingException {
+    void cardAuthTimeoutDeadLettersWithoutVerdict() throws JsonProcessingException {
         UUID customerId = UUID.randomUUID();
         UUID subscriptionId = subscriptionIdEndingIn('e');
         UUID planId = jdbcTemplate.queryForObject(
@@ -293,10 +304,7 @@ class RenewalListenerIntegrationTest {
         LocalDate periodEnd = dueDate.plusMonths(1);
         String idempotencyKey = "sub-" + subscriptionId + "|" + dueDate;
 
-        jdbcTemplate.update("""
-                INSERT INTO customer (id, email, name, status)
-                VALUES (?, ?, ?, 'active')
-                """, customerId, "timeout-test-" + customerId + "@example.com", "Timeout Test Customer");
+        insertCardCustomer(customerId, "tok-000000000001");
         jdbcTemplate.update("""
                 INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
                 VALUES (?, ?, ?, 'active', ?)
@@ -321,15 +329,28 @@ class RenewalListenerIntegrationTest {
                 .setContentType(MessageProperties.CONTENT_TYPE_JSON)
                 .build();
 
+        String stub = """
+                {"priority":5,"request":{"method":"POST","urlPath":"/cardnet/collections","bodyPatterns":[{"matchesJsonPath":{"expression":"$.collection_id","equalTo":"%s"}}]},"response":{"status":500}}
+                """.formatted(idempotencyKey);
+        RestClient.create()
+                .post()
+                .uri("http://" + wireMock.getHost() + ":" + wireMock.getMappedPort(8080)
+                        + "/__admin/mappings")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(stub)
+                .retrieve()
+                .toBodilessEntity();
+
         rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", message);
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
-            String status = jdbcTemplate.queryForObject(
-                    "SELECT status FROM payment WHERE idempotency_key = ?",
-                    String.class, idempotencyKey);
-            assertThat(status).isEqualTo("failed");
-        });
+        // The absence of an authorization verdict is not a decline.
+        await().atMost(Duration.ofSeconds(45)).untilAsserted(() ->
+                assertThat(amqpAdmin.getQueueInfo("billing.renewals.dlq").getMessageCount())
+                        .isEqualTo(1));
 
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM payment WHERE idempotency_key = ?",
+                String.class, idempotencyKey)).isEqualTo("pending");
         String chargeStatus = jdbcTemplate.queryForObject(
                 "SELECT status FROM charge WHERE subscription_id = ?",
                 String.class, subscriptionId);
@@ -338,6 +359,13 @@ class RenewalListenerIntegrationTest {
                 "SELECT status FROM invoice WHERE customer_id = ?",
                 String.class, customerId);
         assertThat(invoiceStatus).isEqualTo("posted");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT renewed_at < ? FROM subscription WHERE id = ?",
+                Boolean.class, dueDate.atStartOfDay().atOffset(ZoneOffset.UTC),
+                subscriptionId)).isTrue();
+        Message deadLetter = rabbitTemplate.receive("billing.renewals.dlq", 5000);
+        assertThat(deadLetter).isNotNull();
+        assertThat(deadLetter.getBody()).isEqualTo(message.getBody());
         assertThat(amqpAdmin.getQueueInfo("billing.renewals.dlq").getMessageCount()).isZero();
     }
 
@@ -355,19 +383,13 @@ class RenewalListenerIntegrationTest {
         LocalDate sentinelDueDate = LocalDate.of(2027, 3, 1);
         String sentinelKey = "sub-" + sentinelSubscriptionId + "|" + sentinelDueDate;
 
-        jdbcTemplate.update("""
-                INSERT INTO customer (id, email, name, status)
-                VALUES (?, ?, ?, 'active')
-                """, failingCustomerId, "no-retry-test-" + failingCustomerId + "@example.com", "No Retry Test Customer");
+        insertCardCustomer(failingCustomerId, "tok-000000000099");
         jdbcTemplate.update("""
                 INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
                 VALUES (?, ?, ?, 'active', ?)
                 """, failingSubscriptionId, failingCustomerId, planId,
                 failingDueDate.minusMonths(1).atStartOfDay().atOffset(ZoneOffset.UTC));
-        jdbcTemplate.update("""
-                INSERT INTO customer (id, email, name, status)
-                VALUES (?, ?, ?, 'active')
-                """, sentinelCustomerId, "no-retry-sentinel-" + sentinelCustomerId + "@example.com", "No Retry Sentinel Customer");
+        insertCardCustomer(sentinelCustomerId, "tok-000000000001");
         jdbcTemplate.update("""
                 INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
                 VALUES (?, ?, ?, 'active', ?)
@@ -418,10 +440,15 @@ class RenewalListenerIntegrationTest {
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             Long sentinelPayments = jdbcTemplate.queryForObject("""
                     SELECT count(*) FROM payment
-                    WHERE idempotency_key = ? AND status = 'succeeded'
+                    WHERE idempotency_key = ? AND status = 'submitted'
                     """, Long.class, sentinelKey);
             assertThat(sentinelPayments).isEqualTo(1L);
         });
+        publishSettlement(sentinelKey, "cardnet", "settled", null, 1);
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(jdbcTemplate.queryForObject(
+                        "SELECT status FROM payment WHERE idempotency_key = ?",
+                        String.class, sentinelKey)).isEqualTo("succeeded"));
 
         Long failedPayments = jdbcTemplate.queryForObject("""
                 SELECT count(*) FROM payment
@@ -437,7 +464,7 @@ class RenewalListenerIntegrationTest {
                 Long.class, failingSubscriptionId);
         assertThat(charges).isEqualTo(1L);
         assertThat(amqpAdmin.getQueueInfo("billing.renewals.dlq").getMessageCount()).isZero();
-        assertThat(pspRequestCount(failingSubscriptionId)).isEqualTo(1);
+        assertThat(bankRequestCount("cardnet", failingKey)).isEqualTo(1);
     }
 
     @Test
@@ -480,6 +507,7 @@ class RenewalListenerIntegrationTest {
 
         double submittedBefore = registry.get("renewals.processed")
                 .tag("outcome", "submitted")
+                .tag("method", "sdd")
                 .counter()
                 .count();
         rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", message);
@@ -514,7 +542,7 @@ class RenewalListenerIntegrationTest {
                 "SELECT renewed_at FROM subscription WHERE id = ?",
                 (rs, rowNum) -> rs.getTimestamp(1).toInstant(), subscriptionId);
         assertThat(renewedAt).isEqualTo(originalRenewedAt.atOffset(ZoneOffset.UTC).toInstant());
-        assertThat(pspRequestCount(subscriptionId)).isZero();
+        assertThat(bankRequestCount("cardnet", idempotencyKey)).isZero();
         assertThat(bankRequestCount("bank-a", idempotencyKey)).isEqualTo(1);
 
         await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).until(
@@ -523,6 +551,7 @@ class RenewalListenerIntegrationTest {
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(registry.get("renewals.processed")
                         .tag("outcome", "submitted")
+                        .tag("method", "sdd")
                         .counter()
                         .count() - submittedBefore).isEqualTo(1.0));
     }
@@ -605,11 +634,7 @@ class RenewalListenerIntegrationTest {
                 VALUES (?, ?, ?, 'active', ?)
                 """, subscriptionId, customerId, planId,
                 dueDate.minusMonths(1).atStartOfDay().atOffset(ZoneOffset.UTC));
-        jdbcTemplate.update("""
-                INSERT INTO customer (id, email, name, status)
-                VALUES (?, ?, ?, 'active')
-                """, sentinelCustomerId, "sdd-sentinel-" + sentinelCustomerId + "@example.com",
-                "SDD Sentinel Customer");
+        insertCardCustomer(sentinelCustomerId, "tok-000000000001");
         jdbcTemplate.update("""
                 INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
                 VALUES (?, ?, ?, 'active', ?)
@@ -641,7 +666,7 @@ class RenewalListenerIntegrationTest {
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             Long sentinelPayments = jdbcTemplate.queryForObject("""
                     SELECT count(*) FROM payment
-                    WHERE idempotency_key = ? AND status = 'succeeded'
+                    WHERE idempotency_key = ? AND status = 'submitted'
                     """, Long.class, sentinelKey);
             assertThat(sentinelPayments).isEqualTo(1L);
         });
@@ -682,7 +707,7 @@ class RenewalListenerIntegrationTest {
                 """.formatted(failingKey);
         RestClient.create()
                 .post()
-                .uri("http://" + mockPsp.getHost() + ":" + mockPsp.getMappedPort(8080)
+                .uri("http://" + wireMock.getHost() + ":" + wireMock.getMappedPort(8080)
                         + "/__admin/mappings")
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(stub)
@@ -719,7 +744,7 @@ class RenewalListenerIntegrationTest {
                 "SELECT renewed_at FROM subscription WHERE id = ?",
                 (rs, rowNum) -> rs.getTimestamp(1).toInstant(), subscriptionId);
         assertThat(renewedAt).isEqualTo(originalRenewedAt.atOffset(ZoneOffset.UTC).toInstant());
-        assertThat(pspRequestCount(subscriptionId)).isZero();
+        assertThat(bankRequestCount("cardnet", failingKey)).isZero();
         assertThat(bankRequestCount("bank-a", failingKey)).isEqualTo(5);
 
         Message deadLetter = rabbitTemplate.receive("billing.renewals.dlq", 5000);
@@ -741,18 +766,12 @@ class RenewalListenerIntegrationTest {
         LocalDate periodEnd = LocalDate.of(2026, 7, 15);
         String idempotencyKey = "sub-" + subscriptionId + "|2026-06-15";
 
-        jdbcTemplate.update("""
-                INSERT INTO customer (id, email, name, status)
-                VALUES (?, ?, ?, 'active')
-                """, customerId, "midnight-test-" + customerId + "@example.com", "Midnight Test Customer");
+        insertCardCustomer(customerId, "tok-000000000001");
         jdbcTemplate.update("""
                 INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
                 VALUES (?, ?, ?, 'active', ?)
                 """, subscriptionId, customerId, planId, dueDate.atStartOfDay().atOffset(ZoneOffset.UTC));
-        jdbcTemplate.update("""
-                INSERT INTO customer (id, email, name, status)
-                VALUES (?, ?, ?, 'active')
-                """, sentinelCustomerId, "sentinel-test-" + sentinelCustomerId + "@example.com", "Sentinel Test Customer");
+        insertCardCustomer(sentinelCustomerId, "tok-000000000001");
         jdbcTemplate.update("""
                 INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
                 VALUES (?, ?, ?, 'active', ?)
@@ -810,17 +829,22 @@ class RenewalListenerIntegrationTest {
             Long sentinelPayments = jdbcTemplate.queryForObject("""
                     SELECT count(*)
                     FROM payment
-                    WHERE idempotency_key = ? AND status = 'succeeded'
+                    WHERE idempotency_key = ? AND status = 'submitted'
                     """, Long.class, sentinelKey);
             assertThat(sentinelPayments).isEqualTo(1L);
         });
 
-        Long payments = jdbcTemplate.queryForObject("""
+        Long submittedPayments = jdbcTemplate.queryForObject("""
                 SELECT count(*)
                 FROM payment
-                WHERE idempotency_key = ? AND status = 'succeeded'
+                WHERE idempotency_key = ? AND status = 'submitted'
                 """, Long.class, idempotencyKey);
-        assertThat(payments).isEqualTo(1L);
+        assertThat(submittedPayments).isEqualTo(1L);
+        publishSettlement(idempotencyKey, "cardnet", "settled", null, 1);
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(jdbcTemplate.queryForObject(
+                        "SELECT status FROM payment WHERE idempotency_key = ?",
+                        String.class, idempotencyKey)).isEqualTo("succeeded"));
 
         Long invoices = jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM invoice WHERE customer_id = ?",
@@ -860,10 +884,7 @@ class RenewalListenerIntegrationTest {
                 UUID.class);
         LocalDate dueDate = LocalDate.of(2026, 6, 15);
 
-        jdbcTemplate.update("""
-                INSERT INTO customer (id, email, name, status)
-                VALUES (?, ?, ?, 'active')
-                """, customerId, "invalid-test-" + customerId + "@example.com", "Invalid Test Customer");
+        insertCardCustomer(customerId, "tok-000000000001");
         jdbcTemplate.update("""
                 INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
                 VALUES (?, ?, ?, 'active', ?)
@@ -938,10 +959,7 @@ class RenewalListenerIntegrationTest {
         LocalDate periodEnd = periodStart.plusMonths(1);
         String idempotencyKey = "sub-" + subscriptionId + "|" + periodStart;
 
-        jdbcTemplate.update("""
-                INSERT INTO customer (id, email, name, status)
-                VALUES (?, ?, ?, 'active')
-                """, customerId, "poison-test-" + customerId + "@example.com", "Poison Test Customer");
+        insertCardCustomer(customerId, "tok-000000000001");
         jdbcTemplate.update("""
                 INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
                 VALUES (?, ?, ?, 'active', ?)
@@ -981,12 +999,12 @@ class RenewalListenerIntegrationTest {
                         .build());
 
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
-            Long succeededPayments = jdbcTemplate.queryForObject("""
+            Long submittedPayments = jdbcTemplate.queryForObject("""
                     SELECT count(*)
                     FROM payment
-                    WHERE idempotency_key = ? AND status = 'succeeded'
+                    WHERE idempotency_key = ? AND status = 'submitted'
                     """, Long.class, idempotencyKey);
-            assertThat(succeededPayments).isEqualTo(1L);
+            assertThat(submittedPayments).isEqualTo(1L);
         });
 
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
@@ -1006,20 +1024,6 @@ class RenewalListenerIntegrationTest {
         assertThat(amqpAdmin.getQueueInfo("billing.renewals.main").getMessageCount()).isZero();
     }
 
-    private int pspRequestCount(UUID subscriptionId) throws JsonProcessingException {
-        String request = """
-                {"method":"POST","urlPath":"/psp/charges","bodyPatterns":[{"matchesJsonPath":{"expression":"$.subscription_id","equalTo":"%s"}}]}
-                """.formatted(subscriptionId);
-        String response = RestClient.create()
-                .post()
-                .uri("http://" + mockPsp.getHost() + ":" + mockPsp.getMappedPort(8080) + "/__admin/requests/count")
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(request)
-                .retrieve()
-                .body(String.class);
-        return objectMapper.readTree(response).path("count").asInt();
-    }
-
     private int bankRequestCount(String bank, String collectionId)
             throws JsonProcessingException {
         String request = """
@@ -1027,7 +1031,7 @@ class RenewalListenerIntegrationTest {
                 """.formatted(bank, collectionId);
         String response = RestClient.create()
                 .post()
-                .uri("http://" + mockPsp.getHost() + ":" + mockPsp.getMappedPort(8080) + "/__admin/requests/count")
+                .uri("http://" + wireMock.getHost() + ":" + wireMock.getMappedPort(8080) + "/__admin/requests/count")
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(request)
                 .retrieve()
@@ -1052,29 +1056,39 @@ class RenewalListenerIntegrationTest {
                 "MNDT-TEST-" + customerId.toString().substring(0, 8), country);
     }
 
-    // Pin subscription ids so the deterministic PSP suffix rules cannot make existing tests flaky.
+    private void insertCardCustomer(UUID customerId, String cardToken) {
+        jdbcTemplate.update("""
+                INSERT INTO customer (
+                    id, email, name, status, payment_method, card_token
+                )
+                VALUES (?, ?, ?, 'active', 'card', ?)
+                """, customerId, "card-test-" + customerId + "@example.com",
+                "Card Test Customer", cardToken);
+    }
+
+    private void publishSettlement(
+            String collectionId, String bankId, String outcome,
+            String reason, int sequence) throws JsonProcessingException {
+        SettlementReceived settlement = new SettlementReceived(
+                1,
+                collectionId + ":" + sequence,
+                bankId,
+                collectionId,
+                outcome,
+                reason,
+                "2030-01-01T00:00:00+00:00");
+        rabbitTemplate.convertAndSend(
+                SettlementTopology.EXCHANGE,
+                SettlementTopology.ROUTING_KEY,
+                MessageBuilder.withBody(objectMapper.writeValueAsBytes(settlement))
+                        .setContentType(MessageProperties.CONTENT_TYPE_JSON)
+                        .build());
+    }
+
+    // Pin ids for tests that exercise delivery timing independently of UUID shape.
     private static UUID subscriptionIdEndingIn(char lastHexChar) {
         String base = UUID.randomUUID().toString();
         return UUID.fromString(base.substring(0, base.length() - 1) + lastHexChar);
-    }
-
-    private static String renderPspTemplate(String name) {
-        Path moduleDirectory = Path.of(System.getProperty("basedir", System.getProperty("user.dir")));
-        Path template = moduleDirectory
-                .resolve("../../mock-psp/mappings")
-                .resolve(name)
-                .toAbsolutePath()
-                .normalize();
-
-        if (!Files.isRegularFile(template)) {
-            throw new IllegalStateException("PSP mapping template not found: " + template);
-        }
-
-        try {
-            return Files.readString(template).replace("__PSP_FAIL_HEX__", "0");
-        } catch (IOException exception) {
-            throw new IllegalStateException("Could not read PSP mapping template " + template, exception);
-        }
     }
 
     private static String readTestResource(String name) {

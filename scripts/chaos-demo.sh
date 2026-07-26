@@ -51,9 +51,9 @@ RMQ_MGMT_PORT="$(env_val RABBITMQ_MGMT_PORT 15672)"
 RMQ_QUEUE="$(env_val RABBITMQ_QUEUE billing.renewals.main)"
 RMQ_EXCHANGE="$(env_val RABBITMQ_EXCHANGE billing.renewals)"
 RMQ_RK="$(env_val RABBITMQ_ROUTINGKEY renewal.requested)"
-PSP_FAIL_HEX="$(env_val PSP_FAIL_HEX 0)"
 BANK_PORT="$(env_val BANK_HTTP_PORT 8085)"
 BANK_B_PORT="$(env_val BANK_B_HTTP_PORT 8086)"
+CARDNET_PORT="$(env_val CARDNET_HTTP_PORT 8087)"
 RMQ_DLQ="billing.renewals.dlq"
 SETTLEMENT_DLQ="billing.settlements.dlq"
 
@@ -164,6 +164,11 @@ bank_b_up() {
     | grep -q '"status":"ok"'
 }
 
+cardnet_up() {
+  curl -fsS "http://localhost:${CARDNET_PORT}/health" 2>/dev/null \
+    | grep -q '"status":"ok"'
+}
+
 outbox_drained() {
   [[ "$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NULL')" == "0" ]]
 }
@@ -172,10 +177,8 @@ main_queue_empty() {
   [[ "$(queue_depth "$RMQ_QUEUE")" == "0" ]]
 }
 
-# A today-due card outbox row is correctly billed when a payment exists under
-# its derived idempotency key with EXACTLY the terminal status the PSP hex rule
-# predicts.
-MISMATCHED_SQL="SELECT count(*) FROM renewal_outbox o
+# Card terminality derives from each customer's stored token.
+CARD_TERMINAL_MISMATCH_SQL="SELECT count(*) FROM renewal_outbox o
 JOIN subscription s ON s.id = o.subscription_id
 JOIN customer c ON c.id = s.customer_id
 WHERE o.due_date = current_date
@@ -183,8 +186,14 @@ WHERE o.due_date = current_date
   AND NOT EXISTS (
     SELECT 1 FROM payment p
     WHERE p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
-      AND p.status = CASE WHEN right(o.subscription_id::text, 1) ~ '[${PSP_FAIL_HEX}]'
-                          THEN 'failed' ELSE 'succeeded' END
+      AND p.channel = 'CARD'
+      AND p.status = CASE WHEN right(c.card_token, 2) IN ('99','98') THEN 'failed'
+                          WHEN right(c.card_token, 2) = '96' THEN 'charged_back'
+                          ELSE 'succeeded' END
+      AND (p.status = 'succeeded' OR p.failure_reason = CASE right(c.card_token, 2)
+                          WHEN '99' THEN 'insufficient_funds' WHEN '98' THEN 'do_not_honor'
+                          WHEN '96' THEN 'fraud_dispute' END)
+      AND (p.status = 'failed' OR (p.bank_id IS NOT NULL AND p.collection_id IS NOT NULL))
   )"
 
 # SDD terminality includes the bank delay and chargeback lag. The bank
@@ -206,7 +215,7 @@ WHERE o.due_date = current_date
                           WHEN '96' THEN 'MD06' END)
   )"
 billed_ok() {
-  [[ "$(q "$MISMATCHED_SQL")" == "0" \
+  [[ "$(q "$CARD_TERMINAL_MISMATCH_SQL")" == "0" \
     && "$(q "$SDD_TERMINAL_MISMATCH_SQL")" == "0" ]]
 }
 
@@ -216,8 +225,7 @@ JOIN subscription s ON s.id = o.subscription_id
 JOIN customer c ON c.id = s.customer_id
 JOIN payment p
   ON p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
- AND p.status = CASE WHEN right(o.subscription_id::text, 1) ~ '[${PSP_FAIL_HEX}]'
-                     THEN 'failed' ELSE 'succeeded' END
+ AND p.status = 'succeeded'
 WHERE o.due_date = current_date
   AND c.payment_method = 'card'
   AND c.email LIKE 'chaos-$1-${RUN_TAG}-%@example.test'"
@@ -282,9 +290,12 @@ WITH seed_plan AS (
                           THEN 'month' ELSE 'year' END
     ORDER BY name LIMIT 1
 ), new_customers AS (
-    INSERT INTO customer (id, email)
-    SELECT gen_random_uuid(), 'chaos-${tag}-${RUN_TAG}-' || g || '@example.test'
-    FROM generate_series(1, ${n}) g
+    -- Scenes 1-5 demonstrate delivery semantics with a clean card cohort.
+    INSERT INTO customer (id, email, card_token)
+    SELECT gen_random_uuid(),
+           'chaos-${tag}-${RUN_TAG}-' || n || '@example.test',
+           'tok-' || lpad(n::text, 10, '0') || '01'
+    FROM generate_series(1, ${n}) n
     RETURNING id
 )
 INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
@@ -408,7 +419,7 @@ three_consumers_respond() {
   [[ "$(responsive_consumer_count)" -ge 3 ]] 2>/dev/null
 }
 
-PROC_REGEX='^renewals_processed_total\{outcome="(succeeded|failed)"\}'
+PROC_REGEX='^renewals_processed_total\{.*outcome="(succeeded|failed|submitted)"'
 RUN_TAG="$(date +%s)-$$"
 
 echo "Payfold scripted chaos demo"
@@ -419,6 +430,7 @@ wait_until "consumer /actuator/health UP" consumer_up || summary
 wait_until "RabbitMQ management API reachable" broker_up || summary
 wait_until "mock-bank /health ok" bank_up || summary
 wait_until "mock-bank-b /health ok" bank_b_up || summary
+wait_until "mock-card /health ok" cardnet_up || summary
 wait_until "starting outbox fully published" outbox_drained || summary
 wait_until "starting main queue empty" main_queue_empty || summary
 wait_until "starting due-today rows exactly billed" billed_ok || summary
@@ -528,6 +540,10 @@ wait_until "scene 2 good traffic completed despite poison" billed_ok
 pause_between_scenes
 
 scene 3 "Kill the worker (G1/G2: worker dies → nothing lost → backlog drains on recovery; auto-respawn is orchestration and out of scope)"
+# Settlement webhooks fired during the deliberate outage survive on the
+# counterparties' bounded retry envelope (BANK_WEBHOOK_RETRY_*, ~4 min — R23f).
+# Never restart a counterparty to reprofile it mid-scene: pending deliveries
+# are in-memory and die with the container (the R28 amnesia note).
 seed_due 5000 s3 || summary
 SCENE_3_PROC_BEFORE="$(consumer_sum "$PROC_REGEX")"
 if [[ "$SCENE_3_PROC_BEFORE" =~ ^[0-9]+$ ]]; then
@@ -580,7 +596,7 @@ if (( ! DEATH_PROVED )); then
     "counter=${DEATH_PROC} depth=${DEATH_DEPTH} billed=${DEATH_BILLED_BEFORE:-unread}/${DEATH_BILLED_AFTER:-unread}"
 fi
 
-if docker compose up -d renewal-consumer; then
+if docker compose up -d --no-deps renewal-consumer; then
   pass "scene 3 renewal-consumer restarted"
 else
   fail "scene 3 renewal-consumer restarted" "docker compose up failed"
@@ -601,7 +617,7 @@ fi
 pause_between_scenes
 
 scene 4 "Scale out (G2: competing consumers are safe by constraint-based idempotency)"
-if docker compose up -d --scale renewal-consumer=3; then
+if docker compose up -d --no-deps --scale renewal-consumer=3 renewal-consumer; then
   pass "scene 4 requested three renewal-consumer replicas without recreating other services"
 else
   fail "scene 4 requested three renewal-consumer replicas" "docker compose up --scale failed"
@@ -656,7 +672,7 @@ scene 5 "Broker restart (G1/G2: durable queues + reconnect + redelivery absorbed
 # One worker for this scene: at scene 4's three-replica drain rate the backlog
 # empties before the restart can interrupt it, and the story here is a parked
 # backlog surviving the broker — scale down first so the queue stays deep.
-if docker compose up -d --scale renewal-consumer=1 >/dev/null 2>&1; then
+if docker compose up -d --no-deps --scale renewal-consumer=1 renewal-consumer >/dev/null 2>&1; then
   pass "scene 5 scaled back to a single consumer so the backlog outlives the drain"
 else
   fail "scene 5 scaled back to a single consumer" "docker compose up --scale failed"
@@ -857,7 +873,7 @@ wait_until "scene 7 bank-b submitted backlog drained fully terminal" scene_7_slo
 
 echo
 note "epilogue: returning the stack to one renewal-consumer replica…"
-if docker compose up -d --scale renewal-consumer=1; then
+if docker compose up -d --no-deps --scale renewal-consumer=1 renewal-consumer; then
   pass "epilogue restored the default one-consumer shape"
 else
   fail "epilogue restored the default one-consumer shape" "docker compose up --scale failed"

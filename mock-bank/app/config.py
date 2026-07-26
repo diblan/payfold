@@ -38,7 +38,7 @@ def load_settings() -> Settings:
             os.environ.get("BANK_WEBHOOK_RETRY_BACKOFF_SECONDS", "0.5")
         ),
     )
-    # BANK_SCHEME is the extension seam for the card scheme introduced in R23f.
-    if settings.scheme != "sepa_core":
+    # BANK_SCHEME selects the exercised counterparty seam shared by SDD and cards.
+    if settings.scheme not in {"sepa_core", "card"}:
         raise ValueError(f"unsupported bank scheme: {settings.scheme}")
     return settings
