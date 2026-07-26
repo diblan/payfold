@@ -261,7 +261,7 @@ consumer scaling flips to measured; verify.sh green at scale ([R17](#r17)'s poll
 fix should land first or ride along — its acceptance needs exactly this run).
 
 <a id="r21"></a>
-### [ ] R21 — Grafana dashboards as code ([D12](decisions.md#d12))
+### [x] R21 — Grafana dashboards as code ([D12](decisions.md#d12))
 **Scope:** `docker-compose.yaml` (Prometheus + Grafana containers; RabbitMQ's
 built-in prometheus plugin exposed for queue/DLQ depth), provisioning files +
 dashboard JSON checked in, `.env.example`, docs.
@@ -290,6 +290,25 @@ Honesty guardrail from the direction discussion: auto-respawn is orchestration
 drains on recovery".
 **Done when:** the demo runs green end-to-end on a fresh stack with the
 [R21](#r21) dashboard telling the same story live; README documents how to run it.
+
+<a id="r25"></a>
+### [ ] R25 — Publisher channel discipline under a slow broker
+**Scope:** producer `OutboxPublisher` / `RabbitConfig` (cache/confirm settings).
+Observed 2026-07-26 (R21 session, cold boot under image-pull load): with the
+broker slow to confirm, the pipelined page publish piled up channels — spring-
+rabbit creates a new channel per concurrent send when cached channels are
+awaiting confirms — until RabbitMQ's `channelMax` (2047) threw
+`AmqpResourceNotAvailableException`, the page had zero confirms, and the job
+FAILED on the zero-progress rule. The safety net held ([G1](invariants.md#g1):
+outbox rows stayed unpublished; the next trigger re-picked and published all
+15k cleanly), but a degraded broker shouldn't cost a job failure. Likely shape:
+bound in-flight sends per page (or cap/reuse channels: `channelCacheSize` +
+`channelCheckoutTimeout` turn the cache into a bounded pool) so the page
+publishes within a fixed channel budget; keep the loud zero-progress failure.
+**Done when:** a test proves the publish page never exceeds a bounded channel
+count under delayed confirms; a slow-confirm scenario completes without
+`channelMax` exhaustion; the at-least-once semantics and zero-progress rule are
+unchanged.
 
 <a id="r23"></a>
 ### [ ] R23 — SEPA mock-bank: async settlement ([D13](decisions.md#d13)) *(epic — split at execution)*

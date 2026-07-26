@@ -265,6 +265,20 @@ tag sets above match the live `/actuator/prometheus` output. The end-to-end veri
 cross-checks same-run metric deltas against database deltas because counters reset with
 the service process while the database persists.
 
+Since [R21](roadmap.md#r21) ([D12](decisions.md#d12)) the compose stack ships
+its own visualization: Prometheus (`prom/prometheus:v3.5.0`, 5s scrape) reads
+both services' `/actuator/prometheus`, discovers every scaled consumer replica
+via DNS A-record service discovery, and reads the broker plugin's per-queue
+family (`rabbitmq_detailed_queue_messages{queue="billing.renewals.main"|".dlq"}`
+from `/metrics/detailed?family=queue_coarse_metrics`); Grafana
+(`grafana/grafana:13.1.1` — the same app version the external platform repo
+runs) provisions its datasource and the `payfold-pipeline` dashboard from
+`observability/` at boot and serves it to anonymous viewers, so a fresh
+`docker compose up` renders the pipeline with zero clicks. `verify.sh` asserts
+Prometheus is healthy and scraping and that the dashboard is provisioned. The
+dashboards are demo-local; the platform repo runs its own kube-prometheus-stack
+in-cluster.
+
 ## Message contract — renewal.requested v1
 
 The producer writes all contract fields into the outbox payload in the same scan
@@ -357,6 +371,8 @@ The deploy images' env contracts (`FLYWAY_*`, `POSTGRES_*`) are catalogued under
 | `localhost:8080` | producer — `/actuator/health`, `/actuator/prometheus`, `POST /actuator/renewal-job?force=true`, `GET /actuator/renewal-job/{executionId}` |
 | `localhost:8081` | consumer's first replica — `/actuator/health` (since [R1](roadmap.md#r1)), `/actuator/prometheus`; scaled replicas bind 8082–8083 with the same endpoints; container-internal 8080 |
 | `localhost:8084` | mock PSP (WireMock) — POST `/psp/charges`; admin/journal at `/__admin`; moved off 8082 by [R20](roadmap.md#r20) (consumer replica range) |
+| `localhost:9090` | Prometheus — targets, `/api/v1/query`, `/-/healthy` |
+| `localhost:3000` | Grafana — `payfold-pipeline` dashboard, anonymous viewer access |
 | `localhost:5672` / `15672` | RabbitMQ AMQP / management UI (creds from `.env`) |
 | `localhost:5432` | Postgres (creds from `.env`) |
 

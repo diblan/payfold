@@ -1,0 +1,25 @@
+# Scrape config for the compose-local demo stack (R21). The consumer job uses
+# DNS A-record discovery so every `--scale renewal-consumer=N` replica is
+# scraped; the rabbitmq job reads the broker plugin's per-queue family.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: payfold-producer
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["renewal-producer:8080"]
+
+  - job_name: payfold-consumer
+    metrics_path: /actuator/prometheus
+    dns_sd_configs:
+      - names: ["renewal-consumer"]
+        type: A
+        port: 8080
+
+  - job_name: rabbitmq-queues
+    metrics_path: /metrics/detailed
+    params:
+      family: [queue_coarse_metrics]
+    static_configs:
+      - targets: ["rabbitmq:15692"]

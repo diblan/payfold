@@ -8,6 +8,8 @@
 # derived from PSP_FAIL_HEX, and cross-checks same-run Prometheus/DB deltas; consumer
 # counters are summed across the replica port range.
 # It also re-runs the payfold-migrations image as a no-op run-to-completion Job.
+# It also requires Prometheus to be scraping both services and Grafana to serve
+# the provisioned pipeline dashboard anonymously.
 #
 # Usage:
 #   scripts/verify.sh [--no-up] [--timeout SECONDS] [--poison|--no-poison]
@@ -64,6 +66,8 @@ PGPASS="$(env_val POSTGRES_PASSWORD admin)"
 PRODUCER_PORT="$(env_val PRODUCER_HTTP_PORT 8080)"
 CONSUMER_PORT="$(env_val CONSUMER_HTTP_PORT 8081)"
 CONSUMER_PORT_END="$(env_val CONSUMER_HTTP_PORT_END 8083)"
+PROM_PORT="$(env_val PROMETHEUS_PORT 9090)"
+GRAFANA_PORT="$(env_val GRAFANA_PORT 3000)"
 RMQ_USER="$(env_val RABBITMQ_USER guest)"
 RMQ_PASS="$(env_val RABBITMQ_PASSWORD guest)"
 RMQ_MGMT_PORT="$(env_val RABBITMQ_MGMT_PORT 15672)"
@@ -111,7 +115,17 @@ summary() {
 pg_ready()   { [[ "$(q 'SELECT 1')" == "1" ]]; }
 seeded()     { [[ "$(q 'SELECT count(*) FROM customer')" -gt 0 && "$(q 'SELECT count(*) FROM subscription')" -gt 0 ]] 2>/dev/null; }
 producer_up() { curl -fsS "http://localhost:${PRODUCER_PORT}/actuator/health" 2>/dev/null | grep -q '"status":"UP"'; }
-consumer_up() { curl -fsS "http://localhost:${CONSUMER_PORT}/actuator/health" 2>/dev/null | grep -q '"status":"UP"'; }
+# A single replica may bind ANY port in the compose range (assignment within
+# "8081-8083:8080" is not deterministic), so health is "some replica is UP".
+consumer_up() {
+  local port
+  for port in $(seq "$CONSUMER_PORT" "$CONSUMER_PORT_END"); do
+    if curl -fsS "http://localhost:${port}/actuator/health" 2>/dev/null | grep -q '"status":"UP"'; then
+      return 0
+    fi
+  done
+  return 1
+}
 consumer_running() { docker compose ps --status running --services 2>/dev/null | grep -qx renewal-consumer; }
 
 outbox_drained() { [[ "$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NULL')" == "0" ]]; }
@@ -282,6 +296,25 @@ fi
 
 wait_for "producer /actuator/prometheus serves outbox counters" producer_prometheus_ready || summary
 wait_for "consumer /actuator/prometheus serves renewals counter" consumer_prometheus_ready || summary
+
+# R21: the observability layer is part of the stack's definition of working —
+# Prometheus must be up and actually scraping both services, and Grafana must
+# have provisioned the pipeline dashboard for anonymous viewing.
+prometheus_healthy() { curl -fsS "http://localhost:${PROM_PORT}/-/healthy" >/dev/null 2>&1; }
+prometheus_scraping() {
+  local body
+  body="$(curl -fsS "http://localhost:${PROM_PORT}/api/v1/query?query=up" 2>/dev/null)" || return 1
+  echo "$body" | grep -q '"job":"payfold-producer"' \
+    && echo "$body" | grep -q '"job":"payfold-consumer"' \
+    && ! echo "$body" | grep -q '"value":\[[0-9.]*,"0"\]'
+}
+grafana_dashboard_provisioned() {
+  curl -fsS "http://localhost:${GRAFANA_PORT}/api/search?query=Payfold" 2>/dev/null \
+    | grep -q '"uid":"payfold-pipeline"'
+}
+wait_for "prometheus healthy"                              prometheus_healthy
+wait_for "prometheus scraping producer and consumer"       prometheus_scraping
+wait_for "grafana serves the provisioned pipeline dashboard" grafana_dashboard_provisioned
 
 M_INS_BEFORE="$(prom_val "$PRODUCER_PORT" '^outbox_inserted_total ')"
 M_PUB_BEFORE="$(prom_val "$PRODUCER_PORT" '^outbox_published_total ')"

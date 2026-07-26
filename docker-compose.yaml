@@ -177,6 +177,42 @@ services:
       timeout: 5s
       retries: 30
 
+  # Local observability (R21/D12): industry tooling as code, never a custom UI.
+  # Prometheus scrapes both services and the broker's per-queue metrics;
+  # Grafana provisions its datasource and the pipeline dashboard from files at
+  # boot — a fresh `docker compose up` serves the dashboard with zero clicks.
+  # The platform repo runs its own in-cluster stack; these two are the
+  # compose-local demo equivalent.
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: prometheus-payfold
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.1.1
+    container_name: grafana-payfold
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-payfold}
+      # Anonymous read access: the demo dashboard must render without a login.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
 volumes:
   pg_data:
   rmq_data:
