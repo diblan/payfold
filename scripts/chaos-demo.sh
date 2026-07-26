@@ -448,7 +448,19 @@ seed_due 2000 s2 || summary
 trigger_and_wait "scene 2 renewal job trigger" || summary
 wait_until "scene 2 outbox fully published" outbox_drained || summary
 
-SCENE_2_DEPTH="$(queue_depth "$RMQ_QUEUE")"
+# The management API's message counter refreshes on a ~5s stats interval, so a
+# single read right after the publish can return a pre-publish 0 while the
+# backlog is real (R27; the same race verify.sh's R17 fix polls around). Poll
+# briefly for a nonzero sample instead of trusting the first read.
+SCENE_2_DEPTH=0
+SCENE_2_DEPTH_START=$SECONDS
+while (( SECONDS - SCENE_2_DEPTH_START < 15 )); do
+  SCENE_2_DEPTH="$(queue_depth "$RMQ_QUEUE")"
+  if [[ "$SCENE_2_DEPTH" =~ ^[0-9]+$ ]] && (( SCENE_2_DEPTH > 0 )); then
+    break
+  fi
+  sleep 1
+done
 if [[ "$SCENE_2_DEPTH" =~ ^[0-9]+$ ]] && (( SCENE_2_DEPTH > 0 )); then
   pass "scene 2 poison injected mid-drain with good-message backlog (${SCENE_2_DEPTH})"
 else

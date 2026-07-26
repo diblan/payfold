@@ -461,7 +461,7 @@ after [R23](#r23) reshapes the flow is cheap and expected.
 claim shown matches the measured numbers in quality.md/README.
 
 <a id="r27"></a>
-### [ ] R27 — chaos-demo scene 2: backlog precondition races the management API
+### [x] R27 — chaos-demo scene 2: backlog precondition races the management API
 **Scope:** `scripts/chaos-demo.sh` only.
 Scene 2's "poison injected mid-drain with good-message backlog" precondition
 reads the management API's `messages` counter exactly once right after the
