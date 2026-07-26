@@ -77,6 +77,32 @@ services:
       timeout: 3s
       retries: 20
 
+  # Mock SEPA bank (R23a/D15): accepts SDD collection submissions and reports
+  # outcomes later via a signed webhook. Outcomes derive deterministically from
+  # the debtor IBAN's last two chars; only delays are instance config. Standalone
+  # until R23b routes the consumer's SDD cohort here (the webhook target below
+  # exists from R23c; until then nothing submits, so nothing is delivered).
+  mock-bank:
+    build:
+      context: ./mock-bank
+    image: payfold-mock-bank:latest
+    container_name: mock-bank
+    environment:
+      BANK_ID: ${BANK_ID:-bank-a}
+      BANK_SCHEME: sepa_core
+      BANK_WEBHOOK_URL: http://renewal-consumer:8080/webhooks/bank/${BANK_ID:-bank-a}
+      BANK_WEBHOOK_SECRET: ${BANK_WEBHOOK_SECRET:-payfold-dev-secret}
+      BANK_SETTLEMENT_DELAY_SECONDS: ${BANK_SETTLEMENT_DELAY_SECONDS:-2}
+      BANK_CHARGEBACK_LAG_SECONDS: ${BANK_CHARGEBACK_LAG_SECONDS:-5}
+      TZ: ${TZ}
+    ports:
+      - "${BANK_HTTP_PORT:-8085}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8080/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   # Seed data runs from the same payfold-seed-data-gen image CI publishes
   # (D11/R18): seeder source, JDBC driver, and name data are baked in at build
   # time; entrypoint and working dir come from the image.

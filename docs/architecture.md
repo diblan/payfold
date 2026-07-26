@@ -65,6 +65,10 @@ Honesty table:
                  │ mock-psp (WireMock)  │  declines iff last hex char of
                  │ :8084 (host)         │  subscription_id ∈ PSP_FAIL_HEX
                  └──────────────────────┘
+                 ┌──────────────────────┐
+                 │ mock-bank (FastAPI)  │  SEPA SDD counterparty (R23a):
+                 │ :8085 (host)         │  IBAN-suffix outcome rules, signed
+                 └──────────────────────┘  webhooks; standalone until R23b
 ```
 
 ## The renewal job (producer)
@@ -239,6 +243,94 @@ The consumer accepts unknown extra fields (`@JsonIgnoreProperties`), treats any
 connection error, or non-2xx as `provider_error:<cause>` — all business
 failures, never dead-lettered ([G5](invariants.md#g5)).
 
+<a id="mock-bank"></a>
+## Mock bank
+
+The FastAPI mock bank exists as the asynchronous SEPA SDD settlement
+counterparty selected by [D13](decisions.md#d13) and
+[D15](decisions.md#d15); the synchronous mock PSP continues to serve cards
+until [R23f](roadmap.md#r23f), when cards join the same settlement spine per
+[D17](decisions.md#d17).
+
+`POST /collections` accepts this request:
+
+| Field | JSON type | Semantics |
+|---|---|---|
+| `collection_id` | string | Stable submission identity; duplicate submissions are idempotent |
+| `amount_cents` | integer | Positive amount in integer minor units ([G4](invariants.md#g4)); floats and strings are rejected |
+| `currency` | string | Three uppercase letters paired with `amount_cents` ([G4](invariants.md#g4)) |
+| `debtor_iban` | string | Debtor account; the deterministic rule keys on its last two characters |
+| `mandate_reference` | string | Creditor's non-empty SDD mandate reference |
+| `due_date` | string | Collection due date in ISO `YYYY-MM-DD` form |
+
+A new collection returns `202` with `status: accepted` and `duplicate: false`,
+stores its classified outcome and notification states, and schedules delivery.
+Repeating a `collection_id` returns `200` with `duplicate: true` and schedules
+nothing. `GET /collections/{collection_id}` exposes the stored submission,
+classification, and each notification's `scheduled` / `delivered` / `gave_up`
+state. `/health` reports the bank identity and scheme. `/metrics` exposes the
+Prometheus counters `bank_collections_received_total`,
+`bank_webhook_delivered_total`, and `bank_webhook_giveups_total`.
+
+The IBAN rule is deliberately small and deterministic:
+
+| Last two IBAN characters | Classification | Wire notification(s) | ISO 20022 reason |
+|---|---|---|---|
+| `99` | failed | `failed` | `AM04` — insufficient funds |
+| `98` | failed | `failed` | `AC04` — account closed |
+| `97` | failed | `failed` | `MD01` — no valid mandate |
+| `96` | settled then charged back | `settled`, then `charged_back` | `MD06` — payer objection after settlement |
+| any other suffix | settled | `settled` | none |
+
+Each rule-bearing suffix is 1% of a uniform two-digit tail. More importantly,
+later verifier sub-items can predict every result directly in SQL as
+`right(debtor_iban, 2)` rather than trusting an aggregate percentage.
+
+Webhook delivery sends the exact compact JSON bytes that were signed. Headers
+are `Content-Type: application/json`, `X-Bank-Id: <bank_id>`, and
+`X-Bank-Signature: sha256=<hex HMAC-SHA256 of the exact raw body>`. The
+versioned payload has seven fields:
+
+```json
+{
+  "schema_version": 1,
+  "bank_id": "bank-a",
+  "notification_id": "collection-123:1",
+  "collection_id": "collection-123",
+  "outcome": "settled",
+  "reason": null,
+  "occurred_at": "2026-07-26T12:00:00+00:00"
+}
+```
+
+Notification ids are deterministic: `<collection_id>:<seq>`. Sequence 1 is
+sent after the settlement delay; a chargeback at sequence 2 adds the configured
+chargeback lag. Non-2xx responses and HTTP transport errors retry with bounded
+exponential backoff. Exhausting the attempt cap gives up loudly with an ERROR
+log carrying the bank, notification, collection, URL, and attempt count, plus
+an increment of `bank_webhook_giveups_total`.
+
+The generic image is configured per instance with compose-only `BANK_*`
+environment variables; there is no `application.yaml`:
+
+| Environment variable | Default | Purpose |
+|---|---|---|
+| `BANK_ID` | `bank-a` | Bank identity included in notifications and headers |
+| `BANK_SCHEME` | `sepa_core` | Counterparty behavior scheme |
+| `BANK_WEBHOOK_URL` | `http://renewal-consumer:8080/webhooks/bank/bank-a` | Notification target |
+| `BANK_WEBHOOK_SECRET` | `payfold-dev-secret` | Per-bank HMAC shared secret |
+| `BANK_SETTLEMENT_DELAY_SECONDS` | `2.0` | Delay before sequence 1 |
+| `BANK_CHARGEBACK_LAG_SECONDS` | `5.0` | Additional delay before sequence 2 |
+| `BANK_WEBHOOK_RETRY_MAX_ATTEMPTS` | `5` | Bounded delivery-attempt cap |
+| `BANK_WEBHOOK_RETRY_BACKOFF_SECONDS` | `0.5` | Initial exponential-retry delay |
+
+This delivery surface is an explicit PSP-style fiction: real banks commonly
+report over file channels such as EBICS, with pain.002 and camt.054 batches.
+Payfold borrows that vocabulary while emitting JSON webhooks to keep the
+distributed-systems behavior inspectable. `BANK_SCHEME` is the reuse seam; only
+`sepa_core` exists today, and a `card` scheme joins the image in
+[R23f](roadmap.md#r23f) per [D17](decisions.md#d17).
+
 ## Observability
 
 Both services log through SLF4J, with Logback supplied by Spring Boot's defaults.
@@ -366,7 +458,16 @@ Seed size is compose-only configuration, deliberately absent from the table abov
 by `CustomerSeeder` in the seed container ([R12](roadmap.md#r12)). Every seeded
 subscription is due on the seed day, so the value directly sets the size of the
 day's renewal batch; `scripts/load-test.sh` adds more due-today volume to a running
-stack without a reseed. `CONSUMER_LISTENER_CONCURRENCY` (default 1) passes straight
+stack without a reseed.
+
+The mock bank is likewise configured entirely by compose-only envs, deliberately
+absent from the `application.yaml` table: `BANK_HTTP_PORT`, `BANK_ID`,
+`BANK_SCHEME`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`,
+`BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`,
+`BANK_WEBHOOK_RETRY_MAX_ATTEMPTS`, and
+`BANK_WEBHOOK_RETRY_BACKOFF_SECONDS`.
+
+`CONSUMER_LISTENER_CONCURRENCY` (default 1) passes straight
 through to `spring.rabbitmq.listener.simple.concurrency`, and the consumer's host ports
 are the range `CONSUMER_HTTP_PORT`–`CONSUMER_HTTP_PORT_END` (defaults
 8081–8083) so `docker compose up --scale renewal-consumer=N` can bind every
@@ -385,6 +486,7 @@ The deploy images' env contracts (`FLYWAY_*`, `POSTGRES_*`) are catalogued under
 | `localhost:8080` | producer — `/actuator/health`, `/actuator/prometheus`, `POST /actuator/renewal-job?force=true`, `GET /actuator/renewal-job/{executionId}` |
 | `localhost:8081` | consumer's first replica — `/actuator/health` (since [R1](roadmap.md#r1)), `/actuator/prometheus`; scaled replicas bind 8082–8083 with the same endpoints; container-internal 8080 |
 | `localhost:8084` | mock PSP (WireMock) — POST `/psp/charges`; admin/journal at `/__admin`; moved off 8082 by [R20](roadmap.md#r20) (consumer replica range) |
+| `localhost:8085` | mock bank (FastAPI) — `POST /collections`, `GET /collections/{id}`, `/health`, `/metrics` |
 | `localhost:9090` | Prometheus — targets, `/api/v1/query`, `/-/healthy` |
 | `localhost:3000` | Grafana — `payfold-pipeline` dashboard, anonymous viewer access |
 | `localhost:5672` / `15672` | RabbitMQ AMQP / management UI (creds from `.env`) |
@@ -394,7 +496,7 @@ The deploy images' env contracts (`FLYWAY_*`, `POSTGRES_*`) are catalogued under
 
 <a id="deploy-artifacts"></a>
 Per [D11](decisions.md#d11)/[R18](roadmap.md#r18), a manually pushed `vX.Y.Z` git
-tag runs `.github/workflows/publish.yml`, which publishes four images to GHCR.
+tag runs `.github/workflows/publish.yml`, which publishes five images to GHCR.
 Tags are immutable semver — never `latest`, never a mutable tag: the external
 platform repo pins exact tags in Git, and ordered semver is what lets its image
 automation bump them commit-by-commit. Every tag is a linux/amd64 + linux/arm64
@@ -409,6 +511,7 @@ architecture-independent jar once instead of emulating Maven under QEMU.
 | `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, `PAYMENT_PROVIDER_BASE_URL`, `TZ` |
 | `payfold-migrations` | `flyway/flyway:11` + `db-migrations/V*.sql`, `CMD ["migrate"]` | run-to-completion Job; exit 0 = success; re-run on a current schema is a no-op (asserted by `verify.sh`) | `FLYWAY_URL`, `FLYWAY_USER`, `FLYWAY_PASSWORD`, `FLYWAY_CONNECT_RETRIES` (image default 30) |
 | `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS` |
+| `payfold-mock-bank` | FastAPI mock bank (source + pinned pure-python deps) | long-running service; port 8080, `/health` | `BANK_ID`, `BANK_SCHEME`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `TZ` |
 
 Compose builds `payfold-migrations` and `payfold-seed-data-gen` itself (the flyway
 and seed-data services) instead of bind-mounting host paths, so the local stack

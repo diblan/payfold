@@ -10,6 +10,7 @@
 # It also re-runs the payfold-migrations image as a no-op run-to-completion Job.
 # It also requires Prometheus to be scraping both services and Grafana to serve
 # the provisioned pipeline dashboard anonymously.
+# It also requires the standalone mock-bank service to report healthy.
 #
 # Usage:
 #   scripts/verify.sh [--no-up] [--timeout SECONDS] [--poison|--no-poison]
@@ -75,6 +76,7 @@ RMQ_QUEUE="$(env_val RABBITMQ_QUEUE billing.renewals.main)"
 RMQ_EXCHANGE="$(env_val RABBITMQ_EXCHANGE billing.renewals)"
 RMQ_RK="$(env_val RABBITMQ_ROUTINGKEY renewal.requested)"
 PSP_FAIL_HEX="$(env_val PSP_FAIL_HEX 0)"
+BANK_PORT="$(env_val BANK_HTTP_PORT 8085)"
 RMQ_DLQ="billing.renewals.dlq"
 
 RESULTS=()
@@ -127,6 +129,7 @@ consumer_up() {
   return 1
 }
 consumer_running() { docker compose ps --status running --services 2>/dev/null | grep -qx renewal-consumer; }
+bank_up() { curl -fsS "http://localhost:${BANK_PORT}/health" 2>/dev/null | grep -q '"status":"ok"'; }
 
 outbox_drained() { [[ "$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NULL')" == "0" ]]; }
 
@@ -293,6 +296,9 @@ else
     fail "consumer container running"
   fi
 fi
+
+# R23a: the mock bank is part of the stack's definition of working.
+wait_for "mock-bank /health ok" bank_up
 
 wait_for "producer /actuator/prometheus serves outbox counters" producer_prometheus_ready || summary
 wait_for "consumer /actuator/prometheus serves renewals counter" consumer_prometheus_ready || summary

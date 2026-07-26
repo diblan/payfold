@@ -328,7 +328,7 @@ at v1 (additive only, [G8](invariants.md#g8)); the settlement message is a new
 internal contract starting at v1 ([D15](decisions.md#d15)).
 
 <a id="r23a"></a>
-### [ ] R23a — Mock bank service, standalone
+### [x] R23a — Mock bank service, standalone
 **Scope:** new `mock-bank/` (Python 3 + FastAPI, [D15](decisions.md#d15)),
 Dockerfile (multi-arch-buildable, [R18](#r18) precedent), compose service +
 healthcheck, CI job for the Python suite; no Java changes.

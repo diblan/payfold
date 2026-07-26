@@ -1,6 +1,6 @@
 name: publish
 
-# Publishes the four deploy images to GHCR on a manually pushed semver tag
+# Publishes the five deploy images to GHCR on a manually pushed semver tag
 # (vX.Y.Z). Tags are immutable: a tag is published once and never moved, and no
 # mutable tag (latest, major-only) is ever created — the platform repo pins exact
 # tags in Git. Every image tag is a linux/amd64 + linux/arm64 manifest list; the
@@ -82,3 +82,16 @@ jobs:
             org.opencontainers.image.version=${{ github.ref_name }}
           cache-from: type=gha,scope=payfold-seed-data-gen
           cache-to: type=gha,mode=max,scope=payfold-seed-data-gen
+      - name: Publish payfold-mock-bank
+        uses: docker/build-push-action@v6
+        with:
+          context: mock-bank
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ghcr.io/diblan/payfold-mock-bank:${{ github.ref_name }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/diblan/payfold
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+          cache-from: type=gha,scope=payfold-mock-bank
+          cache-to: type=gha,mode=max,scope=payfold-mock-bank
