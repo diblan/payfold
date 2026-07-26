@@ -244,7 +244,7 @@ platform's livenessProbe already uses it); compose and the consumer test run the
 multi-arch WireMock variant; verify.sh green.
 
 <a id="r20"></a>
-### [ ] R20 — Consumer scaling levers: measured, not assumed
+### [x] R20 — Consumer scaling levers: measured, not assumed
 The consumer is the binding constraint (~48/s sustained, [R12](#r12)) and its two
 scaling levers are untested: listener concurrency (in-process) and multiple
 consumer instances (G2's constraint-based idempotency makes N parallel consumers

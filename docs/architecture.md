@@ -22,6 +22,7 @@ Honesty table:
 | Operational observability | Demonstrated — SLF4J logging, Prometheus counters + built-in job/listener timers, `verify.sh` cross-checks metric deltas against DB deltas |
 | Throughput at 330k/day | Measured end to end — producer: 1,015,000 due rows scanned + published in 459 s wall, peak heap 183 MiB; consumer: 100,000 due-today renewals drained in ~30 min (~48/s sustained) in [R12](roadmap.md#r12)'s documented run, so a 330k night is ~2.5 min of publishing plus 1.9–2.2 h of draining — 11–13× the 3.8/s requirement average. Single-node WSL2 dev-laptop numbers; the consumer is the binding constraint (2026-07-21, see quality.md "Measured scale runs") |
 | Horizontal producer scaling | Demonstrated — `FOR UPDATE SKIP LOCKED` page claims + advisory-lock cron guard; exactly-once under two concurrent publishers proven by test (compose still runs a single producer instance) |
+| Consumer scaling levers | Measured — listener concurrency ×8: 100k drained in 191 s (524/s avg, ~10× the ~53/s single-thread baseline); 3 same-host replicas at concurrency 1: 100k in 951 s (105/s, ~2×; RabbitMQ round-robin split 33,335/33,320/33,345) — both full verify.sh-green with fleet-summed exact checks ([R20](roadmap.md#r20), 2026-07-26). Same-host replicas contend for one machine; true multi-node scaling is the external platform repo's KEDA demonstration |
 
 ## Component map
 
@@ -62,7 +63,7 @@ Honesty table:
                             ▼
                  ┌──────────────────────┐
                  │ mock-psp (WireMock)  │  declines iff last hex char of
-                 │ :8082 (host)         │  subscription_id ∈ PSP_FAIL_HEX
+                 │ :8084 (host)         │  subscription_id ∈ PSP_FAIL_HEX
                  └──────────────────────┘
 ```
 
@@ -337,7 +338,12 @@ Seed size is compose-only configuration, deliberately absent from the table abov
 by `CustomerSeeder` in the seed container ([R12](roadmap.md#r12)). Every seeded
 subscription is due on the seed day, so the value directly sets the size of the
 day's renewal batch; `scripts/load-test.sh` adds more due-today volume to a running
-stack without a reseed.
+stack without a reseed. `CONSUMER_LISTENER_CONCURRENCY` (default 1) passes straight
+through to `spring.rabbitmq.listener.simple.concurrency`, and the consumer's host ports
+are the range `CONSUMER_HTTP_PORT`–`CONSUMER_HTTP_PORT_END` (defaults
+8081–8083) so `docker compose up --scale renewal-consumer=N` can bind every
+replica; `verify.sh` sums the per-replica counters over that range
+([R20](roadmap.md#r20)).
 On month-end clamp days (Jul 31, Dec 31, …) every seeding path falls back to the
 V5 yearly plan, whose one-year preimage exists on all such days; the monthly path
 covers Feb 29, where only the one-month preimage exists.
@@ -349,8 +355,8 @@ The deploy images' env contracts (`FLYWAY_*`, `POSTGRES_*`) are catalogued under
 | Where | What |
 |---|---|
 | `localhost:8080` | producer — `/actuator/health`, `/actuator/prometheus`, `POST /actuator/renewal-job?force=true`, `GET /actuator/renewal-job/{executionId}` |
-| `localhost:8081` | consumer — `/actuator/health` (since [R1](roadmap.md#r1)), `/actuator/prometheus`; container-internal 8080 |
-| `localhost:8082` | mock PSP (WireMock) — POST `/psp/charges`; admin/journal at `/__admin` |
+| `localhost:8081` | consumer's first replica — `/actuator/health` (since [R1](roadmap.md#r1)), `/actuator/prometheus`; scaled replicas bind 8082–8083 with the same endpoints; container-internal 8080 |
+| `localhost:8084` | mock PSP (WireMock) — POST `/psp/charges`; admin/journal at `/__admin`; moved off 8082 by [R20](roadmap.md#r20) (consumer replica range) |
 | `localhost:5672` / `15672` | RabbitMQ AMQP / management UI (creds from `.env`) |
 | `localhost:5432` | Postgres (creds from `.env`) |
 

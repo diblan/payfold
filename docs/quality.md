@@ -23,8 +23,8 @@ Last full re-grade: **2026-07-21** (R13 entropy pass, after R15).
 | `db-migrations` | **B** | Clean, ordered, sole schema authority; since R18 also ships as the `payfold-migrations` Job image (SQL baked at build, FLYWAY_* env config), whose no-op re-run `verify.sh` asserts; V1 carries aspirational tables (`bank_tx`, `recon_match`, `ledger_entry`) no code uses — harmless but reviewer-confusing | — |
 | `seed-data-gen` | **B** | Seed size parameterized (`SEED_CUSTOMERS`, default 15k, all due today); emails numbered from the current row count so `customer_email_key` cannot collide at any size; since R18 ships as the `payfold-seed-data-gen` Job image (source, JDBC driver, and name data baked; strict-exit runner); due-today seeding is clamp-day-safe since R16 (interval round-trip fallback to the V5 yearly plan, same rule in the keyset test seed and load-test.sh, cross-checked against Postgres arithmetic by `ClampDayDuePreimageTest`). No test harness of its own — the arithmetic rule is covered from the producer suite | — |
 | `mock-psp/` (WireMock) | **B** | Deterministic decline rule (last-hex-char class) rendered from inert `.json.tpl` templates by the compose entrypoint; multi-arch image since R19 (the alpine variant was amd64-only, caught by the platform repo's audit); request/response wire contract documented in architecture.md so third parties can stub it; healthchecked; exercised end-to-end by the consumer integration suite and `verify.sh`'s exact per-row assertions. The sed-render entrypoint itself has no direct test | — |
-| `docker-compose.yaml` + config | **B** | Stack ordering and healthchecks pass; app-specific env names use relaxed binding, yaml contains only consumed keys, and declared named-volume defaults preserve path overrides; flyway and seed-data build and run the same images CI publishes (R18) instead of bind-mounting host paths | — |
-| `docs/` + harness | **B** | CI uses pinned Maven wrappers and runs real-container integration tests for both services; a tag-triggered workflow publishes the four multi-arch deploy images (R18); `verify.sh` covers the happy path via the async trigger (<1s POST assert + execution-status polling), same-day idempotency, poison probe, per-row predicted PSP outcomes with an exact failed count, same-run metric/DB delta cross-checks, and the migrations image's no-op Job re-run; since R17 every management-API depth assertion is a bounded poll (the last single-read check flaked at 100k on the API's ~5s stats interval and is fixed the way its DLQ siblings already were) | — |
+| `docker-compose.yaml` + config | **B** | Stack ordering and healthchecks pass; app-specific env names use relaxed binding, yaml contains only consumed keys, and declared named-volume defaults preserve path overrides; flyway and seed-data build and run the same images CI publishes (R18) instead of bind-mounting host paths; the consumer is scale-safe since R20 (no fixed container name, host-port range 8081–8083, mock PSP moved to 8084) | — |
+| `docs/` + harness | **B** | CI uses pinned Maven wrappers and runs real-container integration tests for both services; a tag-triggered workflow publishes the four multi-arch deploy images (R18); `verify.sh` covers the happy path via the async trigger (<1s POST assert + execution-status polling), same-day idempotency, poison probe, per-row predicted PSP outcomes with an exact failed count, same-run metric/DB delta cross-checks, and the migrations image's no-op Job re-run; since R17 every management-API depth assertion is a bounded poll (the last single-read check flaked at 100k on the API's ~5s stats interval and is fixed the way its DLQ siblings already were); since R20 the consumer metric checks sum across the replica port range and are proven green at 3 replicas | — |
 
 ## Test coverage
 
@@ -65,6 +65,24 @@ including the async trigger-then-poll happy path, same-day idempotency, a strict
 exact deterministic provider-failure assertions.
 
 ## Measured scale runs
+
+- **2026-07-26 — consumer scaling levers (R20, the commit this entry ships in;
+  WSL2 Docker Compose stack).** Three fresh-boot 100k-due-today runs, each
+  passing the full verify.sh; drain windows measured from `payment` timestamps
+  (`max(completed_at) − min(requested_at)`), rates cross-checked by 60 s
+  Prometheus sampling. *Baseline* (1 replica × concurrency 1): steady
+  **52–54/s** across twenty 60 s intervals — consistent with R12's 48–55/s.
+  *Concurrency 8* (one JVM, `CONSUMER_LISTENER_CONCURRENCY=8`): 100,000 in
+  **191 s = 524/s average, ~10× baseline** — mildly superlinear per thread
+  because prefetched deliveries pipeline instead of paying the full
+  per-message round-trip chain. *3 replicas × concurrency 1*
+  (`--scale renewal-consumer=3`): 100,000 in **951 s = 105/s, ~2× baseline**;
+  RabbitMQ round-robin split the work **33,335 / 33,320 / 33,345** (0.08%
+  spread) — the load-balancing evidence — but three same-host JVMs contend for
+  one machine's CPU, so in-process concurrency is the cheaper local lever and
+  replica scaling pays off across real nodes (the platform repo's KEDA
+  autoscaling). First multi-replica verify.sh green: the fleet-summed consumer
+  checks matched DB deltas exactly at 3 replicas.
 
 - **2026-07-21 — 1M producer run (R11, the commit this section ships in; WSL2 Docker
   Compose stack, no config overrides).** Seeded 1,015,000 active due-today

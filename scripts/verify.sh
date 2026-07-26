@@ -5,7 +5,8 @@
 # docs/invariants.md G7): it may only ever be made stricter, never loosened.
 # It asserts the async renewal trigger returns an execution id in <1s,
 # polls that execution to completion, checks exact deterministic provider failures
-# derived from PSP_FAIL_HEX, and cross-checks same-run Prometheus/DB deltas.
+# derived from PSP_FAIL_HEX, and cross-checks same-run Prometheus/DB deltas; consumer
+# counters are summed across the replica port range.
 # It also re-runs the payfold-migrations image as a no-op run-to-completion Job.
 #
 # Usage:
@@ -62,6 +63,7 @@ PGDB="$(env_val POSTGRES_DB payfold)"
 PGPASS="$(env_val POSTGRES_PASSWORD admin)"
 PRODUCER_PORT="$(env_val PRODUCER_HTTP_PORT 8080)"
 CONSUMER_PORT="$(env_val CONSUMER_HTTP_PORT 8081)"
+CONSUMER_PORT_END="$(env_val CONSUMER_HTTP_PORT_END 8083)"
 RMQ_USER="$(env_val RABBITMQ_USER guest)"
 RMQ_PASS="$(env_val RABBITMQ_PASSWORD guest)"
 RMQ_MGMT_PORT="$(env_val RABBITMQ_MGMT_PORT 15672)"
@@ -142,6 +144,25 @@ prom_val() { # port, extended-regex over metric lines -> integer sum | absent | 
     | awk '{s+=$NF} END { if (NR==0) print "absent"; else printf "%.0f\n", s }'
 }
 
+# Sum an extended-regex metric over every responsive consumer replica port.
+# Replicas expose per-process counters; the fleet-wide truth is their sum.
+# Echoes the sum, "absent" if no responsive port serves the metric, or
+# "unreachable" if no port in the range responds at all.
+consumer_prom_sum() {
+  local total=0 seen=0 reachable=0 port v
+  for port in $(seq "$CONSUMER_PORT" "$CONSUMER_PORT_END"); do
+    v="$(prom_val "$port" "$1")"
+    [[ "$v" == "unreachable" ]] && continue
+    reachable=1
+    [[ "$v" == "absent" ]] && continue
+    seen=1
+    total=$((total + v))
+  done
+  if (( ! reachable )); then echo unreachable; return; fi
+  if (( ! seen )); then echo absent; return; fi
+  echo "$total"
+}
+
 producer_prometheus_ready() {
   local inserted published
   inserted="$(prom_val "$PRODUCER_PORT" '^outbox_inserted_total ')"
@@ -151,7 +172,7 @@ producer_prometheus_ready() {
 }
 consumer_prometheus_ready() {
   local processed
-  processed="$(prom_val "$CONSUMER_PORT" '^renewals_processed_total\{outcome="(succeeded|failed)"\}')"
+  processed="$(consumer_prom_sum '^renewals_processed_total\{outcome="(succeeded|failed)"\}')"
   [[ "$processed" != "absent" && "$processed" != "unreachable" ]]
 }
 main_queue_empty() { [[ "$(queue_depth "$RMQ_QUEUE")" == "0" ]]; }
@@ -264,7 +285,7 @@ wait_for "consumer /actuator/prometheus serves renewals counter" consumer_promet
 
 M_INS_BEFORE="$(prom_val "$PRODUCER_PORT" '^outbox_inserted_total ')"
 M_PUB_BEFORE="$(prom_val "$PRODUCER_PORT" '^outbox_published_total ')"
-M_PROC_BEFORE="$(prom_val "$CONSUMER_PORT" '^renewals_processed_total\{outcome="(succeeded|failed)"\}')"
+M_PROC_BEFORE="$(consumer_prom_sum '^renewals_processed_total\{outcome="(succeeded|failed)"\}')"
 DB_OUTBOX_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox')"
 DB_PUB_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NOT NULL')"
 
@@ -310,7 +331,7 @@ published_metric_delta_matches() {
 }
 processed_metric_delta_matches() {
   local current
-  current="$(prom_val "$CONSUMER_PORT" '^renewals_processed_total\{outcome="(succeeded|failed)"\}')"
+  current="$(consumer_prom_sum '^renewals_processed_total\{outcome="(succeeded|failed)"\}')"
   [[ "$current" =~ ^[0-9]+$ ]] && (( current - M_PROC_BEFORE == DB_PUB_DELTA ))
 }
 batch_job_timer_recorded() {
@@ -486,7 +507,7 @@ fi
 
 listener_timer_recorded() {
   local count
-  count="$(prom_val "$CONSUMER_PORT" '^spring_rabbitmq_listener_seconds_count')"
+  count="$(consumer_prom_sum '^spring_rabbitmq_listener_seconds_count')"
   [[ "$count" != "absent" && "$count" != "unreachable" ]]
 }
 wait_for "spring_rabbitmq_listener timer recorded on consumer" listener_timer_recorded

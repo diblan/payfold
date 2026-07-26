@@ -55,7 +55,7 @@ This README stays a quickstart; everything deeper belongs in `docs/`.
    - `seed-data`: executes the Java seed scripts in `seed-data-gen`, seeding
      `SEED_CUSTOMERS` customers (default 15000), each with a subscription due today
    - `rabbitmq`: RabbitMQ 3.13 with the management UI exposed locally
-   - `mock-psp`: WireMock mock payment provider (port `8082`), declining a
+   - `mock-psp`: WireMock mock payment provider (port `8084`), declining a
      deterministic `PSP_FAIL_HEX` slice of renewals
    - `renewal-producer`: Spring Boot billing engine (port `8080`)
    - `renewal-consumer`: Spring Boot payment service (port `8081`)
@@ -109,10 +109,19 @@ under "Measured scale runs".
 - **Extrapolation:** at the measured 41–48/s, a 330k nightly batch drains in
   1.9–2.2 hours — **11–13× the 3.8/s average** the 10M/month target requires.
 
-The consumer is the binding constraint. Untested levers, listed as future work
-rather than claims: listener concurrency and additional consumer instances — both
-safe by design, because idempotency lives in database unique constraints, not in
-consumer state.
+The single-thread consumer default is the binding constraint — and its two
+scaling levers are measured, not promised (R20, 2026-07-26; both safe by design,
+because idempotency lives in database unique constraints, not in consumer state):
+
+- **Listener concurrency ×8** (one JVM, `CONSUMER_LISTENER_CONCURRENCY=8`):
+  100k drained in **191 s — 524/s average, ~10× the baseline** — so a 330k
+  nightly batch drains in ~10.5 minutes.
+- **3 consumer replicas** (`docker compose up --scale renewal-consumer=3`,
+  concurrency 1 each): 100k in 951 s — 105/s, ~2× baseline, with RabbitMQ
+  round-robin splitting the work 33,335 / 33,320 / 33,345. Same-host replicas
+  share one machine, so in-process concurrency is the cheaper local lever;
+  replica scaling is the fault-tolerance and multi-node story (autoscaled
+  across real hardware in the companion platform repo).
 
 Reproduce it yourself:
 
