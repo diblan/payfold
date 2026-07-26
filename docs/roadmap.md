@@ -17,7 +17,7 @@ Scope insurance. Promoting any of these onto the roadmap requires a
 | Non-goal | Why not |
 |---|---|
 | Kubernetes / cloud deploy | Compose demonstrates the architecture; orchestration adds ops surface, not distributed-systems insight. [D11](decisions.md#d11) sanctions one epilogue — publishing versioned images for the external platform repo ([R18](#r18)); orchestration itself stays out |
-| Real PSP or money movement | Mock counterparties only: the mock PSP ([R8](#r8)) pioneered the deterministic failure path; the mock bank supersedes it within [R23](#r23) ([D15](decisions.md#d15)) — still no credentials, compliance, or real money |
+| Real PSP or money movement | Mock counterparties only: the mock PSP ([R8](#r8)) pioneered the deterministic failure path; the mock bank joins it in [R23](#r23), and the async card scheme absorbs WireMock's role in [R23f](#r23f) ([D15](decisions.md#d15)/[D17](decisions.md#d17)) — still no credentials, compliance, or real money |
 | Auth / multi-tenancy | Orthogonal to the billing pipeline story |
 | Any UI | The consumers of this system are curl, psql, and the RabbitMQ console. [D12](decisions.md#d12) carves out provisioned Grafana ([R21](#r21)) — industry ops tooling as code, not a custom page |
 | Proration, refunds, tax | Each is a project of its own; the renewal happy path + failure path is the thesis. Dunning left this row 2026-07-26: [D16](decisions.md#d16) promotes it to [R26](#r26), gated on [R23](#r23) |
@@ -31,10 +31,12 @@ Ordering principle: *repair the feedback loop → correctness → resilience →
 Dependencies: R1, R2 → R3 → R4–R8; R4 → R5; R10 → R11, R12.
 Story phase (2026-07-26): R20 → R22; R21 → R22; R22 → R24 ([R17](#r17) pairs
 naturally with [R20](#r20)'s scale runs; [R23](#r23) re-triggers [R24](#r24)).
-SEPA phase (2026-07-26): [R23](#r23) split per [D15](decisions.md#d15) into
-R23a → R23b → R23c → R23d → R23e, strictly in order; R23 → R26 ([D16](decisions.md#d16)).
-**No version tag between R23b and R23c** — images published from that window
-park every renewal in `submitted` with nothing to settle them.
+SEPA phase (2026-07-26): [R23](#r23) split per [D15](decisions.md#d15)/[D17](decisions.md#d17)
+into R23a → R23b → R23c → R23d → R23e → R23f, strictly in order;
+R23 → R26 ([D16](decisions.md#d16)). Between [R23b](#r23b) and [R23c](#r23c) the
+SDD cohort parks in `submitted` while cards settle as today ([D17](decisions.md#d17))
+— a tag proposed from that window must say so, and the seeded SDD share should
+stay low until the loop closes.
 
 <a id="r1"></a>
 ### [x] R1 — Consumer bootstrap hygiene
@@ -315,10 +317,12 @@ count under delayed confirms; a slow-confirm scenario completes without
 unchanged.
 
 <a id="r23"></a>
-### [ ] R23 — SEPA mock-bank: async settlement ([D13](decisions.md#d13), design [D15](decisions.md#d15)) *(epic — split 2026-07-26 into R23a–R23e below; check when all five are checked)*
-**Done when (epic-level):** a renewal is only `succeeded` after asynchronous bank
-confirmation; chaos parameters demonstrably shift outcomes; verify.sh models the
-async settlement deterministically (the [R8](#r8) recomputable-rule precedent).
+### [ ] R23 — SEPA mock-bank: async settlement ([D13](decisions.md#d13), design [D15](decisions.md#d15)/[D17](decisions.md#d17)) *(epic — split 2026-07-26 into R23a–R23f below; check when all six are checked)*
+**Done when (epic-level):** a renewal is only `succeeded` after asynchronous
+confirmation — for **both** payment methods ([D17](decisions.md#d17)): SDD via
+the mock bank, cards via a sync auth verdict + async settlement on the same
+spine; chaos parameters demonstrably shift outcomes; verify.sh models the async
+settlement deterministically (the [R8](#r8) recomputable-rule precedent).
 Sub-items execute strictly top-down, one per session. `renewal.requested` stays
 at v1 (additive only, [G8](invariants.md#g8)); the settlement message is a new
 internal contract starting at v1 ([D15](decisions.md#d15)).
@@ -338,6 +342,8 @@ for demo), it POSTs a settlement notification (bank id, notification id,
 collection id, outcome, reason) to a configured webhook URL, signed
 HMAC-SHA256 with a per-bank shared secret, retrying on non-2xx with backoff and
 a bounded attempt cap — then gives up loudly (log + metric), never silently.
+Instance config (bank id, delay profile, secret) is designed for scheme reuse —
+a `card` scheme joins the same image in [R23f](#r23f) ([D17](decisions.md#d17)).
 **Done when:** pytest covers the IBAN rule engine, HMAC signing, and bounded
 retry; a curl'd submission with a rule-bearing IBAN delivers a signed webhook to
 a test sink after the configured delay; the compose service is healthy on a
@@ -345,26 +351,26 @@ fresh `up`; verify.sh gains a mock-bank health check (a tightening,
 [G7](invariants.md#g7)); [quality.md](quality.md) gains a `mock-bank` module row.
 
 <a id="r23b"></a>
-### [ ] R23b — Submission reshape: renewals become SDD collections
-**Scope:** new migrations ([G3](invariants.md#g3)): `payment.status` grows
-`submitted`, payment rows gain bank id + collection id; customers gain IBAN +
-mandate reference + country (seeder-populated, outcome mix env-tunable via
-rule-bearing IBAN share); `BillingService` ends by submitting a collection to
-the bank — payment `submitted`, invoice/charge **not** finalized, subscription
-**not** advanced, message ACKed. The mock PSP retires with this item
-([D15](decisions.md#d15)): compose service, `payment.provider.*` config, and the
-architecture.md wire-contract section — **flag loudly**: the platform repo's P8
-onboarding stubs the PSP and consumes its env ([R19](#r19)); the session summary
-must call out every platform-facing removal and addition (bank base URL/secret
-env → truth table).
-**Done when:** an integration test proves consuming a renewal ends `submitted`
-with nothing finalized and no redelivery; duplicate delivery still yields
-exactly one submitted payment ([G2](invariants.md#g2)); verify.sh reshapes phase
-1: after drain, every due renewal has exactly one payment, **all** `submitted`,
-zero finalized invoices (exact counts — the reshape [D13](decisions.md#d13)/
-[D15](decisions.md#d15) sanction); config truth table updated ([G6](invariants.md#g6)).
-**Note:** until [R23c](#r23c), payments park in `submitted` by design — honest
-intermediate state, hence the no-tag window (see phase note above).
+### [ ] R23b — Payment methods: the SDD cohort submits, cards keep flowing
+**Scope:** new migrations ([G3](invariants.md#g3)): customers gain
+`payment_method` (`card` | `sdd`, seeded mix env-tunable per
+[D17](decisions.md#d17)) and, for SDD, IBAN + mandate reference + country
+(rule-bearing IBAN share env-tunable); `payment.status` grows `submitted`,
+payment rows gain bank id + collection id. `BillingService` routes by method:
+**card → the existing synchronous PSP path, byte-for-byte untouched**; sdd →
+submit a collection to the bank — payment `submitted`, invoice/charge **not**
+finalized, subscription **not** advanced, message ACKed. The mock PSP does
+**not** retire here ([D17](decisions.md#d17) — that's [R23f](#r23f)); bank base
+URL/secret env → config truth table ([G6](invariants.md#g6)).
+**Done when:** a routing integration test proves each method takes its path;
+consuming an SDD renewal ends `submitted` with nothing finalized and no
+redelivery; duplicate delivery still yields exactly one submitted payment
+([G2](invariants.md#g2)); verify.sh keeps [R8](#r8)'s card assertions
+**verbatim** ([G7](invariants.md#g7) untouched) and adds exact SDD assertions:
+every SDD renewal has exactly one payment, all `submitted`, zero finalized
+(exact counts by seeded mix).
+**Note:** until [R23c](#r23c), SDD payments park in `submitted` by design while
+cards settle as today — honest intermediate state (see phase note above).
 
 <a id="r23c"></a>
 ### [ ] R23c — Close the loop: webhook receiver, settlement inbox, queue, listener
@@ -384,11 +390,12 @@ Micrometer `settlements_processed_total{outcome}` + dashboard panels
 one finalization; (b) redelivered settlement message → no double finalize
 ([G2](invariants.md#g2)); (c) poison settlement → DLQ within the bound while
 good ones keep flowing ([G5](invariants.md#g5)); verify.sh closes phase 2: after
-bank-delay + drain, **zero** payments stuck `submitted`, per-outcome exact
+bank-delay + drain, **zero** SDD payments stuck `submitted`, per-outcome exact
 counts match the IBAN-rule prediction, and reconciliation holds — every inbox
-row processed-or-DLQ'd, every terminal payment traces to an inbox row. A renewal
-is `succeeded` only after asynchronous confirmation: the epic's headline now
-holds. Tag proposal expected (end-to-end restored).
+row processed-or-DLQ'd, every terminal SDD payment traces to an inbox row. A
+renewal is `succeeded` only after asynchronous confirmation — the epic's
+headline now holds for the SDD cohort (universal at [R23f](#r23f)). Tag proposal
+expected (the SDD loop is closed).
 
 <a id="r23d"></a>
 ### [ ] R23d — Chargebacks + chaos profiles that shift outcomes
@@ -417,7 +424,31 @@ architecture.md bank-registry + truth-table update ([G6](invariants.md#g6)).
 asserts per-bank attribution (each bank's inbox rows match its routed share,
 [G7](invariants.md#g7)); the dashboard visibly shows the slow bank lagging the
 fast one on the same load; the [R22](#r22) demo gains a slow-bank backlog-drain
-beat. Epic checkbox closes with this item.
+beat.
+
+<a id="r23f"></a>
+### [ ] R23f — Cards join the async spine; WireMock retires ([D17](decisions.md#d17))
+**Scope:** the mock-counterparty service grows a `scheme` config
+(`sepa_core` | `card`): a card instance answers submission with a
+**synchronous auth verdict** — mirroring the real card network's auth round
+trip; declines deterministic from the card token ([R8](#r8)'s original trick
+coming home) — and delivers the **settlement** webhook on a fast profile with
+card decline vocabulary (insufficient funds, do-not-honor, …); the
+settle-then-chargeback rule applies to cards too ([R23d](#r23d)'s machinery,
+card-flavored reason). Consumer card path reshapes: auth decline → terminal
+`failed` immediately; authorized → `submitted`, finalization via the same
+inbox → queue → listener spine. The WireMock mock PSP and `payment.provider.*`
+config retire — **flag loudly**: the platform repo's P8 onboarding stubs the
+PSP and consumes its env ([R19](#r19)); the session summary must call out every
+platform-facing removal and addition; architecture.md wire-contract section
+replaced by the counterparty contract ([G6](invariants.md#g6)).
+**Done when:** integration tests prove the sync-decline and async-settle card
+paths, idempotent under redelivery ([G2](invariants.md#g2)); verify.sh reshapes
+[R8](#r8)'s card assertions from rate ± tolerance to **exact per-outcome
+counts** (a tightening, [G7](invariants.md#g7)) and extends reconciliation +
+zero-stuck-`submitted` to **all** payments; the dashboard outcome split gains a
+per-method dimension; re-triggers [R24](#r24). Tag proposal expected. Epic
+checkbox closes with this item.
 
 <a id="r24"></a>
 ### [ ] R24 — README screen recording

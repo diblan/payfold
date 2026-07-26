@@ -237,7 +237,7 @@ in flight covers the measured 5k msg/s page baseline ([D10](decisions.md#d10)) w
 margin. Up to 100 idle channels stay cached on a quiet connection — well under
 `channelMax` and cheap on the broker.
 
-## D15 — R23 execution design: settlement inbox behind the queue, bank-agnostic contract, FastAPI mock bank — 2026-07-26 — active
+## D15 — R23 execution design: settlement inbox behind the queue, bank-agnostic contract, FastAPI mock bank — 2026-07-26 — active, flow scope amended by [D17](#d17)
 <a id="d15"></a>
 Execution-level decisions for [D13](decisions.md#d13)'s epic, agreed in the
 2026-07-26 design discussion; where this differs from the overnight design brief
@@ -295,6 +295,10 @@ real→Payfold mapping live in gitignored `notes/sepa-references.md`.
 **Dunning boundary:** a chargeback is a recorded fact (terminal state + reason);
 the subscription stays advanced and nothing compensates — reacting is dunning,
 promoted separately with a gate in [D16](decisions.md#d16).
+**Amended same day by [D17](#d17):** the PSP-supersession scope. The user
+clarified both payment methods are wanted; cards migrate onto the same
+settlement spine in [R23f](roadmap.md#r23f) instead of retiring with
+[R23b](roadmap.md#r23b). Everything else in this entry stands.
 
 ## D16 — Dunning: promoted from non-goal to a gated future epic — 2026-07-26 — active
 <a id="d16"></a>
@@ -313,3 +317,44 @@ no mandate are not), a `past_due` grace lifecycle on the subscription, bounded
 attempts ending in cancellation. No new service; no notification channels
 (email etc. stay out).
 **Boundary unchanged:** proration, refunds-as-a-flow, and tax remain non-goals.
+
+## D17 — Two payment methods, one event-driven settlement spine — 2026-07-26 — active
+<a id="d17"></a>
+Amends [D15](#d15)'s flow scope after a user clarification the same day. The
+2026-07-19 critique ("something that instantly says there's a correct bank
+transfer is unrealistic") targeted the **synchronous request-response shape** —
+tell an API "do this payment", block, receive "it happened" — not direct debits
+specifically. *Async* here means what the rest of this system means by it:
+distributed, event/message-driven confirmation. And the product vision is
+Netflix-like: the customer chooses a payment method, and the project is built to
+grow from one method to two — so cards are not superseded, they are the second
+traveler on the same spine.
+**Decision:** customers carry a `payment_method` (`card` | `sdd`), seeded with an
+env-tunable mix.
+- **SDD** goes async first, exactly per [D15](#d15) ([R23a](roadmap.md#r23a)–[R23e](roadmap.md#r23e) unchanged).
+- **Card stays on the existing synchronous WireMock PSP through the epic's
+  middle** — [R8](roadmap.md#r8)'s verify assertions survive verbatim
+  ([G7](invariants.md#g7) stays clean, no reshape controversy) and the pipeline
+  never has a window where nothing settles.
+- **[R23f](roadmap.md#r23f) then migrates cards onto the async spine,** modeling
+  cards honestly: authorization **is** a genuine synchronous round trip in the
+  real card network (merchant → PSP → scheme → issuer, seconds), so submission
+  returns a sync auth verdict and a decline is terminal immediately; but
+  fulfillment-grade confirmation (capture/settlement) arrives later as an event
+  — the industry's own fulfill-via-webhook rule — through the same
+  inbox → queue → listener machinery, on a fast profile with card decline
+  vocabulary. The counterparty is the **same mock-counterparty image** in a
+  `card` scheme; WireMock retires there, and [R19](roadmap.md#r19)'s
+  platform-facing PSP contract flags move there with it.
+**Why this shape:** the difference between cards and SDD is not sync vs async —
+every payment method is submit-now-confirm-later once you look past the auth hop
+— it is the **latency and trustworthiness of the first signal** (cards: a
+reliable verdict in seconds; SDD: nothing trustworthy for days). One state
+machine with per-scheme profiles models that truthfully, and the card scheme
+becomes the first proof that [D15](#d15)'s bank-agnostic contract is genuinely
+counterparty-agnostic.
+**Noted, not scoped:** the user's phone-bill analogy (pay manually vs
+automatically) points at a third method — customer-initiated push payment with
+open-invoice reconciliation, which is exactly what the dormant
+`bank_tx`/`recon_match` tables await. Stays a non-goal until its own decision
+entry.
