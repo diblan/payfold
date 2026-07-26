@@ -17,10 +17,10 @@ Scope insurance. Promoting any of these onto the roadmap requires a
 | Non-goal | Why not |
 |---|---|
 | Kubernetes / cloud deploy | Compose demonstrates the architecture; orchestration adds ops surface, not distributed-systems insight. [D11](decisions.md#d11) sanctions one epilogue — publishing versioned images for the external platform repo ([R18](#r18)); orchestration itself stays out |
-| Real PSP or money movement | Mock PSP ([R8](#r8)) exercises every interesting failure path without credentials or compliance |
+| Real PSP or money movement | Mock counterparties only: the mock PSP ([R8](#r8)) pioneered the deterministic failure path; the mock bank supersedes it within [R23](#r23) ([D15](decisions.md#d15)) — still no credentials, compliance, or real money |
 | Auth / multi-tenancy | Orthogonal to the billing pipeline story |
 | Any UI | The consumers of this system are curl, psql, and the RabbitMQ console. [D12](decisions.md#d12) carves out provisioned Grafana ([R21](#r21)) — industry ops tooling as code, not a custom page |
-| Dunning, proration, refunds, tax | Each is a project of its own; the renewal happy path + failure path is the thesis |
+| Proration, refunds, tax | Each is a project of its own; the renewal happy path + failure path is the thesis. Dunning left this row 2026-07-26: [D16](decisions.md#d16) promotes it to [R26](#r26), gated on [R23](#r23) |
 | Event-sourcing rewrite | The outbox pattern *is* the demonstration; rewriting the persistence model restarts the project |
 | More services | Two services already demonstrate cross-service delivery semantics; a third must earn its place via a decision entry — [D13](decisions.md#d13) grants exactly one: the mock-bank settlement service ([R23](#r23)) |
 | Reconciliation / ledger flows | `bank_tx`, `recon_match`, `ledger_entry` stay dormant until promoted |
@@ -31,6 +31,10 @@ Ordering principle: *repair the feedback loop → correctness → resilience →
 Dependencies: R1, R2 → R3 → R4–R8; R4 → R5; R10 → R11, R12.
 Story phase (2026-07-26): R20 → R22; R21 → R22; R22 → R24 ([R17](#r17) pairs
 naturally with [R20](#r20)'s scale runs; [R23](#r23) re-triggers [R24](#r24)).
+SEPA phase (2026-07-26): [R23](#r23) split per [D15](decisions.md#d15) into
+R23a → R23b → R23c → R23d → R23e, strictly in order; R23 → R26 ([D16](decisions.md#d16)).
+**No version tag between R23b and R23c** — images published from that window
+park every renewal in `submitted` with nothing to settle them.
 
 <a id="r1"></a>
 ### [x] R1 — Consumer bootstrap hygiene
@@ -311,16 +315,109 @@ count under delayed confirms; a slow-confirm scenario completes without
 unchanged.
 
 <a id="r23"></a>
-### [ ] R23 — SEPA mock-bank: async settlement ([D13](decisions.md#d13)) *(epic — split at execution)*
-**Scope (promotion-level):** new mock-bank service; payment flow redesign:
-submission → `submitted`, terminal state arrives later via the bank's webhook
-(settled / failed / chargeback), bank-side chaos parameters (delays, failure and
-chargeback rates), multiple per-country banks; schema via new migrations
-([G3](invariants.md#g3)); payload evolution per [G8](invariants.md#g8).
+### [ ] R23 — SEPA mock-bank: async settlement ([D13](decisions.md#d13), design [D15](decisions.md#d15)) *(epic — split 2026-07-26 into R23a–R23e below; check when all five are checked)*
 **Done when (epic-level):** a renewal is only `succeeded` after asynchronous bank
 confirmation; chaos parameters demonstrably shift outcomes; verify.sh models the
-async settlement deterministically (the [R8](#r8) recomputable-rule precedent);
-detailed sub-item acceptance criteria are written when the epic is split.
+async settlement deterministically (the [R8](#r8) recomputable-rule precedent).
+Sub-items execute strictly top-down, one per session. `renewal.requested` stays
+at v1 (additive only, [G8](invariants.md#g8)); the settlement message is a new
+internal contract starting at v1 ([D15](decisions.md#d15)).
+
+<a id="r23a"></a>
+### [ ] R23a — Mock bank service, standalone
+**Scope:** new `mock-bank/` (Python 3 + FastAPI, [D15](decisions.md#d15)),
+Dockerfile (multi-arch-buildable, [R18](#r18) precedent), compose service +
+healthcheck, CI job for the Python suite; no Java changes.
+`POST /collections` accepts a submission (collection id, amount in integer cents
++ currency per [G4](invariants.md#g4), debtor IBAN, mandate reference, due
+date); the outcome — `settled`, failed with an ISO reason (AM04 insufficient
+funds, AC04 closed account, MD01 no mandate), or settle-then-chargeback (MD06)
+— derives **deterministically from the debtor IBAN** ([R8](#r8) precedent);
+after the instance's configured delay profile (fixed/fast for verify, visible
+for demo), it POSTs a settlement notification (bank id, notification id,
+collection id, outcome, reason) to a configured webhook URL, signed
+HMAC-SHA256 with a per-bank shared secret, retrying on non-2xx with backoff and
+a bounded attempt cap — then gives up loudly (log + metric), never silently.
+**Done when:** pytest covers the IBAN rule engine, HMAC signing, and bounded
+retry; a curl'd submission with a rule-bearing IBAN delivers a signed webhook to
+a test sink after the configured delay; the compose service is healthy on a
+fresh `up`; verify.sh gains a mock-bank health check (a tightening,
+[G7](invariants.md#g7)); [quality.md](quality.md) gains a `mock-bank` module row.
+
+<a id="r23b"></a>
+### [ ] R23b — Submission reshape: renewals become SDD collections
+**Scope:** new migrations ([G3](invariants.md#g3)): `payment.status` grows
+`submitted`, payment rows gain bank id + collection id; customers gain IBAN +
+mandate reference + country (seeder-populated, outcome mix env-tunable via
+rule-bearing IBAN share); `BillingService` ends by submitting a collection to
+the bank — payment `submitted`, invoice/charge **not** finalized, subscription
+**not** advanced, message ACKed. The mock PSP retires with this item
+([D15](decisions.md#d15)): compose service, `payment.provider.*` config, and the
+architecture.md wire-contract section — **flag loudly**: the platform repo's P8
+onboarding stubs the PSP and consumes its env ([R19](#r19)); the session summary
+must call out every platform-facing removal and addition (bank base URL/secret
+env → truth table).
+**Done when:** an integration test proves consuming a renewal ends `submitted`
+with nothing finalized and no redelivery; duplicate delivery still yields
+exactly one submitted payment ([G2](invariants.md#g2)); verify.sh reshapes phase
+1: after drain, every due renewal has exactly one payment, **all** `submitted`,
+zero finalized invoices (exact counts — the reshape [D13](decisions.md#d13)/
+[D15](decisions.md#d15) sanction); config truth table updated ([G6](invariants.md#g6)).
+**Note:** until [R23c](#r23c), payments park in `submitted` by design — honest
+intermediate state, hence the no-tag window (see phase note above).
+
+<a id="r23c"></a>
+### [ ] R23c — Close the loop: webhook receiver, settlement inbox, queue, listener
+**Scope:** new migration: `settlement_inbox` (bank id, notification id, raw
+payload, received/published timestamps; **unique (bank id, notification id)** —
+the row doubles as its own outbox via `published_at`, [D15](decisions.md#d15));
+payment-service gains `POST /webhooks/bank/{bankId}`: HMAC failure → 401,
+unparseable → 400 (the bank's bounded retry then gives up loudly), valid →
+inbox insert in one transaction, duplicate insert → no-op 200; a relay
+publishes unpublished inbox rows to a new settlements queue (+DLQ, [D4](decisions.md#d4)
+topology) as the normalized bank-agnostic settlement contract v1 (notification
+id = idempotency key); a settlement listener finalizes: `settled` → charge
+settled, invoice paid, subscription advanced; `failed` → terminal + reason;
+Micrometer `settlements_processed_total{outcome}` + dashboard panels
+([D12](decisions.md#d12)); architecture.md message-flow section ([G6](invariants.md#g6)).
+**Done when:** integration tests prove (a) duplicate webhook → one inbox row,
+one finalization; (b) redelivered settlement message → no double finalize
+([G2](invariants.md#g2)); (c) poison settlement → DLQ within the bound while
+good ones keep flowing ([G5](invariants.md#g5)); verify.sh closes phase 2: after
+bank-delay + drain, **zero** payments stuck `submitted`, per-outcome exact
+counts match the IBAN-rule prediction, and reconciliation holds — every inbox
+row processed-or-DLQ'd, every terminal payment traces to an inbox row. A renewal
+is `succeeded` only after asynchronous confirmation: the epic's headline now
+holds. Tag proposal expected (end-to-end restored).
+
+<a id="r23d"></a>
+### [ ] R23d — Chargebacks + chaos profiles that shift outcomes
+**Scope:** new migration: `payment.status` grows `charged_back` (+ reason);
+mock-bank emits MD06 **after** a settled notification, deterministic from the
+IBAN rule with a configurable chargeback lag; the subscription **stays
+advanced** and nothing compensates — reacting is dunning ([D16](decisions.md#d16));
+bank delay-profile envs demonstrably shift the live picture (slow profile →
+visible `submitted` backlog on the [R21](#r21) dashboard); a new chaos-demo
+scene ([R22](#r22)) asserts the chargeback invariants.
+**Done when:** an integration test proves a settled payment receiving MD06 ends
+`charged_back` with invoice marked and subscription untouched, idempotent under
+webhook redelivery; verify.sh gains exact chargeback-count assertions from the
+IBAN rules ([G7](invariants.md#g7)); the demo scene runs green; the dashboard
+outcome split includes chargebacks. Re-triggers [R24](#r24).
+
+<a id="r23e"></a>
+### [ ] R23e — Multi-bank: per-country routing, one slow bank
+**Scope:** compose runs ≥2 instances of the same mock-bank image with different
+profiles (one fast, one slow — [D15](decisions.md#d15)'s "bank N+1 is a compose
+entry" claim, proven); consumer gains a bank registry (customer country →
+bank base URL + shared secret); seeder distributes countries; per-bank metric
+label + a per-bank dashboard row (settlement latency, outcome split);
+architecture.md bank-registry + truth-table update ([G6](invariants.md#g6)).
+**Done when:** a routing test proves country → bank is deterministic; verify.sh
+asserts per-bank attribution (each bank's inbox rows match its routed share,
+[G7](invariants.md#g7)); the dashboard visibly shows the slow bank lagging the
+fast one on the same load; the [R22](#r22) demo gains a slow-bank backlog-drain
+beat. Epic checkbox closes with this item.
 
 <a id="r24"></a>
 ### [ ] R24 — README screen recording
@@ -331,3 +428,16 @@ don't clone repos. The demo script makes recording reproducible, so re-recording
 after [R23](#r23) reshapes the flow is cheap and expected.
 **Done when:** the README embeds (or links) the recording near the top and every
 claim shown matches the measured numbers in quality.md/README.
+
+<a id="r26"></a>
+### [ ] R26 — Dunning: failed collections get a lifecycle ([D16](decisions.md#d16)) *(epic — blocked on [R23](#r23); split at execution)*
+**Scope (promotion-level):** consumes [R23](#r23)'s terminal outcomes — no new
+service, no notification channels. Per-reason retry policy (AM04 insufficient
+funds retriable on a schedule; AC04 closed account and MD01 no mandate are not),
+a `past_due` grace lifecycle on the subscription, bounded attempts ending in
+cancellation; schema via new migrations ([G3](invariants.md#g3)).
+**Done when (epic-level):** a retriable failed collection demonstrably
+re-collects on schedule and settles or exhausts into cancellation; a chargeback
+moves the subscription through the grace lifecycle instead of being a dead-end
+fact; verify.sh models the retry outcomes deterministically; detailed sub-item
+acceptance criteria are written when the epic is split.

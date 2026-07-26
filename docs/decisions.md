@@ -236,3 +236,80 @@ existing page deadline and keeps the failure semantics identical.
 in flight covers the measured 5k msg/s page baseline ([D10](decisions.md#d10)) with
 margin. Up to 100 idle channels stay cached on a quiet connection — well under
 `channelMax` and cheap on the broker.
+
+## D15 — R23 execution design: settlement inbox behind the queue, bank-agnostic contract, FastAPI mock bank — 2026-07-26 — active
+<a id="d15"></a>
+Execution-level decisions for [D13](decisions.md#d13)'s epic, agreed in the
+2026-07-26 design discussion; where this differs from the overnight design brief
+(gitignored `notes/`), this entry wins. The split itself lives in
+[R23a–R23e](roadmap.md#r23).
+**Flow:** processing a renewal ends by *submitting* an SDD collection to a mock
+bank — `payment.status = 'submitted'`, message ACKed, nothing finalized. The bank
+applies its chaos profile and reports the outcome later via a signed webhook
+(HMAC-SHA256, per-bank shared secret). Renewals **become** direct-debit
+collections: the mock PSP was always a stand-in for the bank and is superseded
+within the epic, not run alongside ([D5](decisions.md#d5)'s fake-counterparty
+role passes to the bank; its deterministic-outcome trick is inherited, see below).
+**Receiver placement:** the webhook endpoint lives on payment-service, not a new
+gateway service — [D13](decisions.md#d13) grants exactly one new service (the
+bank), and the receiver's correctness depends on writing tables payment-service
+owns in one transaction. Service boundaries follow data ownership, not transport.
+**Inbox pattern with a publish relay:** the receiver's transaction inserts the
+raw notification into `settlement_inbox` (unique on bank id + notification id;
+duplicate insert → no-op, still 200) and *only then* acks — after a 200 the bank
+never resends, so the durable row is what makes the 200 truthful. A relay
+publishes unpublished inbox rows to a settlements queue (the row doubles as its
+own outbox via `published_at` — the [D1](decisions.md#d1) dual-write answer,
+mirrored inbound), and a settlement listener finalizes: the outbox on the way
+out, an inbox on the way in. **Why the queue hop** instead of finalizing inside
+the webhook transaction: it routes settlements through the pipeline's existing
+[G2](invariants.md#g2)/[G5](invariants.md#g5) machinery — idempotent redelivery
+by constraint, poison to a bounded DLQ instead of an endless bank-retry loop —
+and settlement processing inherits the queue-depth scaling story (a slow bank's
+backlog drains like any other backlog).
+**Bank-agnostic contract — accepted simplification:** the receiver normalizes
+every bank's callback into one versioned internal settlement message
+([G8](invariants.md#g8) discipline, new contract at v1); the source bank is a
+field, which is what makes bank N+1 a compose entry. Voiced deliberately: in the
+real industry a pure bank-agnostic edge often *doesn't* survive, because each
+bank relationship carries its own surface — mTLS certs, IP allowlisting,
+protocol quirks, rate limits — and at scale that ownership becomes a dedicated
+bank-gateway service. We knowingly accept that simplification; the normalization
+seam is exactly where such a gateway would split off if ever promoted (which
+would need its own decision entry).
+**Mock bank stack:** Python 3 + FastAPI, in-repo (`mock-bank/`), one generic
+image configured per instance via env — deliberately polyglot, and a fit:
+delayed outbound callbacks are natural in asyncio, where WireMock can neither
+hold per-collection state nor schedule outbound calls. Outcomes are **derived
+deterministically from the debtor IBAN** ([R8](roadmap.md#r8)'s recomputable-rule
+precedent): the seeder controls the outcome mix in aggregate, verify.sh predicts
+it exactly per row; only *delays* are bank-profile config (fast for verify,
+visible for demo).
+**SEPA realism boundary:** a simplified SDD-Core-flavored model — real ISO 20022
+reason codes (AC04 closed account, AM04 insufficient funds, MD01 no mandate,
+MD06 payer objection = our chargeback), pain.008/pain.002/camt.054 vocabulary in
+docs, rulebook timelines scaled from days to configurable seconds. Webhook
+delivery itself is a PSP-style fiction (GoCardless-shaped): real banks report
+via file channels (EBICS) — stated honestly in the docs. Sources and the
+real→Payfold mapping live in gitignored `notes/sepa-references.md`.
+**Dunning boundary:** a chargeback is a recorded fact (terminal state + reason);
+the subscription stays advanced and nothing compensates — reacting is dunning,
+promoted separately with a gate in [D16](decisions.md#d16).
+
+## D16 — Dunning: promoted from non-goal to a gated future epic — 2026-07-26 — active
+<a id="d16"></a>
+Promotes the "no dunning" non-goal into [R26](roadmap.md#r26), **blocked on
+[R23](roadmap.md#r23)**. User-confirmed 2026-07-26: dunning is realistic,
+industry-precise vocabulary, and demonstrates domain knowledge — a chargeback or
+failed collection is where a billing system's real work starts. The gate exists
+because R23 *produces* the inputs dunning consumes (terminal `failed` /
+`charged_back` states with ISO reason codes); building it earlier would invent
+its own triggers. R23's only obligation to dunning: record terminal outcomes
+richly enough — state, reason code, timestamps — that R26 needs no schema rework
+of R23's tables ([G3](invariants.md#g3) makes retrofits expensive).
+**Promotion-level scope for R26** (split at execution, like R23): per-reason
+retry policy (AM04 insufficient funds is retriable; AC04 closed account and MD01
+no mandate are not), a `past_due` grace lifecycle on the subscription, bounded
+attempts ending in cancellation. No new service; no notification channels
+(email etc. stay out).
+**Boundary unchanged:** proration, refunds-as-a-flow, and tax remain non-goals.
