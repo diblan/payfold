@@ -24,8 +24,9 @@ public class CustomerSeeder {
     private static final String COUNT_SQL = "SELECT COUNT(*) FROM customer";
 
     private static final String INSERT_SQL = """
-            INSERT INTO customer (id, email, name, locale, status, created_at)
-            VALUES (?, ?, ?, ?, ?, now())
+            INSERT INTO customer (id, email, name, locale, status, payment_method,
+            debtor_iban, mandate_reference, country, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, now())
             """;
 
     // Adjust to your taste (must sum ~1.0; code normalizes anyway)
@@ -42,6 +43,13 @@ public class CustomerSeeder {
         // ---- Config ----
         String dataDir = args.length > 0 ? args[0] : "data";
         int howMany = args.length > 1 ? Integer.parseInt(args[1]) : seedTarget();   // number of customers to insert
+        int sddPercent = seedPercent("SEED_SDD_PERCENT", 20);
+        int sddRulePercent = seedPercent("SEED_SDD_RULE_PERCENT", 4);
+        if (sddRulePercent < 0 || sddPercent < sddRulePercent || sddPercent > 100) {
+            throw new IllegalStateException(
+                    "Seed payment-method percentages must satisfy 0 <= "
+                            + "SEED_SDD_RULE_PERCENT <= SEED_SDD_PERCENT <= 100");
+        }
 
         // Email numbering starts at the current row count: every run draws from a
         // fresh, disjoint number range, so customer_email_key (UNIQUE) cannot trip
@@ -83,11 +91,13 @@ public class CustomerSeeder {
 
         // ---- Generate + insert ----
         Random rnd = new Random();
+        int sddCount = 0;
         try (Connection conn = DriverManager.getConnection(url, user, pass)) {
             conn.setAutoCommit(false);
             try (PreparedStatement ps = conn.prepareStatement(INSERT_SQL)) {
 
                 for (int i = 0; i < howMany; i++) {
+                    int n = offset + i;
                     Loc loc = pickLocale(weights, rnd);
 
                     String first = pickRandom(firstNames.get(loc), rnd);
@@ -95,15 +105,32 @@ public class CustomerSeeder {
                     String fullName = first + " " + last;
 
                     // email: first.last-<seq> @example.<tld>; <seq> is globally unique
-                    String localPart = slugify(first) + "." + slugify(last) + "-" + (offset + i);
+                    String localPart = slugify(first) + "." + slugify(last) + "-" + n;
                     String domain = "example." + loc.code; // be/nl/fr/en
                     String email = (localPart + "@" + domain).toLowerCase(Locale.ROOT);
+                    boolean sdd = n % 100 < sddPercent;
+                    String debtorIban = null;
+                    String mandateReference = null;
+                    String country = null;
+                    if (sdd) {
+                        String suffix = n % 100 < sddRulePercent
+                                ? new String[]{"99", "98", "97", "96"}[n % 4]
+                                : "01";
+                        debtorIban = "BE68" + String.format("%010d", n) + suffix;
+                        mandateReference = "MNDT-" + n;
+                        country = countryFor(loc);
+                        sddCount++;
+                    }
 
                     ps.setObject(1, java.util.UUID.randomUUID());
                     ps.setString(2, email);
                     ps.setString(3, fullName);
                     ps.setString(4, loc.code);
                     ps.setString(5, STATUSES[rnd.nextInt(STATUSES.length)]);
+                    ps.setString(6, sdd ? "sdd" : "card");
+                    ps.setString(7, debtorIban);
+                    ps.setString(8, mandateReference);
+                    ps.setString(9, country);
                     ps.addBatch();
                     if ((i + 1) % 1000 == 0) ps.executeBatch();   // bounded batch, same cadence as SubscriptionSeederDueToday
 
@@ -116,7 +143,8 @@ public class CustomerSeeder {
             conn.commit();
         }
 
-        System.out.println("✅ Inserted " + howMany + " customers with locale-aware names & emails.");
+        System.out.println("✅ Inserted " + howMany
+                + " customers with locale-aware names & emails (" + sddCount + " SDD).");
     }
 
     // Seed target: CLI arg wins, then the SEED_CUSTOMERS env var (passed through by
@@ -126,6 +154,21 @@ public class CustomerSeeder {
         String v = System.getenv("SEED_CUSTOMERS");
         if (v == null || v.isBlank()) return 15000;
         return Integer.parseInt(v.trim());
+    }
+
+    private static int seedPercent(String name, int defaultValue) {
+        String v = System.getenv(name);
+        if (v == null || v.isBlank()) return defaultValue;
+        return Integer.parseInt(v.trim());
+    }
+
+    private static String countryFor(Loc loc) {
+        return switch (loc) {
+            case BE -> "BE";
+            case NL -> "NL";
+            case FR -> "FR";
+            case EN -> "IE";
+        };
     }
 
     // Read weight overrides from -Dw.be=.. etc.

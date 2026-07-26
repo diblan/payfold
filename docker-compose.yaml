@@ -117,6 +117,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       SEED_CUSTOMERS: ${SEED_CUSTOMERS:-15000}
+      SEED_SDD_PERCENT: ${SEED_SDD_PERCENT:-20}
+      SEED_SDD_RULE_PERCENT: ${SEED_SDD_RULE_PERCENT:-4}
     depends_on:
       postgres:
         condition: service_healthy
@@ -184,6 +186,8 @@ services:
       RABBITMQ_QUEUE: ${RABBITMQ_QUEUE}
       RABBITMQ_ROUTINGKEY: ${RABBITMQ_ROUTINGKEY}
       PAYMENT_PROVIDER_BASE_URL: http://mock-psp:8080
+      BANK_ID: ${BANK_ID:-bank-a}
+      BANK_BASE_URL: http://mock-bank:8080
     ports:
       - "${CONSUMER_HTTP_PORT:-8081}-${CONSUMER_HTTP_PORT_END:-8083}:8080"
     depends_on:
@@ -192,6 +196,8 @@ services:
       rabbitmq:
         condition: service_healthy
       mock-psp:
+        condition: service_healthy
+      mock-bank:
         condition: service_healthy
       flyway:
         condition: service_completed_successfully

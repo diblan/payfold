@@ -351,7 +351,7 @@ fresh `up`; verify.sh gains a mock-bank health check (a tightening,
 [G7](invariants.md#g7)); [quality.md](quality.md) gains a `mock-bank` module row.
 
 <a id="r23b"></a>
-### [ ] R23b — Payment methods: the SDD cohort submits, cards keep flowing
+### [x] R23b — Payment methods: the SDD cohort submits, cards keep flowing
 **Scope:** new migrations ([G3](invariants.md#g3)): customers gain
 `payment_method` (`card` | `sdd`, seeded mix env-tunable per
 [D17](decisions.md#d17)) and, for SDD, IBAN + mandate reference + country

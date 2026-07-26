@@ -11,6 +11,7 @@
 # It also requires Prometheus to be scraping both services and Grafana to serve
 # the provisioned pipeline dashboard anonymously.
 # It also requires the standalone mock-bank service to report healthy.
+# It asserts the SDD cohort parks exactly in submitted until R23c settles it.
 #
 # Usage:
 #   scripts/verify.sh [--no-up] [--timeout SECONDS] [--poison|--no-poison]
@@ -133,12 +134,15 @@ bank_up() { curl -fsS "http://localhost:${BANK_PORT}/health" 2>/dev/null | grep 
 
 outbox_drained() { [[ "$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NULL')" == "0" ]]; }
 
-# A today-due outbox row is correctly billed when a payment exists under its
-# derived idempotency key with EXACTLY the terminal status the deterministic
+# A today-due card outbox row is correctly billed when a payment exists under
+# its derived idempotency key with EXACTLY the terminal status the deterministic
 # mock-PSP rule predicts: 'failed' when the subscription id's last hex char is
 # in [$PSP_FAIL_HEX], 'succeeded' otherwise.
 MISMATCHED_SQL="SELECT count(*) FROM renewal_outbox o
+JOIN subscription s ON s.id = o.subscription_id
+JOIN customer c ON c.id = s.customer_id
 WHERE o.due_date = current_date
+  AND c.payment_method = 'card'
   AND NOT EXISTS (
     SELECT 1 FROM payment p
     WHERE p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
@@ -146,6 +150,23 @@ WHERE o.due_date = current_date
                           THEN 'failed' ELSE 'succeeded' END
   )"
 all_billed() { [[ "$(q "$MISMATCHED_SQL")" == "0" ]]; }
+
+# R23b: an SDD renewal's terminal state does not exist yet — the collection is
+# submitted and parks until R23c closes the loop. The exact prediction: every
+# due SDD renewal has exactly one payment, submitted, attributed to a bank
+# and a collection. (Between R23b and R23c this parking is the design.)
+SDD_MISMATCHED_SQL="SELECT count(*) FROM renewal_outbox o
+JOIN subscription s ON s.id = o.subscription_id
+JOIN customer c ON c.id = s.customer_id
+WHERE o.due_date = current_date
+  AND c.payment_method = 'sdd'
+  AND NOT EXISTS (
+    SELECT 1 FROM payment p
+    WHERE p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
+      AND p.status = 'submitted' AND p.channel = 'SEPA_DD'
+      AND p.bank_id IS NOT NULL AND p.collection_id IS NOT NULL
+  )"
+all_sdd_submitted() { [[ "$(q "$SDD_MISMATCHED_SQL")" == "0" ]]; }
 
 queue_depth() { # queue name -> message count, or "unreachable"
   local body
@@ -189,7 +210,7 @@ producer_prometheus_ready() {
 }
 consumer_prometheus_ready() {
   local processed
-  processed="$(consumer_prom_sum '^renewals_processed_total\{outcome="(succeeded|failed)"\}')"
+  processed="$(consumer_prom_sum '^renewals_processed_total\{outcome="(succeeded|failed|submitted)"\}')"
   [[ "$processed" != "absent" && "$processed" != "unreachable" ]]
 }
 main_queue_empty() { [[ "$(queue_depth "$RMQ_QUEUE")" == "0" ]]; }
@@ -324,7 +345,7 @@ wait_for "grafana serves the provisioned pipeline dashboard" grafana_dashboard_p
 
 M_INS_BEFORE="$(prom_val "$PRODUCER_PORT" '^outbox_inserted_total ')"
 M_PUB_BEFORE="$(prom_val "$PRODUCER_PORT" '^outbox_published_total ')"
-M_PROC_BEFORE="$(consumer_prom_sum '^renewals_processed_total\{outcome="(succeeded|failed)"\}')"
+M_PROC_BEFORE="$(consumer_prom_sum '^renewals_processed_total\{outcome="(succeeded|failed|submitted)"\}')"
 DB_OUTBOX_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox')"
 DB_PUB_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NOT NULL')"
 
@@ -343,9 +364,23 @@ if [[ -n "$N_DUE" && "$N_DUE" -gt 0 ]]; then
 else
   fail "outbox contains renewals due today" "count=${N_DUE:-error}"
 fi
+N_CARD_DUE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card'")"
+N_SDD_DUE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'sdd'")"
+if [[ "$N_CARD_DUE" =~ ^[0-9]+$ && "$N_SDD_DUE" =~ ^[0-9]+$ && $((N_CARD_DUE + N_SDD_DUE)) == "$N_DUE" ]]; then
+  pass "due renewals partition into card + sdd cohorts (${N_CARD_DUE} card / ${N_SDD_DUE} sdd)"
+else
+  fail "due renewals partition into card + sdd cohorts" "card=${N_CARD_DUE:-error} sdd=${N_SDD_DUE:-error} due=${N_DUE:-error}"
+fi
+SEED_SDD_PERCENT_VAL="$(env_val SEED_SDD_PERCENT 20)"
+if [[ "$SEED_SDD_PERCENT_VAL" != "0" && "$N_SDD_DUE" == "0" ]]; then
+  fail "SDD cohort present when SEED_SDD_PERCENT > 0" "N_SDD_DUE=0 with SEED_SDD_PERCENT=${SEED_SDD_PERCENT_VAL}"
+else
+  pass "SDD cohort present when SEED_SDD_PERCENT > 0 (${N_SDD_DUE})"
+fi
 
 wait_for "outbox fully published"                outbox_drained
-wait_for "every due renewal reached its predicted terminal payment (PSP rule [${PSP_FAIL_HEX}])" all_billed
+wait_for "every due card renewal reached its predicted terminal payment (PSP rule [${PSP_FAIL_HEX}])" all_billed
+wait_for "every due SDD renewal parked exactly one submitted collection" all_sdd_submitted
 
 DB_OUTBOX_AFTER="$(q 'SELECT count(*) FROM renewal_outbox')"
 DB_PUB_AFTER="$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NOT NULL')"
@@ -370,7 +405,7 @@ published_metric_delta_matches() {
 }
 processed_metric_delta_matches() {
   local current
-  current="$(consumer_prom_sum '^renewals_processed_total\{outcome="(succeeded|failed)"\}')"
+  current="$(consumer_prom_sum '^renewals_processed_total\{outcome="(succeeded|failed|submitted)"\}')"
   [[ "$current" =~ ^[0-9]+$ ]] && (( current - M_PROC_BEFORE == DB_PUB_DELTA ))
 }
 batch_job_timer_recorded() {
@@ -392,19 +427,39 @@ else
     "invalid baseline=${M_PUB_BEFORE} or DB delta=${DB_PUB_DELTA}"
 fi
 if [[ "$M_PROC_BEFORE" =~ ^[0-9]+$ && "$DB_PUB_DELTA" =~ ^-?[0-9]+$ ]]; then
-  wait_for "renewals_processed_total{succeeded,failed} delta matches rows published this run (${DB_PUB_DELTA})" processed_metric_delta_matches
+  wait_for "renewals_processed_total{succeeded,failed,submitted} delta matches rows published this run (${DB_PUB_DELTA})" processed_metric_delta_matches
 else
-  fail "renewals_processed_total{succeeded,failed} delta matches rows published this run (${DB_PUB_DELTA})" \
+  fail "renewals_processed_total{succeeded,failed,submitted} delta matches rows published this run (${DB_PUB_DELTA})" \
     "invalid baseline=${M_PROC_BEFORE} or DB delta=${DB_PUB_DELTA}"
 fi
 wait_for "spring_batch_job_seconds recorded on producer" batch_job_timer_recorded
 
-EXPECTED_FAILED="$(q "SELECT count(*) FROM renewal_outbox o WHERE o.due_date = current_date AND right(o.subscription_id::text, 1) ~ '[${PSP_FAIL_HEX}]'")"
-ACTUAL_FAILED="$(q "SELECT count(*) FROM payment WHERE status = 'failed' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
+EXPECTED_FAILED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(o.subscription_id::text, 1) ~ '[${PSP_FAIL_HEX}]'")"
+ACTUAL_FAILED="$(q "SELECT count(*) FROM payment WHERE status = 'failed' AND channel = 'CARD' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
 if [[ -n "$EXPECTED_FAILED" && "$ACTUAL_FAILED" == "$EXPECTED_FAILED" ]]; then
   pass "failed payment count matches deterministic PSP rule exactly (PSP_FAIL_HEX=[${PSP_FAIL_HEX}], failed=${ACTUAL_FAILED}/${N_DUE})"
 else
   fail "failed payment count matches deterministic PSP rule exactly" "expected=${EXPECTED_FAILED:-error} actual=${ACTUAL_FAILED:-error}"
+fi
+
+ACTUAL_SUBMITTED="$(q "SELECT count(*) FROM payment WHERE status = 'submitted' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
+if [[ -n "$N_SDD_DUE" && "$ACTUAL_SUBMITTED" == "$N_SDD_DUE" ]]; then
+  pass "submitted payment count matches the SDD cohort exactly (${ACTUAL_SUBMITTED}/${N_SDD_DUE})"
+else
+  fail "submitted payment count matches the SDD cohort exactly" "expected=${N_SDD_DUE:-error} actual=${ACTUAL_SUBMITTED:-error}"
+fi
+SUBMITTED_FINALIZED="$(q "SELECT count(*) FROM payment p JOIN charge c ON c.id = p.charge_id WHERE p.status = 'submitted' AND c.status <> 'pending'")"
+if [[ "$SUBMITTED_FINALIZED" == "0" ]]; then
+  pass "no submitted payment has a finalized charge"
+else
+  fail "no submitted payment has a finalized charge" "count=${SUBMITTED_FINALIZED:-error}"
+fi
+SDD_ADVANCED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id
+WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND s.renewed_at >= current_date")"
+if [[ "$SDD_ADVANCED" == "0" ]]; then
+  pass "no submitted SDD renewal advanced its subscription"
+else
+  fail "no submitted SDD renewal advanced its subscription" "count=${SDD_ADVANCED:-error}"
 fi
 
 FAILED_FINALIZED="$(q "SELECT count(*) FROM payment p JOIN charge c ON c.id = p.charge_id WHERE p.status = 'failed' AND c.status <> 'pending'")"
@@ -414,8 +469,9 @@ else
   fail "no failed payment has a finalized charge" "count=${FAILED_FINALIZED:-error}"
 fi
 
-FAILED_ADVANCED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id
+FAILED_ADVANCED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id
 WHERE o.due_date = current_date
+  AND c.payment_method = 'card'
   AND right(o.subscription_id::text, 1) ~ '[${PSP_FAIL_HEX}]'
   AND s.renewed_at >= current_date")"
 if [[ "$FAILED_ADVANCED" == "0" ]]; then

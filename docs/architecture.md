@@ -27,7 +27,7 @@ Honesty table:
 ## Component map
 
 ```
-                 ┌─────────────┐   Flyway V1–V5    ┌──────────────┐
+                 ┌─────────────┐   Flyway V1–V6    ┌──────────────┐
                  │   flyway    ├──────────────────▶│              │
                  └─────────────┘                   │  postgres:18 │
                  ┌─────────────┐  SEED_CUSTOMERS   │   (payfold)  │
@@ -59,16 +59,11 @@ Honesty table:
                  │   renewal-consumer   ├─▶ payment / subscription
                  │   :8081-83 (host)    │   upserts via unique
                  └──────────┬───────────┘   constraints
-                            │ POST /psp/charges
-                            ▼
-                 ┌──────────────────────┐
-                 │ mock-psp (WireMock)  │  declines iff last hex char of
-                 │ :8084 (host)         │  subscription_id ∈ PSP_FAIL_HEX
-                 └──────────────────────┘
-                 ┌──────────────────────┐
-                 │ mock-bank (FastAPI)  │  SEPA SDD counterparty (R23a):
-                 │ :8085 (host)         │  IBAN-suffix outcome rules, signed
-                 └──────────────────────┘  webhooks; standalone until R23b
+                            ├── POST /psp/charges ──▶ mock-psp (WireMock)
+                            │                         :8084; card verdict
+                            └── POST /collections ──▶ mock-bank (FastAPI)
+                                                      :8085; SDD submission,
+                                                      signed webhooks
 ```
 
 ## The renewal job (producer)
@@ -180,6 +175,16 @@ unique constraint (this *is* the idempotency mechanism, [D2](decisions.md#d2)):
 | `PspClient.charge` | — | HTTP `POST /psp/charges` to the mock PSP; called only while the payment is 'pending' |
 | `markPaymentSucceeded` / `markPaymentFailed` | `payment` | terminal status + `completed_at` from the PSP outcome; 'failed' returns without finalizing |
 | `finalizeBilling` | `charge`, `invoice`, `subscription` | sets settled/paid, advances `renewed_at` to `period_end` at 09:00 |
+
+After the shared invoice, charge, and payment upserts, the customer's payment
+method selects the counterparty. Cards keep the synchronous PSP path unchanged.
+SDD submits `POST /collections` with `collection_id` equal to the payment
+idempotency key; the bank's `200` duplicate contract deduplicates a resubmission
+after a crash. Acceptance marks the payment `submitted` with `bank_id` and
+`collection_id`, finalizes nothing, and ACKs the renewal. These payments park in
+`submitted` until R23c adds the settlement receiver. A bank transport failure is
+the absence of a verdict, never a failed payment: it throws and rides the R5
+bounded listener retry to the DLQ ([G5](invariants.md#g5)).
 
 Provider declines, timeouts, 5xx responses, and unreachable-provider errors are
 business failures: the payment becomes `failed`, the message is ACKed, and nothing is
@@ -348,11 +353,11 @@ Micrometer converts dots in meter names to underscores for Prometheus and append
 | `outbox.inserted` | `outbox_inserted_total` | Counter | none | By the number of rows inserted immediately after the scan SQL update |
 | `outbox.published` | `outbox_published_total` | Counter | none | By the number of confirm-gated rows immediately after their `published_at` batch update |
 | `outbox.returned` | `outbox_returned_total` | Counter | none | Once per message the broker returned as unroutable, inside the confirm-future completion that reports the row unconfirmed |
-| `renewals.processed` | `renewals_processed_total{outcome="..."}` | Counter | `outcome=succeeded \| failed \| invalid` | Per processed delivery at its decision point: after successful finalization, at either terminal-failure return, or when validation rejects the message |
+| `renewals.processed` | `renewals_processed_total{outcome="..."}` | Counter | `outcome=succeeded \| failed \| invalid \| submitted` | Per processed delivery at its decision point: after successful finalization, at either terminal-failure return, when validation rejects the message, or after an SDD collection is parked submitted |
 
 All counter series are registered eagerly and therefore render as `0.0` from boot;
 `verify.sh` depends on that property. The renewal outcome taxonomy is bounded to
-`succeeded`, `failed`, and `invalid`. Transient or unexpected failures increment no
+`succeeded`, `failed`, `invalid`, and `submitted`. Transient or unexpected failures increment no
 outcome counter because they have no decided business outcome; retries remain visible
 through the listener timer's `result="failure"` tag.
 
@@ -419,6 +424,7 @@ version bump and a decision entry; see [D8](decisions.md#d8).
 | V3 | `renewal_outbox` + the unique constraints in the table above + supporting indexes |
 | V4 | Spring Batch 5 metadata schema (producer sets `spring.batch.jdbc.initialize-schema: never`; Flyway is the sole schema authority, [G3](invariants.md#g3)) |
 | V5 | one yearly `plan` row ('Premium Annual') so due-today seeding has a valid renewal preimage on month-end clamp days ([R16](roadmap.md#r16)); weighted 0 in the seeder — used only via the clamp fallback |
+| V6 | customer payment method plus SDD debtor material; payment bank and collection attribution for submitted collections |
 
 `renewal_outbox`: `id, subscription_id, due_date, payload jsonb, created_at, published_at`.
 Unpublished = `published_at IS NULL`.
@@ -442,6 +448,9 @@ Every remaining `application.yaml` key has a real consumer.
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |
 | `payment.provider.base-url` (consumer) | `PaymentProviderProperties`, `PspClient`; compose overrides with `PAYMENT_PROVIDER_BASE_URL` | alive |
 | `payment.provider.timeout-ms` (consumer) | `PaymentProviderProperties`, `PspClient` connect + read timeout | alive |
+| `bank.id` (consumer) | `BankProperties`, `BillingService`; compose overrides with `BANK_ID` | alive |
+| `bank.base-url` (consumer) | `BankProperties`, `BankClient`; compose overrides with `BANK_BASE_URL` | alive |
+| `bank.timeout-ms` (consumer) | `BankProperties`, `BankClient` connect + read timeout | alive |
 | `spring.rabbitmq.listener.simple.*` (consumer) | Spring Boot AMQP autoconfig + `ListenerRetryConfig` (`max-attempts`) | alive |
 | `management.endpoints.web.exposure.include` (producer) | actuator exposure for `health`, `info`, `metrics`, `prometheus`, and `renewal-job` | alive |
 | `management.endpoints.web.exposure.include` (consumer) | actuator exposure for `health`, `info`, `metrics`, and `prometheus`; the compose healthcheck relies on `health` | alive |
@@ -453,12 +462,15 @@ and RabbitMQ; local `.env` values can still select bind-mount paths. The consume
 compose healthcheck hits `/actuator/health`, served by actuator since
 [R1](roadmap.md#r1).
 
-Seed size is compose-only configuration, deliberately absent from the table above
-(the table covers `application.yaml` keys): `SEED_CUSTOMERS` (default 15000) is read
-by `CustomerSeeder` in the seed container ([R12](roadmap.md#r12)). Every seeded
-subscription is due on the seed day, so the value directly sets the size of the
-day's renewal batch; `scripts/load-test.sh` adds more due-today volume to a running
-stack without a reseed.
+Seed configuration is compose-only, deliberately absent from the table above
+(the table covers `application.yaml` keys): `SEED_CUSTOMERS` (default 15000),
+`SEED_SDD_PERCENT` (default 20), and `SEED_SDD_RULE_PERCENT` (default 4) are
+read by `CustomerSeeder` in the seed container. The latter two deterministically
+partition customers and assign rule-bearing IBAN suffixes from the global
+customer number. Every seeded subscription is due on the seed day, so
+`SEED_CUSTOMERS` directly sets the size of the day's renewal batch;
+`scripts/load-test.sh` adds more due-today volume to a running stack without a
+reseed.
 
 The mock bank is likewise configured entirely by compose-only envs, deliberately
 absent from the `application.yaml` table: `BANK_HTTP_PORT`, `BANK_ID`,
@@ -508,9 +520,9 @@ architecture-independent jar once instead of emulating Maven under QEMU.
 | Image (`ghcr.io/diblan/…`) | Contents | Run pattern | Config (env) |
 |---|---|---|---|
 | `payfold-renewal-producer` | producer Spring Boot jar | long-running service; port 8080, `/actuator/health` | the compose `renewal-producer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_ROUTINGKEY`, `APP_TIMEZONE`, `APP_SCHEDULECRON`, `TZ` |
-| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, `PAYMENT_PROVIDER_BASE_URL`, `TZ` |
+| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, `PAYMENT_PROVIDER_BASE_URL`, `BANK_ID`, `BANK_BASE_URL`, `TZ` |
 | `payfold-migrations` | `flyway/flyway:11` + `db-migrations/V*.sql`, `CMD ["migrate"]` | run-to-completion Job; exit 0 = success; re-run on a current schema is a no-op (asserted by `verify.sh`) | `FLYWAY_URL`, `FLYWAY_USER`, `FLYWAY_PASSWORD`, `FLYWAY_CONNECT_RETRIES` (image default 30) |
-| `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS` |
+| `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS`, `SEED_SDD_PERCENT`, `SEED_SDD_RULE_PERCENT` |
 | `payfold-mock-bank` | FastAPI mock bank (source + pinned pure-python deps) | long-running service; port 8080, `/health` | `BANK_ID`, `BANK_SCHEME`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `TZ` |
 
 Compose builds `payfold-migrations` and `payfold-seed-data-gen` itself (the flyway

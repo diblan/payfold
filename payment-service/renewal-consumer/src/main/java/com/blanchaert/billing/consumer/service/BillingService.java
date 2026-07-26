@@ -1,5 +1,7 @@
 package com.blanchaert.billing.consumer.service;
 
+import com.blanchaert.billing.consumer.bank.BankClient;
+import com.blanchaert.billing.consumer.config.BankProperties;
 import com.blanchaert.billing.consumer.model.RenewalRequested;
 import com.blanchaert.billing.consumer.psp.PspChargeOutcome;
 import com.blanchaert.billing.consumer.psp.PspClient;
@@ -21,16 +23,23 @@ public class BillingService {
 
     private final JdbcTemplate jdbc;
     private final PspClient psp;
+    private final BankClient bank;
+    private final BankProperties bankProps;
     private final Counter processedSucceeded;
     private final Counter processedFailed;
     private final Counter processedInvalid;
+    private final Counter processedSubmitted;
 
-    public BillingService(JdbcTemplate jdbc, PspClient psp, MeterRegistry meters) {
+    public BillingService(JdbcTemplate jdbc, PspClient psp, BankClient bank,
+                          BankProperties bankProps, MeterRegistry meters) {
         this.jdbc = jdbc;
         this.psp = psp;
+        this.bank = bank;
+        this.bankProps = bankProps;
         this.processedSucceeded = processedCounter(meters, "succeeded");
         this.processedFailed = processedCounter(meters, "failed");
         this.processedInvalid = processedCounter(meters, "invalid");
+        this.processedSubmitted = processedCounter(meters, "submitted");
     }
 
     public void process(RenewalRequested evt) {
@@ -39,6 +48,23 @@ public class BillingService {
         } catch (InvalidRenewalMessageException e) {
             processedInvalid.increment();
             throw e;
+        }
+
+        CustomerBilling customerBilling = jdbc.query("""
+                        SELECT payment_method, debtor_iban, mandate_reference
+                        FROM customer
+                        WHERE id = ?
+                        """,
+                rs -> rs.next()
+                        ? new CustomerBilling(
+                                rs.getString("payment_method"),
+                                rs.getString("debtor_iban"),
+                                rs.getString("mandate_reference"))
+                        : null,
+                evt.customer_id());
+        if (customerBilling == null) {
+            processedInvalid.increment();
+            throw invalid(evt, "customer_id", "customer not found");
         }
 
         LocalDate dueDate = LocalDate.parse(evt.due_date());
@@ -50,7 +76,30 @@ public class BillingService {
         // 3) Upsert charge linked to subscription + invoice + due_date
         UUID chargeId = upsertCharge(evt.subscription_id(), invoiceId, evt.amount_cents(), evt.currency(), dueDate);
         // 4) Create payment row (pending) guarded by idempotency unique key
-        UUID paymentId = upsertPayment(idem, chargeId, evt.amount_cents(), evt.currency());
+        String channel = "sdd".equals(customerBilling.paymentMethod()) ? "SEPA_DD" : "CARD";
+        UUID paymentId = upsertPayment(idem, chargeId, evt.amount_cents(), evt.currency(), channel);
+        if ("sdd".equals(customerBilling.paymentMethod())) {
+            String sddStatus = jdbc.queryForObject(
+                    "SELECT status FROM payment WHERE id = ?", String.class, paymentId);
+            if ("pending".equals(sddStatus)) {
+                // Submit BEFORE flipping status: a crash after the bank accepted is
+                // healed by redelivery re-submitting the same collection_id, which
+                // the bank deduplicates (200 duplicate). collection_id IS the
+                // idempotency key: one renewal, one collection, forever.
+                bank.submitCollection(idem, evt.amount_cents(), evt.currency(),
+                        customerBilling.debtorIban(), customerBilling.mandateReference(), evt.due_date());
+                jdbc.update("""
+                                UPDATE payment
+                                SET status = 'submitted', bank_id = ?, collection_id = ?
+                                WHERE id = ? AND status = 'pending'
+                                """,
+                        bankProps.id(), idem, paymentId);
+            }
+            // Parked or already handled: settlement finalizes via the R23c inbox
+            // spine, never here. Nothing is finalized on the submission path.
+            processedSubmitted.increment();
+            return;
+        }
         // 5) Call the PSP only for a pending payment; failed payments are terminal.
         String status = jdbc.queryForObject("SELECT status FROM payment WHERE id = ?", String.class, paymentId);
         if ("failed".equals(status)) {
@@ -159,14 +208,14 @@ public class BillingService {
     }
 
     private UUID upsertPayment(String idempotencyKey, UUID chargeId, long
-            amount, String currency) {
+            amount, String currency, String channel) {
         // Guard with UNIQUE(idempotency_key)
         jdbc.update("""
                 INSERT INTO payment(id, charge_id, amount_cents, currency, channel,
                 idempotency_key, status)
-                VALUES (?, ?, ?, ?, 'CARD', ?, 'pending')
+                VALUES (?, ?, ?, ?, ?, ?, 'pending')
                 ON CONFLICT (idempotency_key) DO NOTHING
-                """, UUID.randomUUID(), chargeId, amount, currency, idempotencyKey);
+                """, UUID.randomUUID(), chargeId, amount, currency, channel, idempotencyKey);
         return jdbc.queryForObject("SELECT id FROM payment WHERE idempotency_key = ? ", UUID.class, idempotencyKey);
     }
 
@@ -188,5 +237,8 @@ public class BillingService {
         LocalDateTime ldt = newRenewalDate.atTime(9, 0);
         jdbc.update("UPDATE subscription SET renewed_at = ? WHERE id = ?",
                 Timestamp.valueOf(ldt), subscriptionId);
+    }
+
+    record CustomerBilling(String paymentMethod, String debtorIban, String mandateReference) {
     }
 }

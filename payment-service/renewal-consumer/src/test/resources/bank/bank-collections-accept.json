@@ -1,0 +1,9 @@
+{
+  "priority": 10,
+  "request": { "method": "POST", "urlPath": "/collections" },
+  "response": {
+    "status": 202,
+    "headers": { "Content-Type": "application/json" },
+    "jsonBody": { "status": "accepted" }
+  }
+}
