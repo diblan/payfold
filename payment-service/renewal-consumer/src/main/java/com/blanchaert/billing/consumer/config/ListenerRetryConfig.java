@@ -1,5 +1,6 @@
 package com.blanchaert.billing.consumer.config;
 
+import com.blanchaert.billing.consumer.service.InvalidSettlementMessageException;
 import com.blanchaert.billing.consumer.service.InvalidRenewalMessageException;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.amqp.RabbitRetryTemplateCustomizer;
@@ -20,7 +21,9 @@ public class ListenerRetryConfig {
                 // Deterministic contract violations cannot succeed on redelivery, so skip retry.
                 retryTemplate.setRetryPolicy(new SimpleRetryPolicy(
                         maxAttempts,
-                        Map.of(InvalidRenewalMessageException.class, false),
+                        Map.of(
+                                InvalidRenewalMessageException.class, false,
+                                InvalidSettlementMessageException.class, false),
                         true,
                         true));
             }

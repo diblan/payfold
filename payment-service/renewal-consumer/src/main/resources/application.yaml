@@ -8,6 +8,7 @@ spring:
   jackson:
     time-zone: Europe/Brussels
   rabbitmq:
+    publisher-confirm-type: correlated
     listener:
       simple:
         default-requeue-rejected: false
@@ -32,6 +33,7 @@ bank:
   id: bank-a
   base-url: http://localhost:8085
   timeout-ms: 2000
+  webhook-secret: payfold-dev-secret
 
 management:
   endpoints:

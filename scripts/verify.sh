@@ -11,7 +11,7 @@
 # It also requires Prometheus to be scraping both services and Grafana to serve
 # the provisioned pipeline dashboard anonymously.
 # It also requires the standalone mock-bank service to report healthy.
-# It asserts the SDD cohort parks exactly in submitted until R23c settles it.
+# Phase 2 is closed: SDD renewals reach IBAN-predicted terminal states after async settlement, reconciled row-for-row against the inbox.
 #
 # Usage:
 #   scripts/verify.sh [--no-up] [--timeout SECONDS] [--poison|--no-poison]
@@ -79,6 +79,8 @@ RMQ_RK="$(env_val RABBITMQ_ROUTINGKEY renewal.requested)"
 PSP_FAIL_HEX="$(env_val PSP_FAIL_HEX 0)"
 BANK_PORT="$(env_val BANK_HTTP_PORT 8085)"
 RMQ_DLQ="billing.renewals.dlq"
+SETTLEMENT_MAIN="billing.settlements.main"
+SETTLEMENT_DLQ="billing.settlements.dlq"
 
 RESULTS=()
 FAIL_COUNT=0
@@ -151,11 +153,11 @@ WHERE o.due_date = current_date
   )"
 all_billed() { [[ "$(q "$MISMATCHED_SQL")" == "0" ]]; }
 
-# R23b: an SDD renewal's terminal state does not exist yet — the collection is
-# submitted and parks until R23c closes the loop. The exact prediction: every
-# due SDD renewal has exactly one payment, submitted, attributed to a bank
-# and a collection. (Between R23b and R23c this parking is the design.)
-SDD_MISMATCHED_SQL="SELECT count(*) FROM renewal_outbox o
+# R23c closes the loop: every due SDD renewal must reach the terminal state
+# the IBAN rule predicts (docs/architecture.md#mock-bank) after the bank's
+# delay + webhook + relay + listener chain. 96 (settle-then-chargeback)
+# ends 'succeeded' here: the chargeback is accepted and deferred until R23d.
+SDD_TERMINAL_MISMATCH_SQL="SELECT count(*) FROM renewal_outbox o
 JOIN subscription s ON s.id = o.subscription_id
 JOIN customer c ON c.id = s.customer_id
 WHERE o.due_date = current_date
@@ -163,10 +165,13 @@ WHERE o.due_date = current_date
   AND NOT EXISTS (
     SELECT 1 FROM payment p
     WHERE p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
-      AND p.status = 'submitted' AND p.channel = 'SEPA_DD'
-      AND p.bank_id IS NOT NULL AND p.collection_id IS NOT NULL
+      AND p.channel = 'SEPA_DD' AND p.bank_id IS NOT NULL AND p.collection_id IS NOT NULL
+      AND p.status = CASE WHEN right(c.debtor_iban, 2) IN ('99','98','97')
+                          THEN 'failed' ELSE 'succeeded' END
+      AND (p.status <> 'failed' OR p.failure_reason = CASE right(c.debtor_iban, 2)
+                          WHEN '99' THEN 'AM04' WHEN '98' THEN 'AC04' WHEN '97' THEN 'MD01' END)
   )"
-all_sdd_submitted() { [[ "$(q "$SDD_MISMATCHED_SQL")" == "0" ]]; }
+all_sdd_terminal() { [[ "$(q "$SDD_TERMINAL_MISMATCH_SQL")" == "0" ]]; }
 
 queue_depth() { # queue name -> message count, or "unreachable"
   local body
@@ -214,6 +219,8 @@ consumer_prometheus_ready() {
   [[ "$processed" != "absent" && "$processed" != "unreachable" ]]
 }
 main_queue_empty() { [[ "$(queue_depth "$RMQ_QUEUE")" == "0" ]]; }
+settlements_main_empty() { [[ "$(queue_depth "$SETTLEMENT_MAIN")" == "0" ]]; }
+settlements_dlq_empty() { [[ "$(queue_depth "$SETTLEMENT_DLQ")" == "0" ]]; }
 
 TRIGGER_CODE=""
 TRIGGER_TIME=""
@@ -380,7 +387,7 @@ fi
 
 wait_for "outbox fully published"                outbox_drained
 wait_for "every due card renewal reached its predicted terminal payment (PSP rule [${PSP_FAIL_HEX}])" all_billed
-wait_for "every due SDD renewal parked exactly one submitted collection" all_sdd_submitted
+wait_for "every due SDD renewal reached its bank-predicted terminal payment" all_sdd_terminal
 
 DB_OUTBOX_AFTER="$(q 'SELECT count(*) FROM renewal_outbox')"
 DB_PUB_AFTER="$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NOT NULL')"
@@ -442,24 +449,57 @@ else
   fail "failed payment count matches deterministic PSP rule exactly" "expected=${EXPECTED_FAILED:-error} actual=${ACTUAL_FAILED:-error}"
 fi
 
-ACTUAL_SUBMITTED="$(q "SELECT count(*) FROM payment WHERE status = 'submitted' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
-if [[ -n "$N_SDD_DUE" && "$ACTUAL_SUBMITTED" == "$N_SDD_DUE" ]]; then
-  pass "submitted payment count matches the SDD cohort exactly (${ACTUAL_SUBMITTED}/${N_SDD_DUE})"
+STUCK_SUBMITTED="$(q "SELECT count(*) FROM payment WHERE status = 'submitted' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
+if [[ "$STUCK_SUBMITTED" == "0" ]]; then
+  pass "zero SDD payments stuck submitted after settlement"
 else
-  fail "submitted payment count matches the SDD cohort exactly" "expected=${N_SDD_DUE:-error} actual=${ACTUAL_SUBMITTED:-error}"
+  fail "zero SDD payments stuck submitted after settlement" "count=${STUCK_SUBMITTED:-error}"
 fi
-SUBMITTED_FINALIZED="$(q "SELECT count(*) FROM payment p JOIN charge c ON c.id = p.charge_id WHERE p.status = 'submitted' AND c.status <> 'pending'")"
-if [[ "$SUBMITTED_FINALIZED" == "0" ]]; then
-  pass "no submitted payment has a finalized charge"
+EXPECTED_SDD_FAILED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND right(c.debtor_iban, 2) IN ('99','98','97')")"
+ACTUAL_SDD_FAILED="$(q "SELECT count(*) FROM payment WHERE status = 'failed' AND channel = 'SEPA_DD' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
+if [[ -n "$EXPECTED_SDD_FAILED" && "$ACTUAL_SDD_FAILED" == "$EXPECTED_SDD_FAILED" ]]; then
+  pass "SDD failed count matches the IBAN rule exactly (${ACTUAL_SDD_FAILED}/${N_SDD_DUE})"
 else
-  fail "no submitted payment has a finalized charge" "count=${SUBMITTED_FINALIZED:-error}"
+  fail "SDD failed count matches the IBAN rule exactly" "expected=${EXPECTED_SDD_FAILED:-error} actual=${ACTUAL_SDD_FAILED:-error}"
 fi
-SDD_ADVANCED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id
-WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND s.renewed_at >= current_date")"
-if [[ "$SDD_ADVANCED" == "0" ]]; then
-  pass "no submitted SDD renewal advanced its subscription"
+REASON_MISMATCH="$(q "SELECT count(*) FROM payment p JOIN charge ch ON ch.id = p.charge_id JOIN subscription s ON s.id = ch.subscription_id JOIN customer c ON c.id = s.customer_id
+WHERE p.status = 'failed' AND p.channel = 'SEPA_DD'
+  AND p.idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')
+  AND p.failure_reason IS DISTINCT FROM CASE right(c.debtor_iban, 2) WHEN '99' THEN 'AM04' WHEN '98' THEN 'AC04' WHEN '97' THEN 'MD01' END")"
+if [[ "$REASON_MISMATCH" == "0" ]]; then
+  pass "every failed SDD payment carries its predicted ISO reason"
 else
-  fail "no submitted SDD renewal advanced its subscription" "count=${SDD_ADVANCED:-error}"
+  fail "every failed SDD payment carries its predicted ISO reason" "count=${REASON_MISMATCH:-error}"
+fi
+
+# Reconciliation: the 96 cohort produces TWO notifications (settled + the
+# deferred chargeback), everything else one. Chargebacks lag by
+# BANK_CHARGEBACK_LAG_SECONDS, so this is a bounded wait, not a single read.
+N_96_DUE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '96'")"
+EXPECTED_INBOX=$((N_SDD_DUE + N_96_DUE))
+inbox_complete() { [[ "$(q 'SELECT count(*) FROM settlement_inbox')" -ge "$EXPECTED_INBOX" ]] 2>/dev/null; }
+wait_for "settlement inbox received every predicted notification (${EXPECTED_INBOX})" inbox_complete
+INBOX_TOTAL="$(q 'SELECT count(*) FROM settlement_inbox')"
+if [[ "$INBOX_TOTAL" == "$EXPECTED_INBOX" ]]; then
+  pass "settlement inbox row count matches the prediction exactly (${INBOX_TOTAL})"
+else
+  fail "settlement inbox row count matches the prediction exactly" "expected=${EXPECTED_INBOX} actual=${INBOX_TOTAL:-error}"
+fi
+inbox_relayed() { [[ "$(q 'SELECT count(*) FROM settlement_inbox WHERE published_at IS NULL')" == "0" ]]; }
+wait_for "every inbox row relayed to the settlements queue" inbox_relayed
+UNTRACED="$(q "SELECT count(*) FROM payment p WHERE p.channel = 'SEPA_DD' AND p.status IN ('succeeded','failed')
+  AND p.idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')
+  AND NOT EXISTS (SELECT 1 FROM settlement_inbox i WHERE i.bank_id = p.bank_id AND i.notification_id = p.collection_id || ':1')")"
+if [[ "$UNTRACED" == "0" ]]; then
+  pass "every terminal SDD payment traces to an inbox notification"
+else
+  fail "every terminal SDD payment traces to an inbox notification" "count=${UNTRACED:-error}"
+fi
+BANK_GIVEUPS="$(curl -fsS "http://localhost:${BANK_PORT}/metrics" 2>/dev/null | grep '^bank_webhook_giveups_total ' | awk '{print $2}')"
+if [[ "$BANK_GIVEUPS" == "0.0" ]]; then
+  pass "mock bank webhook give-ups are zero"
+else
+  fail "mock bank webhook give-ups are zero" "value=${BANK_GIVEUPS:-unreadable}"
 fi
 
 FAILED_FINALIZED="$(q "SELECT count(*) FROM payment p JOIN charge c ON c.id = p.charge_id WHERE p.status = 'failed' AND c.status <> 'pending'")"
@@ -486,6 +526,9 @@ if [[ "$PENDING" == "0" ]]; then
 else
   fail "no stuck pending payments" "count=${PENDING:-error}"
 fi
+
+wait_for "settlements main queue drained" settlements_main_empty
+wait_for "settlements DLQ empty" settlements_dlq_empty
 
 MAIN_DEPTH="$(queue_depth "$RMQ_QUEUE")"
 if [[ "$MAIN_DEPTH" == "unreachable" ]]; then

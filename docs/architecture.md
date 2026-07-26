@@ -27,7 +27,7 @@ Honesty table:
 ## Component map
 
 ```
-                 ┌─────────────┐   Flyway V1–V6    ┌──────────────┐
+                 ┌─────────────┐   Flyway V1–V7    ┌──────────────┐
                  │   flyway    ├──────────────────▶│              │
                  └─────────────┘                   │  postgres:18 │
                  ┌─────────────┐  SEED_CUSTOMERS   │   (payfold)  │
@@ -63,7 +63,25 @@ Honesty table:
                             │                         :8084; card verdict
                             └── POST /collections ──▶ mock-bank (FastAPI)
                                                       :8085; SDD submission,
-                                                      signed webhooks
+                                                      async outcomes
+```
+
+### Settlement spine (R23c)
+
+```
+mock-bank ── signed POST /webhooks/bank/{id} ──▶ renewal-consumer
+                                                      │
+                                                      ▼
+                                             settlement_inbox
+                                             (unique bank + notification;
+                                              row is also its outbox)
+                                                      │ confirm-gated relay
+                                                      ▼
+                                      billing.settlements.main ──▶ listener
+                                               │                      │
+                                               ▼                      ▼
+                                      billing.settlements.dlq   payment / charge /
+                                                               invoice / subscription
 ```
 
 ## The renewal job (producer)
@@ -181,10 +199,38 @@ method selects the counterparty. Cards keep the synchronous PSP path unchanged.
 SDD submits `POST /collections` with `collection_id` equal to the payment
 idempotency key; the bank's `200` duplicate contract deduplicates a resubmission
 after a crash. Acceptance marks the payment `submitted` with `bank_id` and
-`collection_id`, finalizes nothing, and ACKs the renewal. These payments park in
-`submitted` until R23c adds the settlement receiver. A bank transport failure is
-the absence of a verdict, never a failed payment: it throws and rides the R5
-bounded listener retry to the DLQ ([G5](invariants.md#g5)).
+`collection_id`, finalizes nothing, and ACKs the renewal. A bank transport
+failure is the absence of a verdict, never a failed payment: it throws and rides
+the R5 bounded listener retry to the DLQ ([G5](invariants.md#g5)).
+
+The settlement spine closes that asynchronous submission loop. `POST
+/webhooks/bank/{bankId}` first rejects an unknown bank as `404`, then verifies
+the HMAC-SHA256 signature over the exact request bytes (`401` on a missing or
+mismatched signature), then validates the required notification identity
+(`400` for unparseable or incomplete JSON). A valid callback returns `200` only
+after its raw payload is durably inserted into `settlement_inbox`; uniqueness on
+`(bank_id, notification_id)` makes bank redelivery a no-op that still returns
+`200`. The path bank id, whose secret was verified, is the trusted bank
+attribution.
+
+Each inbox row is also its own outbox. A scheduled relay claims up to 100
+unpublished rows with `FOR UPDATE SKIP LOCKED`, so replicas safely compete,
+normalizes each payload to `settlement.received` v1, and waits synchronously for
+its correlated broker confirm. Only an ack sets `published_at`; a nack, timeout,
+or exception stops the page and leaves the row available for the next tick.
+That confirm/crash window is deliberately at-least-once, with queue-side
+idempotency absorbing duplicates.
+
+`SettlementListener` consumes the fixed `billing.settlements.main` queue.
+`SettlementService` accepts state transitions only through SQL guards with
+`WHERE status = 'submitted'`: `settled` changes the payment to `succeeded` and
+then settles the charge, pays the invoice, and advances the subscription to the
+invoice's `period_end` at 09:00 local; `failed` records terminal `failed`,
+`failure_reason`, and `completed_at` without finalizing billing. A terminal
+payment makes redelivery a no-op. `charged_back` is a valid recorded fact but is
+WARN-logged and ACKed without changing payment state until R23d supplies the
+chargeback state machine; accepting it now keeps the seeded `96` cohort out of
+the settlements DLQ.
 
 Provider declines, timeouts, 5xx responses, and unreachable-provider errors are
 business failures: the payment becomes `failed`, the message is ACKed, and nothing is
@@ -207,6 +253,13 @@ the rejected message. `InvalidRenewalMessageException` is non-retryable and goes
 straight to the DLQ; other failures use the bounded retry budget. Queue arguments are
 immutable, so brokers carrying the pre-R5 queue must delete it or wipe the RabbitMQ
 volume before redeclaration; [D4](decisions.md#d4) records why the queue name stayed.
+
+`SettlementTopology` repeats the D4 shape with fixed internal-contract names:
+direct exchange `billing.settlements`, routing key `settlement.received`, main
+queue `billing.settlements.main`, DLX `billing.settlements.dlx`, and DLQ
+`billing.settlements.dlq` bound with `dlq`. Both listener types share the same
+bounded retry customizer; deterministic renewal and settlement contract
+violations skip directly to their respective DLQ.
 
 ## Mock PSP
 
@@ -354,6 +407,8 @@ Micrometer converts dots in meter names to underscores for Prometheus and append
 | `outbox.published` | `outbox_published_total` | Counter | none | By the number of confirm-gated rows immediately after their `published_at` batch update |
 | `outbox.returned` | `outbox_returned_total` | Counter | none | Once per message the broker returned as unroutable, inside the confirm-future completion that reports the row unconfirmed |
 | `renewals.processed` | `renewals_processed_total{outcome="..."}` | Counter | `outcome=succeeded \| failed \| invalid \| submitted` | Per processed delivery at its decision point: after successful finalization, at either terminal-failure return, when validation rejects the message, or after an SDD collection is parked submitted |
+| `settlements.processed` | `settlements_processed_total{outcome="..."}` | Counter | `outcome=settled \| failed \| charged_back \| invalid` | Per settlement delivery at validation or its accepted outcome; terminal redeliveries count as processings |
+| `settlement.webhooks.received` | `settlement_webhooks_received_total{result="..."}` | Counter | `result=accepted \| duplicate \| unauthorized \| rejected` | Once per webhook request after its receiver decision |
 
 All counter series are registered eagerly and therefore render as `0.0` from boot;
 `verify.sh` depends on that property. The renewal outcome taxonomy is bounded to
@@ -365,7 +420,7 @@ through the listener timer's `result="failure"` tag.
 |---|---|---|
 | `spring.batch.job` | `spring_batch_job_seconds_count/_sum/_max` | `spring_batch_job_name`, `spring_batch_job_status`, `error` |
 | `spring.batch.step` | `spring_batch_step_seconds_count/_sum/_max` | `spring_batch_step_name`, `spring_batch_step_job_name`, `spring_batch_step_status`, `error` |
-| `spring.rabbitmq.listener` | `spring_rabbitmq_listener_seconds_count/_sum/_max` | `listener_id="renewal"`, `queue`, `result`, `exception` |
+| `spring.rabbitmq.listener` | `spring_rabbitmq_listener_seconds_count/_sum/_max` | `listener_id="renewal" \| "settlement"`, `queue`, `result`, `exception` |
 
 These timers come from Spring Batch observation support, auto-wired through
 `@EnableBatchProcessing`'s `BatchObservabilityBeanPostProcessor`, and Spring AMQP's
@@ -415,6 +470,26 @@ unknown fields explicitly through `@JsonIgnoreProperties(ignoreUnknown = true)` 
 Spring Boot's default ObjectMapper behavior). Removing or re-typing a field requires a
 version bump and a decision entry; see [D8](decisions.md#d8).
 
+### Message contract — settlement.received v1
+
+The webhook relay normalizes bank callbacks into this internal, bank-agnostic
+contract. `notification_id` is the settlement idempotency key, stable across
+bank and broker redelivery.
+
+| Field | JSON type | Semantics |
+|---|---|---|
+| `schema_version` | number | Literal `1`; contract version. |
+| `notification_id` | string | Stable bank notification identity and idempotency key. |
+| `bank_id` | string | Verified source bank identity from the webhook path. |
+| `collection_id` | string | Submitted payment collection identity. |
+| `outcome` | string | `settled`, `failed`, or `charged_back`. |
+| `reason` | string or null | ISO outcome reason when supplied (for example `AM04` or `MD06`). |
+| `occurred_at` | string | Bank-supplied ISO-8601 occurrence time. |
+
+Per [G8](invariants.md#g8), settlement v1 changes are additive only and its
+consumer explicitly tolerates unknown fields. Removing or re-typing a field
+requires a version bump and decision entry.
+
 ## Data model (Flyway, `db-migrations/`)
 
 | Migration | Contents |
@@ -425,6 +500,7 @@ version bump and a decision entry; see [D8](decisions.md#d8).
 | V4 | Spring Batch 5 metadata schema (producer sets `spring.batch.jdbc.initialize-schema: never`; Flyway is the sole schema authority, [G3](invariants.md#g3)) |
 | V5 | one yearly `plan` row ('Premium Annual') so due-today seeding has a valid renewal preimage on month-end clamp days ([R16](roadmap.md#r16)); weighted 0 in the seeder — used only via the clamp fallback |
 | V6 | customer payment method plus SDD debtor material; payment bank and collection attribution for submitted collections |
+| V7 | durable `settlement_inbox` with unique bank/notification identity and confirm-gated `published_at`; `payment.failure_reason` for terminal ISO outcomes |
 
 `renewal_outbox`: `id, subscription_id, due_date, payload jsonb, created_at, published_at`.
 Unpublished = `published_at IS NULL`.
@@ -440,6 +516,7 @@ Every remaining `application.yaml` key has a real consumer.
 | `spring.jackson.time-zone` (both) | Spring Boot Jackson autoconfig | alive |
 | `spring.batch.jdbc.initialize-schema` (producer) | Spring Batch | alive |
 | `spring.rabbitmq.publisher-confirm-type` (producer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` confirm type); load-bearing: without it confirm futures never complete and every page times out | alive |
+| `spring.rabbitmq.publisher-confirm-type` (consumer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` confirm type); load-bearing: the inbox relay gates `published_at` on correlated broker confirms | alive |
 | `spring.rabbitmq.publisher-returns` (producer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` returns support); load-bearing: without it the broker's `basic.return` is never delivered and an unroutable message is silently confirm-acked | alive |
 | `spring.rabbitmq.template.mandatory` (producer) | Spring Boot AMQP autoconfig (`RabbitTemplate` mandatory flag); makes the broker return unroutable messages instead of dropping them | alive |
 | `spring.rabbitmq.cache.channel.size` (producer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` channel cache size); kept equal to `app.publishInFlightLimit` so parked confirm channels re-cache and are reused ([R25](roadmap.md#r25)) | alive |
@@ -451,6 +528,7 @@ Every remaining `application.yaml` key has a real consumer.
 | `bank.id` (consumer) | `BankProperties`, `BillingService`; compose overrides with `BANK_ID` | alive |
 | `bank.base-url` (consumer) | `BankProperties`, `BankClient`; compose overrides with `BANK_BASE_URL` | alive |
 | `bank.timeout-ms` (consumer) | `BankProperties`, `BankClient` connect + read timeout | alive |
+| `bank.webhook-secret` (consumer) | `BankProperties`, `BankWebhookController`; compose `BANK_WEBHOOK_SECRET`, shared with the configured mock-bank instance | alive |
 | `spring.rabbitmq.listener.simple.*` (consumer) | Spring Boot AMQP autoconfig + `ListenerRetryConfig` (`max-attempts`) | alive |
 | `management.endpoints.web.exposure.include` (producer) | actuator exposure for `health`, `info`, `metrics`, `prometheus`, and `renewal-job` | alive |
 | `management.endpoints.web.exposure.include` (consumer) | actuator exposure for `health`, `info`, `metrics`, and `prometheus`; the compose healthcheck relies on `health` | alive |
@@ -496,7 +574,7 @@ The deploy images' env contracts (`FLYWAY_*`, `POSTGRES_*`) are catalogued under
 | Where | What |
 |---|---|
 | `localhost:8080` | producer — `/actuator/health`, `/actuator/prometheus`, `POST /actuator/renewal-job?force=true`, `GET /actuator/renewal-job/{executionId}` |
-| `localhost:8081` | consumer's first replica — `/actuator/health` (since [R1](roadmap.md#r1)), `/actuator/prometheus`; scaled replicas bind 8082–8083 with the same endpoints; container-internal 8080 |
+| `localhost:8081` | consumer's first replica — `/actuator/health` (since [R1](roadmap.md#r1)), `/actuator/prometheus`, `POST /webhooks/bank/{bankId}`; scaled replicas bind 8082–8083 with the same endpoints; container-internal 8080 |
 | `localhost:8084` | mock PSP (WireMock) — POST `/psp/charges`; admin/journal at `/__admin`; moved off 8082 by [R20](roadmap.md#r20) (consumer replica range) |
 | `localhost:8085` | mock bank (FastAPI) — `POST /collections`, `GET /collections/{id}`, `/health`, `/metrics` |
 | `localhost:9090` | Prometheus — targets, `/api/v1/query`, `/-/healthy` |

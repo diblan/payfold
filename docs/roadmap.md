@@ -373,7 +373,7 @@ every SDD renewal has exactly one payment, all `submitted`, zero finalized
 cards settle as today — honest intermediate state (see phase note above).
 
 <a id="r23c"></a>
-### [ ] R23c — Close the loop: webhook receiver, settlement inbox, queue, listener
+### [x] R23c — Close the loop: webhook receiver, settlement inbox, queue, listener
 **Scope:** new migration: `settlement_inbox` (bank id, notification id, raw
 payload, received/published timestamps; **unique (bank id, notification id)** —
 the row doubles as its own outbox via `published_at`, [D15](decisions.md#d15));

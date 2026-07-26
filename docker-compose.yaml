@@ -188,6 +188,7 @@ services:
       PAYMENT_PROVIDER_BASE_URL: http://mock-psp:8080
       BANK_ID: ${BANK_ID:-bank-a}
       BANK_BASE_URL: http://mock-bank:8080
+      BANK_WEBHOOK_SECRET: ${BANK_WEBHOOK_SECRET:-payfold-dev-secret}
     ports:
       - "${CONSUMER_HTTP_PORT:-8081}-${CONSUMER_HTTP_PORT_END:-8083}:8080"
     depends_on:
