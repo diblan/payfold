@@ -398,7 +398,7 @@ headline now holds for the SDD cohort (universal at [R23f](#r23f)). Tag proposal
 expected (the SDD loop is closed).
 
 <a id="r23d"></a>
-### [ ] R23d — Chargebacks + chaos profiles that shift outcomes
+### [x] R23d — Chargebacks + chaos profiles that shift outcomes
 **Scope:** new migration: `payment.status` grows `charged_back` (+ reason);
 mock-bank emits MD06 **after** a settled notification, deterministic from the
 IBAN rule with a configurable chargeback lag; the subscription **stays

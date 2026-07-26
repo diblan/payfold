@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Narrated chaos demo for a RUNNING Payfold stack.
 #
+# Scenes: pipeline, poison isolation, worker loss, scale-out, broker restart,
+# and chargebacks under slow/fast bank profiles.
+#
 # Usage:
 #   scripts/chaos-demo.sh [--auto] [--timeout SECONDS]
 #
@@ -49,7 +52,9 @@ RMQ_QUEUE="$(env_val RABBITMQ_QUEUE billing.renewals.main)"
 RMQ_EXCHANGE="$(env_val RABBITMQ_EXCHANGE billing.renewals)"
 RMQ_RK="$(env_val RABBITMQ_ROUTINGKEY renewal.requested)"
 PSP_FAIL_HEX="$(env_val PSP_FAIL_HEX 0)"
+BANK_PORT="$(env_val BANK_HTTP_PORT 8085)"
 RMQ_DLQ="billing.renewals.dlq"
+SETTLEMENT_DLQ="billing.settlements.dlq"
 
 RESULTS=()
 FAIL_COUNT=0
@@ -148,6 +153,11 @@ broker_up() {
   [[ "$(queue_depth "$RMQ_QUEUE")" != "unreachable" ]]
 }
 
+bank_up() {
+  curl -fsS "http://localhost:${BANK_PORT}/health" 2>/dev/null \
+    | grep -q '"status":"ok"'
+}
+
 outbox_drained() {
   [[ "$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NULL')" == "0" ]]
 }
@@ -156,20 +166,42 @@ main_queue_empty() {
   [[ "$(queue_depth "$RMQ_QUEUE")" == "0" ]]
 }
 
-# A today-due outbox row is correctly billed when a payment exists under its
-# derived idempotency key with EXACTLY the terminal status the deterministic
-# mock-PSP rule predicts: 'failed' when the subscription id's last hex char is
-# in [$PSP_FAIL_HEX], 'succeeded' otherwise.
+# A today-due card outbox row is correctly billed when a payment exists under
+# its derived idempotency key with EXACTLY the terminal status the PSP hex rule
+# predicts.
 MISMATCHED_SQL="SELECT count(*) FROM renewal_outbox o
+JOIN subscription s ON s.id = o.subscription_id
+JOIN customer c ON c.id = s.customer_id
 WHERE o.due_date = current_date
+  AND c.payment_method = 'card'
   AND NOT EXISTS (
     SELECT 1 FROM payment p
     WHERE p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
       AND p.status = CASE WHEN right(o.subscription_id::text, 1) ~ '[${PSP_FAIL_HEX}]'
                           THEN 'failed' ELSE 'succeeded' END
   )"
+
+# SDD terminality includes the bank delay and chargeback lag. The bank
+# attribution and ISO reason are part of the same per-row prediction.
+SDD_TERMINAL_MISMATCH_SQL="SELECT count(*) FROM renewal_outbox o
+JOIN subscription s ON s.id = o.subscription_id
+JOIN customer c ON c.id = s.customer_id
+WHERE o.due_date = current_date
+  AND c.payment_method = 'sdd'
+  AND NOT EXISTS (
+    SELECT 1 FROM payment p
+    WHERE p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
+      AND p.channel = 'SEPA_DD' AND p.bank_id IS NOT NULL AND p.collection_id IS NOT NULL
+      AND p.status = CASE WHEN right(c.debtor_iban, 2) IN ('99','98','97')
+                          THEN 'failed' WHEN right(c.debtor_iban, 2) = '96'
+                          THEN 'charged_back' ELSE 'succeeded' END
+      AND (p.status NOT IN ('failed','charged_back') OR p.failure_reason = CASE right(c.debtor_iban, 2)
+                          WHEN '99' THEN 'AM04' WHEN '98' THEN 'AC04' WHEN '97' THEN 'MD01'
+                          WHEN '96' THEN 'MD06' END)
+  )"
 billed_ok() {
-  [[ "$(q "$MISMATCHED_SQL")" == "0" ]]
+  [[ "$(q "$MISMATCHED_SQL")" == "0" \
+    && "$(q "$SDD_TERMINAL_MISMATCH_SQL")" == "0" ]]
 }
 
 scene_billed_count() {
@@ -181,6 +213,7 @@ JOIN payment p
  AND p.status = CASE WHEN right(o.subscription_id::text, 1) ~ '[${PSP_FAIL_HEX}]'
                      THEN 'failed' ELSE 'succeeded' END
 WHERE o.due_date = current_date
+  AND c.payment_method = 'card'
   AND c.email LIKE 'chaos-$1-${RUN_TAG}-%@example.test'"
 }
 
@@ -268,6 +301,50 @@ SQL
   return 1
 }
 
+seed_chargeback_cohort() {
+  local n="$1" seed_out
+  note "seeding ${n} SDD chargeback subscriptions (emails chaos-6-${RUN_TAG}-<n>@example.test)…"
+  if ! seed_out="$(docker compose exec -T postgres psql -U "$PGUSER" -d "$PGDB" -v ON_ERROR_STOP=1 <<SQL
+WITH seed_plan AS (
+    SELECT id, interval FROM plan
+    WHERE interval = CASE WHEN (now() - interval '1 month') + interval '1 month' = now()
+                          THEN 'month' ELSE 'year' END
+    ORDER BY name LIMIT 1
+), new_customers AS (
+    INSERT INTO customer (
+        id, email, name, payment_method, debtor_iban, mandate_reference, country
+    )
+    SELECT gen_random_uuid(),
+           'chaos-6-${RUN_TAG}-' || n || '@example.test',
+           'Chaos 6 Customer ' || n,
+           'sdd',
+           'BE68' || lpad(n::text, 10, '0') || '96',
+           'MNDT-CHAOS-' || n,
+           'BE'
+    FROM generate_series(1, ${n}) n
+    RETURNING id
+)
+INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
+SELECT gen_random_uuid(), c.id, (SELECT id FROM seed_plan), 'active',
+       CASE WHEN (SELECT interval FROM seed_plan) = 'year'
+            THEN now() - INTERVAL '1 year' ELSE now() - INTERVAL '1 month' END
+FROM new_customers c;
+ANALYZE customer;
+ANALYZE subscription;
+SQL
+)"; then
+    fail "scene 6 seeded ${n} SDD chargeback subscriptions" "psql failed: ${seed_out}"
+    return 1
+  fi
+  if echo "$seed_out" | grep -q "INSERT 0 ${n}$"; then
+    pass "scene 6 seeded ${n} SDD chargeback subscriptions"
+    return 0
+  fi
+  fail "scene 6 seeded ${n} SDD chargeback subscriptions" \
+    "unexpected psql output: ${seed_out}"
+  return 1
+}
+
 responsive_consumer_count() {
   local count=0 port
   for port in $(seq "$CONSUMER_PORT" "$CONSUMER_PORT_END"); do
@@ -291,6 +368,7 @@ echo "Grafana: http://localhost:${GRAFANA_PORT}/d/payfold-pipeline (anonymous)"
 wait_until "producer /actuator/health UP" producer_up || summary
 wait_until "consumer /actuator/health UP" consumer_up || summary
 wait_until "RabbitMQ management API reachable" broker_up || summary
+wait_until "mock-bank /health ok" bank_up || summary
 wait_until "starting outbox fully published" outbox_drained || summary
 wait_until "starting main queue empty" main_queue_empty || summary
 wait_until "starting due-today rows exactly billed" billed_ok || summary
@@ -575,6 +653,101 @@ if wait_until "scene 5 every due renewal reached its predicted terminal payment"
       "scene rows at predicted terminal status=${SCENE_5_BILLED:-error}/3000"
   fi
 fi
+
+pause_between_scenes
+
+scene 6 "Chargebacks are recorded facts; chaos profiles shift the picture"
+note "Watch the dashboard's processed-by-outcome panel: the slow bank parks a visible submitted plateau before MD06 chargebacks land."
+SCENE_6_SIZE=40
+seed_chargeback_cohort "$SCENE_6_SIZE" || summary
+if BANK_SETTLEMENT_DELAY_SECONDS=25 docker compose up -d mock-bank; then
+  pass "scene 6 restarted mock-bank with a 25s settlement delay"
+else
+  fail "scene 6 restarted mock-bank with a 25s settlement delay" "docker compose up failed"
+  summary
+fi
+wait_until "scene 6 slow mock-bank healthcheck passed" bank_up || summary
+trigger_and_wait "scene 6 renewal job trigger" || summary
+wait_until "scene 6 outbox fully published" outbox_drained || summary
+
+scene_6_payment_count() {
+  q "SELECT count(*) FROM payment p
+JOIN charge ch ON ch.id = p.charge_id
+JOIN subscription s ON s.id = ch.subscription_id
+JOIN customer c ON c.id = s.customer_id
+WHERE c.email LIKE 'chaos-6-${RUN_TAG}-%@example.test'
+  AND p.status = '$1'"
+}
+scene_6_all_submitted() {
+  [[ "$(scene_6_payment_count submitted)" == "$SCENE_6_SIZE" ]]
+}
+wait_until "scene 6 all ${SCENE_6_SIZE} payments visibly parked submitted" scene_6_all_submitted || summary
+
+SCENE_6_HOLD_OK=1
+SCENE_6_HOLD_START=$SECONDS
+while (( SECONDS - SCENE_6_HOLD_START < 6 )); do
+  SCENE_6_SUBMITTED="$(scene_6_payment_count submitted)"
+  if ! [[ "$SCENE_6_SUBMITTED" =~ ^[0-9]+$ ]] || (( SCENE_6_SUBMITTED == 0 )); then
+    SCENE_6_HOLD_OK=0
+    break
+  fi
+  sleep 2
+done
+if (( SCENE_6_HOLD_OK )); then
+  pass "scene 6 submitted backlog remained visible for 6s"
+else
+  fail "scene 6 submitted backlog remained visible for 6s" \
+    "submitted=${SCENE_6_SUBMITTED:-unreadable}"
+fi
+
+scene_6_lifecycle_complete() {
+  [[ "$(q "SELECT count(*) FROM payment p
+JOIN charge ch ON ch.id = p.charge_id
+JOIN invoice i ON i.id = ch.invoice_id
+JOIN subscription s ON s.id = ch.subscription_id
+JOIN customer c ON c.id = s.customer_id
+WHERE c.email LIKE 'chaos-6-${RUN_TAG}-%@example.test'
+  AND p.status = 'charged_back'
+  AND p.failure_reason = 'MD06'
+  AND p.charged_back_at IS NOT NULL
+  AND ch.status = 'settled'
+  AND i.status = 'disputed'
+  AND s.renewed_at >= current_date")" == "$SCENE_6_SIZE" ]]
+}
+wait_until "scene 6 all ${SCENE_6_SIZE} payments completed settled → charged_back after the slow-bank delay + chargeback lag" scene_6_lifecycle_complete
+
+if docker compose up -d mock-bank; then
+  pass "scene 6 restored the fast mock-bank profile"
+else
+  fail "scene 6 restored the fast mock-bank profile" "docker compose up failed"
+fi
+wait_until "scene 6 restored mock-bank healthcheck passed" bank_up
+
+if scene_6_lifecycle_complete; then
+  pass "scene 6 every chargeback left its invoice disputed, charge settled, and subscription advanced"
+else
+  fail "scene 6 every chargeback left its invoice disputed, charge settled, and subscription advanced"
+fi
+SCENE_6_FAILED="$(scene_6_payment_count failed)"
+if [[ "$SCENE_6_FAILED" == "0" ]]; then
+  pass "scene 6 zero payments failed"
+else
+  fail "scene 6 zero payments failed" "count=${SCENE_6_FAILED:-error}"
+fi
+SCENE_6_PAID="$(q "SELECT count(*) FROM invoice i
+JOIN customer c ON c.id = i.customer_id
+WHERE c.email LIKE 'chaos-6-${RUN_TAG}-%@example.test'
+  AND i.status = 'paid'")"
+if [[ "$SCENE_6_PAID" == "0" ]]; then
+  pass "scene 6 zero invoices remained paid after chargeback"
+else
+  fail "scene 6 zero invoices remained paid after chargeback" \
+    "count=${SCENE_6_PAID:-error}"
+fi
+settlements_dlq_empty() {
+  [[ "$(queue_depth "$SETTLEMENT_DLQ")" == "0" ]]
+}
+wait_until "scene 6 settlements DLQ empty" settlements_dlq_empty
 
 echo
 note "epilogue: returning the stack to one renewal-consumer replica…"

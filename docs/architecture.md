@@ -27,7 +27,7 @@ Honesty table:
 ## Component map
 
 ```
-                 ┌─────────────┐   Flyway V1–V7    ┌──────────────┐
+                 ┌─────────────┐   Flyway V1–V8    ┌──────────────┐
                  │   flyway    ├──────────────────▶│              │
                  └─────────────┘                   │  postgres:18 │
                  ┌─────────────┐  SEED_CUSTOMERS   │   (payfold)  │
@@ -66,7 +66,7 @@ Honesty table:
                                                       async outcomes
 ```
 
-### Settlement spine (R23c)
+### Settlement spine (R23d)
 
 ```
 mock-bank ── signed POST /webhooks/bank/{id} ──▶ renewal-consumer
@@ -203,6 +203,10 @@ after a crash. Acceptance marks the payment `submitted` with `bank_id` and
 failure is the absence of a verdict, never a failed payment: it throws and rides
 the R5 bounded listener retry to the DLQ ([G5](invariants.md#g5)).
 
+The payment status vocabulary is `pending`, `submitted`, `succeeded`, `failed`,
+and `charged_back`. The invoice vocabulary is `draft`, `posted`, `paid`,
+`disputed`, and `void`.
+
 The settlement spine closes that asynchronous submission loop. `POST
 /webhooks/bank/{bankId}` first rejects an unknown bank as `404`, then verifies
 the HMAC-SHA256 signature over the exact request bytes (`401` on a missing or
@@ -223,14 +227,18 @@ idempotency absorbing duplicates.
 
 `SettlementListener` consumes the fixed `billing.settlements.main` queue.
 `SettlementService` accepts state transitions only through SQL guards with
-`WHERE status = 'submitted'`: `settled` changes the payment to `succeeded` and
-then settles the charge, pays the invoice, and advances the subscription to the
+status predicates: `settled` changes a `submitted` payment to `succeeded`, then
+settles the charge, pays the invoice, and advances the subscription to the
 invoice's `period_end` at 09:00 local; `failed` records terminal `failed`,
-`failure_reason`, and `completed_at` without finalizing billing. A terminal
-payment makes redelivery a no-op. `charged_back` is a valid recorded fact but is
-WARN-logged and ACKed without changing payment state until R23d supplies the
-chargeback state machine; accepting it now keeps the seeded `96` cohort out of
-the settlements DLQ.
+`failure_reason`, and `completed_at` without finalizing billing. A
+`charged_back` notification changes either `submitted` or `succeeded` to
+`charged_back`, records its reason and `charged_back_at`, and wins in either
+arrival order. When the prior state was `succeeded`, the already-paid invoice
+becomes `disputed`; when chargeback arrives first, the invoice remains `posted`
+and a later settlement no-ops. In both cases charge and subscription are
+untouched: a chargeback is a recorded fact, not compensation, and reacting
+belongs to dunning ([D16](decisions.md#d16)). Terminal status guards make every
+redelivery a no-op.
 
 Provider declines, timeouts, 5xx responses, and unreachable-provider errors are
 business failures: the payment becomes `failed`, the message is ACKed, and nothing is
@@ -501,6 +509,7 @@ requires a version bump and decision entry.
 | V5 | one yearly `plan` row ('Premium Annual') so due-today seeding has a valid renewal preimage on month-end clamp days ([R16](roadmap.md#r16)); weighted 0 in the seeder — used only via the clamp fallback |
 | V6 | customer payment method plus SDD debtor material; payment bank and collection attribution for submitted collections |
 | V7 | durable `settlement_inbox` with unique bank/notification identity and confirm-gated `published_at`; `payment.failure_reason` for terminal ISO outcomes |
+| V8 | `payment.charged_back_at`, separating the dispute timestamp from settlement completion |
 
 `renewal_outbox`: `id, subscription_id, due_date, payload jsonb, created_at, published_at`.
 Unpublished = `published_at IS NULL`.

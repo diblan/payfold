@@ -153,10 +153,9 @@ WHERE o.due_date = current_date
   )"
 all_billed() { [[ "$(q "$MISMATCHED_SQL")" == "0" ]]; }
 
-# R23c closes the loop: every due SDD renewal must reach the terminal state
+# R23d closes the loop: every due SDD renewal must reach the terminal state
 # the IBAN rule predicts (docs/architecture.md#mock-bank) after the bank's
-# delay + webhook + relay + listener chain. 96 (settle-then-chargeback)
-# ends 'succeeded' here: the chargeback is accepted and deferred until R23d.
+# delay + webhook + relay + listener chain, including the 96 chargeback lag.
 SDD_TERMINAL_MISMATCH_SQL="SELECT count(*) FROM renewal_outbox o
 JOIN subscription s ON s.id = o.subscription_id
 JOIN customer c ON c.id = s.customer_id
@@ -167,9 +166,11 @@ WHERE o.due_date = current_date
     WHERE p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
       AND p.channel = 'SEPA_DD' AND p.bank_id IS NOT NULL AND p.collection_id IS NOT NULL
       AND p.status = CASE WHEN right(c.debtor_iban, 2) IN ('99','98','97')
-                          THEN 'failed' ELSE 'succeeded' END
-      AND (p.status <> 'failed' OR p.failure_reason = CASE right(c.debtor_iban, 2)
-                          WHEN '99' THEN 'AM04' WHEN '98' THEN 'AC04' WHEN '97' THEN 'MD01' END)
+                          THEN 'failed' WHEN right(c.debtor_iban, 2) = '96'
+                          THEN 'charged_back' ELSE 'succeeded' END
+      AND (p.status NOT IN ('failed','charged_back') OR p.failure_reason = CASE right(c.debtor_iban, 2)
+                          WHEN '99' THEN 'AM04' WHEN '98' THEN 'AC04' WHEN '97' THEN 'MD01'
+                          WHEN '96' THEN 'MD06' END)
   )"
 all_sdd_terminal() { [[ "$(q "$SDD_TERMINAL_MISMATCH_SQL")" == "0" ]]; }
 
@@ -473,7 +474,7 @@ else
 fi
 
 # Reconciliation: the 96 cohort produces TWO notifications (settled + the
-# deferred chargeback), everything else one. Chargebacks lag by
+# applied chargeback), everything else one. Chargebacks lag by
 # BANK_CHARGEBACK_LAG_SECONDS, so this is a bounded wait, not a single read.
 N_96_DUE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '96'")"
 EXPECTED_INBOX=$((N_SDD_DUE + N_96_DUE))
@@ -487,7 +488,27 @@ else
 fi
 inbox_relayed() { [[ "$(q 'SELECT count(*) FROM settlement_inbox WHERE published_at IS NULL')" == "0" ]]; }
 wait_for "every inbox row relayed to the settlements queue" inbox_relayed
-UNTRACED="$(q "SELECT count(*) FROM payment p WHERE p.channel = 'SEPA_DD' AND p.status IN ('succeeded','failed')
+ACTUAL_CHARGED_BACK="$(q "SELECT count(*) FROM payment WHERE status = 'charged_back' AND channel = 'SEPA_DD' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
+if [[ -n "$N_96_DUE" && "$ACTUAL_CHARGED_BACK" == "$N_96_DUE" ]]; then
+  pass "charged-back count matches the IBAN rule exactly (${ACTUAL_CHARGED_BACK}/${N_96_DUE})"
+else
+  fail "charged-back count matches the IBAN rule exactly" "expected=${N_96_DUE:-error} actual=${ACTUAL_CHARGED_BACK:-error}"
+fi
+DISPUTED_MISMATCH="$(q "SELECT count(*) FROM payment p JOIN charge ch ON ch.id = p.charge_id JOIN invoice i ON i.id = ch.invoice_id
+WHERE p.status = 'charged_back' AND p.idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD') AND i.status <> 'disputed'")"
+if [[ "$DISPUTED_MISMATCH" == "0" ]]; then
+  pass "every charged-back payment's invoice is marked disputed"
+else
+  fail "every charged-back payment's invoice is marked disputed" "count=${DISPUTED_MISMATCH:-error}"
+fi
+CHARGEBACK_ROLLBACKS="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id
+WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '96' AND s.renewed_at < current_date")"
+if [[ "$CHARGEBACK_ROLLBACKS" == "0" ]]; then
+  pass "no chargeback rolled a subscription back (recorded fact, D16)"
+else
+  fail "no chargeback rolled a subscription back (recorded fact, D16)" "count=${CHARGEBACK_ROLLBACKS:-error}"
+fi
+UNTRACED="$(q "SELECT count(*) FROM payment p WHERE p.channel = 'SEPA_DD' AND p.status IN ('succeeded','failed','charged_back')
   AND p.idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')
   AND NOT EXISTS (SELECT 1 FROM settlement_inbox i WHERE i.bank_id = p.bank_id AND i.notification_id = p.collection_id || ':1')")"
 if [[ "$UNTRACED" == "0" ]]; then

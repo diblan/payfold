@@ -54,9 +54,25 @@ public class SettlementService {
         }
 
         if ("charged_back".equals(event.outcome())) {
-            // Recorded-fact handling and the payment state machine arrive in R23d;
-            // ACKing here keeps the seeded chargeback cohort out of the DLQ meanwhile.
-            log.warn("Chargeback handling deferred (bank_id={}, notification_id={}, collection_id={})",
+            // A chargeback wins regardless of arrival order. The bank sends settled
+            // before charged_back, but queue redelivery can reorder; applying from
+            // 'submitted' too (skipping the never-finalized invoice) keeps the rare
+            // reordered case consistent instead of dead-lettering it, and the later
+            // settled notification then no-ops on its own status guard.
+            int updated = jdbc.update("""
+                    UPDATE payment
+                    SET status = 'charged_back', failure_reason = ?, charged_back_at = now()
+                    WHERE id = ? AND status IN ('submitted', 'succeeded')
+                    """, event.reason(), payment.id());
+            if (updated == 1 && "succeeded".equals(payment.status())) {
+                BillingLinks links = billingLinks(payment.chargeId());
+                jdbc.update("""
+                        UPDATE invoice SET status = 'disputed'
+                        WHERE id = ? AND status = 'paid'
+                        """, links.invoiceId());
+            }
+            // D16's recorded-fact boundary leaves the charge and subscription untouched.
+            log.info("Chargeback processed (bank_id={}, notification_id={}, collection_id={})",
                     event.bank_id(), event.notification_id(), event.collection_id());
             chargedBack.increment();
             return;

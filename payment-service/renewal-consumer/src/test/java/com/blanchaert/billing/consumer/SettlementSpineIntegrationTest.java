@@ -242,7 +242,7 @@ class SettlementSpineIntegrationTest {
     }
 
     @Test
-    void chargebackIsAcceptedAndDeferred() throws Exception {
+    void chargebackEndsSettledPaymentChargedBack() throws Exception {
         SubmittedPayment fixture = parkSubmitted("06");
         byte[] settled = webhook(fixture.collectionId(), 1, "settled", null);
         byte[] chargedBack = webhook(fixture.collectionId(), 2, "charged_back", "MD06");
@@ -254,17 +254,88 @@ class SettlementSpineIntegrationTest {
         assertThat(postWebhook(BANK_ID, chargedBack, sign(chargedBack, WEBHOOK_SECRET)))
                 .isEqualTo(200);
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
-                assertThat(jdbc.queryForObject("""
-                        SELECT count(*) FROM settlement_inbox
-                        WHERE bank_id = ? AND notification_id LIKE ?
-                          AND published_at IS NOT NULL
-                        """, Long.class, BANK_ID, fixture.collectionId() + ":%"))
-                        .isEqualTo(2L));
-        await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-            assertThat(paymentStatus(fixture)).isEqualTo("succeeded");
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            assertThat(paymentStatus(fixture)).isEqualTo("charged_back");
+            assertThat(jdbc.queryForObject("""
+                    SELECT failure_reason FROM payment WHERE collection_id = ?
+                    """, String.class, fixture.collectionId())).isEqualTo("MD06");
+            assertThat(jdbc.queryForObject("""
+                    SELECT charged_back_at IS NOT NULL FROM payment
+                    WHERE collection_id = ?
+                    """, Boolean.class, fixture.collectionId())).isTrue();
+            assertThat(jdbc.queryForObject(
+                    "SELECT status FROM invoice WHERE customer_id = ?",
+                    String.class, fixture.customerId())).isEqualTo("disputed");
+            assertThat(jdbc.queryForObject(
+                    "SELECT status FROM charge WHERE subscription_id = ?",
+                    String.class, fixture.subscriptionId())).isEqualTo("settled");
             assertThat(renewedAt(fixture.subscriptionId()))
                     .isEqualTo(expectedRenewedAt(fixture.periodEnd()));
+        });
+    }
+
+    @Test
+    void chargebackRedeliveryIsIdempotent() throws Exception {
+        SubmittedPayment fixture = parkSubmitted("07");
+        byte[] settled = webhook(fixture.collectionId(), 1, "settled", null);
+        byte[] chargedBack = webhook(fixture.collectionId(), 2, "charged_back", "MD06");
+
+        assertThat(postWebhook(BANK_ID, settled, sign(settled, WEBHOOK_SECRET)))
+                .isEqualTo(200);
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(paymentStatus(fixture)).isEqualTo("succeeded"));
+        assertThat(postWebhook(BANK_ID, chargedBack, sign(chargedBack, WEBHOOK_SECRET)))
+                .isEqualTo(200);
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(paymentStatus(fixture)).isEqualTo("charged_back"));
+        Instant firstChargedBackAt = chargedBackAt(fixture);
+
+        assertThat(postWebhook(BANK_ID, chargedBack, sign(chargedBack, WEBHOOK_SECRET)))
+                .isEqualTo(200);
+
+        await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+            assertThat(jdbc.queryForObject("""
+                    SELECT count(*) FROM settlement_inbox
+                    WHERE bank_id = ? AND notification_id = ?
+                    """, Long.class, BANK_ID, fixture.collectionId() + ":2")).isEqualTo(1L);
+            assertThat(paymentStatus(fixture)).isEqualTo("charged_back");
+            assertThat(jdbc.queryForObject("""
+                    SELECT failure_reason FROM payment WHERE collection_id = ?
+                    """, String.class, fixture.collectionId())).isEqualTo("MD06");
+            assertThat(chargedBackAt(fixture)).isEqualTo(firstChargedBackAt);
+            assertThat(jdbc.queryForObject(
+                    "SELECT status FROM invoice WHERE customer_id = ?",
+                    String.class, fixture.customerId())).isEqualTo("disputed");
+            assertThat(jdbc.queryForObject(
+                    "SELECT status FROM charge WHERE subscription_id = ?",
+                    String.class, fixture.subscriptionId())).isEqualTo("settled");
+            assertThat(renewedAt(fixture.subscriptionId()))
+                    .isEqualTo(expectedRenewedAt(fixture.periodEnd()));
+        });
+    }
+
+    @Test
+    void chargebackBeforeSettleStillWins() throws Exception {
+        SubmittedPayment fixture = parkSubmitted("08");
+        Message chargedBack = jsonMessage(objectMapper.writeValueAsBytes(
+                settlement(fixture.collectionId(), 2, "charged_back", "MD06")));
+        Message settled = jsonMessage(objectMapper.writeValueAsBytes(
+                settlement(fixture.collectionId(), 1, "settled", null)));
+
+        rabbitTemplate.convertAndSend(
+                SettlementTopology.EXCHANGE, SettlementTopology.ROUTING_KEY, chargedBack);
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(paymentStatus(fixture)).isEqualTo("charged_back"));
+
+        rabbitTemplate.convertAndSend(
+                SettlementTopology.EXCHANGE, SettlementTopology.ROUTING_KEY, settled);
+        await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+            assertThat(paymentStatus(fixture)).isEqualTo("charged_back");
+            assertThat(renewedAt(fixture.subscriptionId()))
+                    .isEqualTo(fixture.originalRenewedAt());
+            assertThat(jdbc.queryForObject(
+                    "SELECT status FROM invoice WHERE customer_id = ?",
+                    String.class, fixture.customerId())).isEqualTo("posted");
             assertThat(amqpAdmin.getQueueInfo(SettlementTopology.MAIN_QUEUE).getMessageCount())
                     .isZero();
             assertThat(amqpAdmin.getQueueInfo(SettlementTopology.DLQ).getMessageCount())
@@ -376,6 +447,12 @@ class SettlementSpineIntegrationTest {
         return jdbc.queryForObject(
                 "SELECT renewed_at FROM subscription WHERE id = ?",
                 (rs, rowNum) -> rs.getTimestamp(1).toInstant(), subscriptionId);
+    }
+
+    private Instant chargedBackAt(SubmittedPayment fixture) {
+        return jdbc.queryForObject(
+                "SELECT charged_back_at FROM payment WHERE collection_id = ?",
+                (rs, rowNum) -> rs.getTimestamp(1).toInstant(), fixture.collectionId());
     }
 
     private Instant expectedRenewedAt(LocalDate periodEnd) {

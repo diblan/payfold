@@ -141,9 +141,12 @@ One command demonstrates the failure modes the architecture exists for —
 poison messages dead-lettering while good traffic flows, a killed worker
 losing nothing and draining its backlog on recovery, three competing
 consumers splitting the queue, and a broker restart absorbed without a
-double-billed cent. Every scene *asserts* its invariant (exact per-row
-terminal states, DLQ depths, per-replica counters) rather than just showing
-it; watch it live on the provisioned Grafana dashboard at
+double-billed cent. Scene 6 switches the mock bank to a slow profile so the
+submitted SDD backlog is visible, then proves MD06 chargebacks leave payments
+`charged_back`, invoices `disputed`, settled charges intact, and subscriptions
+advanced before restoring the fast profile. Every scene *asserts* its invariant
+(exact card/SDD per-row terminal states, DLQ depths, per-replica counters)
+rather than just showing it; watch it live on the provisioned Grafana dashboard at
 `http://localhost:3000/d/payfold-pipeline`.
 
 ```bash
@@ -173,4 +176,3 @@ scripts/chaos-demo.sh --auto     # unattended, asserts everything
   `POSTGRES_*` settings defined in `.env`.
 - **Configuration tweaks:** Update `.env` and re-run `docker compose up` to
   apply changes such as alternative ports or a different payment provider mock.
-
