@@ -26,6 +26,7 @@ import java.util.*;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -216,6 +217,7 @@ public class RenewalJobConfig {
                             OutboxPublisher publisher,
                             MeterRegistry meters,
                             @Value("${app.publishPageSize:10000}") int publishPageSize,
+                            @Value("${app.publishInFlightLimit:100}") int publishInFlightLimit,
                             @Value("${app.confirmTimeoutMs:10000}") long confirmTimeoutMs) {
         Counter publishedCounter = Counter.builder("outbox.published")
                 .description("Outbox rows confirmed published")
@@ -241,12 +243,39 @@ public class RenewalJobConfig {
                         return RepeatStatus.FINISHED; // stop the step
                     }
 
+                    // Publisher-confirm channel discipline: a channel whose confirms are
+                    // pending is parked by CachingConnectionFactory until its acks arrive,
+                    // so every unconfirmed in-flight send holds one broker channel, and
+                    // unbounded pipelining under a slow-confirming broker opens a channel
+                    // per send — up to the broker's channelMax (2047, observed as a
+                    // zero-confirm page failure during a cold boot at 15k scale). The
+                    // window caps in-flight sends, and with them the page's channel
+                    // budget; permits release on confirm-future completion, which
+                    // spring-rabbit performs synchronously with ack delivery. A window
+                    // stalled to the page deadline means the broker is not confirming:
+                    // stop sending, let the await loop below mark whatever confirmed, and
+                    // keep the zero-progress failure loud.
+                    var window = new Semaphore(publishInFlightLimit);
+                    long deadline = System.nanoTime() + confirmTimeoutMs * 1_000_000L;
                     var futures = new LinkedHashMap<UUID, CompletableFuture<Boolean>>(rows.size());
                     for (var row : rows) {
-                        futures.put(row.id(), publisher.publish(row.id().toString(), row.payload()));
+                        boolean acquired;
+                        try {
+                            acquired = window.tryAcquire(Math.max(deadline - System.nanoTime(), 0L), TimeUnit.NANOSECONDS);
+                        }
+                        catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new IllegalStateException("interrupted awaiting a publish window slot", e);
+                        }
+                        if (!acquired) {
+                            log.warn("Publish window stalled: {} of {} rows unsent at the confirm deadline; they stay unpublished for re-pick.",
+                                    rows.size() - futures.size(), rows.size());
+                            break;
+                        }
+                        CompletableFuture<Boolean> future = publisher.publish(row.id().toString(), row.payload());
+                        future.whenComplete((confirmed, cause) -> window.release());
+                        futures.put(row.id(), future);
                     }
-
-                    long deadline = System.nanoTime() + confirmTimeoutMs * 1_000_000L;
                     var confirmedIds = new ArrayList<UUID>(rows.size());
                     for (var entry : futures.entrySet()) {
                         long remaining = Math.max(deadline - System.nanoTime(), 0L);
@@ -264,8 +293,8 @@ public class RenewalJobConfig {
 
                     if (confirmedIds.isEmpty()) {
                         throw new IllegalStateException(
-                                "0/" + rows.size() + " rows confirmed within " + confirmTimeoutMs
-                                        + " ms"
+                                "0/" + futures.size() + " sent rows confirmed within " + confirmTimeoutMs
+                                        + " ms (" + rows.size() + " rows claimed)"
                         );
                     }
 
@@ -277,10 +306,10 @@ public class RenewalJobConfig {
                     );
                     publishedCounter.increment(confirmedIds.size());
 
-                    int unconfirmedCount = rows.size() - confirmedIds.size();
+                    int unconfirmedCount = futures.size() - confirmedIds.size();
                     if (unconfirmedCount > 0) {
-                        log.warn("{} of {} unconfirmed, rows stay unpublished and will be re-picked.",
-                                unconfirmedCount, rows.size());
+                        log.warn("{} of {} sent unconfirmed, rows stay unpublished and will be re-picked.",
+                                unconfirmedCount, futures.size());
                     }
 
                     log.info("Published page count: {}", confirmedIds.size());

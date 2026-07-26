@@ -146,6 +146,19 @@ the ack — so its row keeps `published_at` NULL and is re-picked. A fully-retur
 ends in the zero-progress job failure above. Every returned message is logged at WARN
 with its routing key and counted by `outbox_returned_total`.
 
+Within a page, sends are pipelined but never more than `app.publishInFlightLimit`
+(default 100) may be awaiting confirms at once ([R25](roadmap.md#r25)): spring-rabbit
+parks a channel whose confirms are pending instead of re-caching it, so each
+unconfirmed in-flight send holds one broker channel, and unbounded pipelining under a
+slow-confirming broker opens a channel per send until RabbitMQ's `channelMax` (2047)
+kills the page with zero confirms. The window caps the page's channel budget;
+`spring.rabbitmq.cache.channel.size` is kept equal to the limit so a parked channel
+re-enters the cache when its confirm arrives and is reused rather than churned. A
+window stalled to the `app.confirmTimeoutMs` deadline stops sending — unsent rows
+simply stay unpublished for re-pick — and the zero-progress failure above is
+unchanged. Bounding via `channelCheckoutTimeout` instead was rejected
+([D14](decisions.md#d14)).
+
 Producer declares only the exchange (`RabbitConfig`); the consumer owns the rest of the topology.
 
 ## The consumer
@@ -331,7 +344,8 @@ Every remaining `application.yaml` key has a real consumer.
 | `spring.rabbitmq.publisher-confirm-type` (producer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` confirm type); load-bearing: without it confirm futures never complete and every page times out | alive |
 | `spring.rabbitmq.publisher-returns` (producer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` returns support); load-bearing: without it the broker's `basic.return` is never delivered and an unroutable message is silently confirm-acked | alive |
 | `spring.rabbitmq.template.mandatory` (producer) | Spring Boot AMQP autoconfig (`RabbitTemplate` mandatory flag); makes the broker return unroutable messages instead of dropping them | alive |
-| `app.timezone`, `app.scheduleCron`, `app.scanPageSize`, `app.publishPageSize`, `app.confirmTimeoutMs` (producer) | `RenewalScheduler`, `RenewalJobConfig`, `RenewalJobEndpoint` | alive |
+| `spring.rabbitmq.cache.channel.size` (producer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` channel cache size); kept equal to `app.publishInFlightLimit` so parked confirm channels re-cache and are reused ([R25](roadmap.md#r25)) | alive |
+| `app.timezone`, `app.scheduleCron`, `app.scanPageSize`, `app.publishPageSize`, `app.publishInFlightLimit`, `app.confirmTimeoutMs` (producer) | `RenewalScheduler`, `RenewalJobConfig`, `RenewalJobEndpoint` | alive |
 | `rabbitmq.exchange`, `rabbitmq.routingKey` (producer) | `RabbitConfig`, `OutboxPublisher` | alive |
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |
 | `payment.provider.base-url` (consumer) | `PaymentProviderProperties`, `PspClient`; compose overrides with `PAYMENT_PROVIDER_BASE_URL` | alive |

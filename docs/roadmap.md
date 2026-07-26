@@ -292,7 +292,7 @@ drains on recovery".
 [R21](#r21) dashboard telling the same story live; README documents how to run it.
 
 <a id="r25"></a>
-### [ ] R25 — Publisher channel discipline under a slow broker
+### [x] R25 — Publisher channel discipline under a slow broker
 **Scope:** producer `OutboxPublisher` / `RabbitConfig` (cache/confirm settings).
 Observed 2026-07-26 (R21 session, cold boot under image-pull load): with the
 broker slow to confirm, the pipelined page publish piled up channels — spring-

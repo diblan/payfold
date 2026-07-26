@@ -203,3 +203,36 @@ decision entry); schema changes arrive via new migrations ([G3](invariants.md#g3
 the item is an epic and is expected to split into sub-items at execution, each
 with its own acceptance criteria.
 **Boundary unchanged:** still no real PSP, no real bank, no real money movement.
+
+## D14 — Publish-page channel budget via an in-flight window, not channelCheckoutTimeout — 2026-07-26 — active
+<a id="d14"></a>
+[R25](roadmap.md#r25): with correlated confirms, `CachingConnectionFactory` parks any
+channel whose confirms are pending (`returnToCache` → `channelsAwaitingAcks`) instead
+of re-caching it, so each unconfirmed send holds one channel — publishStep's
+unbounded pipelined page therefore opened a new channel per send while the broker
+lagged, up to RabbitMQ's `channelMax` (2047). Observed at cold boot under image-pull
+load (R21 session): zero confirms, `AmqpResourceNotAvailableException`, job failed on
+the zero-progress rule; [G1](invariants.md#g1) re-picked every row safely, but a
+degraded broker should not cost a job failure.
+**Decision:** bound in-flight sends per page with a
+`Semaphore(app.publishInFlightLimit)` (default 100) whose permits release on
+confirm-future completion — spring-rabbit completes that future synchronously with
+ack delivery, so the window tracks the broker exactly.
+`spring.rabbitmq.cache.channel.size` is kept equal to the limit so a parked channel
+re-enters the cache on confirm and is reused: the page publishes within a fixed
+channel budget, with no open/close churn. A window stalled to the page's
+`app.confirmTimeoutMs` deadline stops sending; unsent rows stay unpublished for
+re-pick; the loud zero-progress failure is unchanged.
+**Why not `channelCheckoutTimeout`:** it does turn the channel cache into a bounded
+pool, but checkout permits release only when a channel physically re-caches, so with
+every permit parked behind pending confirms each further send blocks *inside*
+`convertAndSend` — a trickling broker stretches the page unboundedly past the
+confirm deadline (the 03:00 cron would hang rather than fail), and a dead broker
+throws `AmqpTimeoutException` mid-send-loop, abandoning already-confirmed rows
+unmarked (they would re-publish as duplicates; harmless under
+[G2](invariants.md#g2), but needless). The app-level window integrates with the
+existing page deadline and keeps the failure semantics identical.
+**Trade-off:** peak publish throughput is capped at window ÷ confirm round-trip; 100
+in flight covers the measured 5k msg/s page baseline ([D10](decisions.md#d10)) with
+margin. Up to 100 idle channels stay cached on a quiet connection — well under
+`channelMax` and cheap on the broker.

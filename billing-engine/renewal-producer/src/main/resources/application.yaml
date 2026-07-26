@@ -12,6 +12,9 @@ spring:
     publisher-returns: true
     template:
       mandatory: true
+    cache:
+      channel:
+        size: 100   # kept = app.publishInFlightLimit so a parked confirm channel re-enters the cache and is reused, not churned
   batch:
     jdbc:
       initialize-schema: never
@@ -21,6 +24,7 @@ app:
   timezone: Europe/Brussels
   scanPageSize: 10000
   publishPageSize: 10000
+  publishInFlightLimit: 100   # max unconfirmed sends in flight per publish page; each holds one broker channel while its confirm is pending
   confirmTimeoutMs: 10000
   scheduleCron: "0 0 3 * * *"   # 03:00 local by default
 
