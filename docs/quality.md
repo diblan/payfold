@@ -3,7 +3,7 @@
 Coarse, honest, and **maintained**: any PR touching a module re-grades it in the same
 PR ([G6](invariants.md#g6)). The value of this file is currency, not precision.
 
-Last full re-grade: **2026-07-21** (R13 entropy pass, after R15).
+Last full re-grade: **2026-07-26** (R13 entropy pass, after R20).
 
 ## Rubric
 

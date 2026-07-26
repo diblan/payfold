@@ -58,7 +58,8 @@ This README stays a quickstart; everything deeper belongs in `docs/`.
    - `mock-psp`: WireMock mock payment provider (port `8084`), declining a
      deterministic `PSP_FAIL_HEX` slice of renewals
    - `renewal-producer`: Spring Boot billing engine (port `8080`)
-   - `renewal-consumer`: Spring Boot payment service (port `8081`)
+   - `renewal-consumer`: Spring Boot payment service (port `8081`; scaled
+     replicas bind up to `8083`)
 
    The Spring Boot services include health checks that keep retrying until their
    dependencies are ready, so the first boot can take a minute.

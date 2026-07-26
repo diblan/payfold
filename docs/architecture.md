@@ -57,7 +57,7 @@ Honesty table:
                             ▼                             ▼
                  ┌──────────────────────┐   invoice / charge /
                  │   renewal-consumer   ├─▶ payment / subscription
-                 │   :8081 (host)       │   upserts via unique
+                 │   :8081-83 (host)    │   upserts via unique
                  └──────────┬───────────┘   constraints
                             │ POST /psp/charges
                             ▼
