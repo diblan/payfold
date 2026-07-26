@@ -1,6 +1,6 @@
 {
   "priority": 10,
-  "request": { "method": "POST", "urlPath": "/collections" },
+  "request": { "method": "POST", "urlPathPattern": "/bank-[ab]/collections" },
   "response": {
     "status": 202,
     "headers": { "Content-Type": "application/json" },

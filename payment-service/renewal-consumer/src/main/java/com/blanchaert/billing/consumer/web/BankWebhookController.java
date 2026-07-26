@@ -1,6 +1,7 @@
 package com.blanchaert.billing.consumer.web;
 
 import com.blanchaert.billing.consumer.config.BankProperties;
+import com.blanchaert.billing.consumer.config.BankRegistry;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.Counter;
@@ -23,7 +24,7 @@ import java.util.HexFormat;
 
 @RestController
 public class BankWebhookController {
-    private final BankProperties bankProperties;
+    private final BankRegistry bankRegistry;
     private final ObjectMapper objectMapper;
     private final JdbcTemplate jdbc;
     private final Counter accepted;
@@ -31,9 +32,9 @@ public class BankWebhookController {
     private final Counter unauthorized;
     private final Counter rejected;
 
-    public BankWebhookController(BankProperties bankProperties, ObjectMapper objectMapper,
+    public BankWebhookController(BankRegistry bankRegistry, ObjectMapper objectMapper,
                                  JdbcTemplate jdbc, MeterRegistry meters) {
-        this.bankProperties = bankProperties;
+        this.bankRegistry = bankRegistry;
         this.objectMapper = objectMapper;
         this.jdbc = jdbc;
         this.accepted = receivedCounter(meters, "accepted");
@@ -50,11 +51,12 @@ public class BankWebhookController {
             @PathVariable("bankId") String bankId,
             @RequestHeader(value = "X-Bank-Signature", required = false) String signature,
             @RequestBody byte[] body) {
-        if (!bankProperties.id().equals(bankId)) {
+        BankProperties.BankEntry bank = bankRegistry.byId(bankId);
+        if (bank == null) {
             rejected.increment();
             return ResponseEntity.notFound().build();
         }
-        if (!validSignature(signature, body)) {
+        if (!validSignature(signature, body, bank.webhookSecret())) {
             unauthorized.increment();
             return ResponseEntity.status(401).build();
         }
@@ -88,14 +90,14 @@ public class BankWebhookController {
         return ResponseEntity.ok().build();
     }
 
-    private boolean validSignature(String signature, byte[] body) {
+    private boolean validSignature(String signature, byte[] body, String webhookSecret) {
         if (signature == null) {
             return false;
         }
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
             mac.init(new SecretKeySpec(
-                    bankProperties.webhookSecret().getBytes(StandardCharsets.UTF_8),
+                    webhookSecret.getBytes(StandardCharsets.UTF_8),
                     "HmacSHA256"));
             String expected = "sha256=" + HexFormat.of().formatHex(mac.doFinal(body));
             return MessageDigest.isEqual(

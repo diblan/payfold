@@ -61,15 +61,15 @@ Honesty table:
                  └──────────┬───────────┘   constraints
                             ├── POST /psp/charges ──▶ mock-psp (WireMock)
                             │                         :8084; card verdict
-                            └── POST /collections ──▶ mock-bank (FastAPI)
-                                                      :8085; SDD submission,
-                                                      async outcomes
+                            └── POST /collections ──▶ mock-bank ×2 (same FastAPI image)
+                                                      a :8085 — BE,FR / fast
+                                                      b :8086 — NL,IE / slow
 ```
 
-### Settlement spine (R23d)
+### Settlement spine (R23e)
 
 ```
-mock-bank ── signed POST /webhooks/bank/{id} ──▶ renewal-consumer
+mock-bank ×2 ── signed POST /webhooks/bank/{id} ──▶ renewal-consumer
                                                       │
                                                       ▼
                                              settlement_inbox
@@ -196,12 +196,18 @@ unique constraint (this *is* the idempotency mechanism, [D2](decisions.md#d2)):
 
 After the shared invoice, charge, and payment upserts, the customer's payment
 method selects the counterparty. Cards keep the synchronous PSP path unchanged.
-SDD submits `POST /collections` with `collection_id` equal to the payment
-idempotency key; the bank's `200` duplicate contract deduplicates a resubmission
-after a crash. Acceptance marks the payment `submitted` with `bank_id` and
-`collection_id`, finalizes nothing, and ACKs the renewal. A bank transport
-failure is the absence of a verdict, never a failed payment: it throws and rides
-the R5 bounded listener retry to the DLQ ([G5](invariants.md#g5)).
+For SDD, a fail-fast bank registry maps the customer's uppercase-normalized
+country to an entry containing bank id, base URL, webhook secret, and claimed
+countries. Startup rejects an empty registry, incomplete entries, duplicate bank
+ids, or duplicate country claims. An unroutable or null country is a deterministic
+renewal violation and takes the no-retry path to the DLQ. A routed SDD submits
+`POST /collections` through that bank's client with `collection_id` equal to the
+payment idempotency key; the bank's `200` duplicate contract deduplicates a
+resubmission after a crash. Acceptance marks the payment `submitted` with the
+routed `bank_id` and `collection_id`, finalizes nothing, and ACKs the renewal. A
+bank transport failure is the absence of a verdict, never a failed payment: it
+throws and rides the R5 bounded listener retry to the DLQ
+([G5](invariants.md#g5)).
 
 The payment status vocabulary is `pending`, `submitted`, `succeeded`, `failed`,
 and `charged_back`. The invoice vocabulary is `draft`, `posted`, `paid`,
@@ -318,6 +324,14 @@ counterparty selected by [D13](decisions.md#d13) and
 until [R23f](roadmap.md#r23f), when cards join the same settlement spine per
 [D17](decisions.md#d17).
 
+Compose runs two instances of the same generic image. `bank-a` serves BE and FR
+on the fast profile (2 s settlement / 5 s chargeback lag); `bank-b` serves NL and
+IE on a deliberately slow profile (8 s / 10 s). Identity, callback URL, shared
+secret, and delays are per-instance environment only: adding bank N+1 is a
+compose registry entry plus another image instance, exactly the simplification
+accepted by D15. The slow profile is a chaos parameter that makes its submitted
+backlog and higher round-trip latency visible beside bank-a under the same load.
+
 `POST /collections` accepts this request:
 
 | Field | JSON type | Semantics |
@@ -415,14 +429,17 @@ Micrometer converts dots in meter names to underscores for Prometheus and append
 | `outbox.published` | `outbox_published_total` | Counter | none | By the number of confirm-gated rows immediately after their `published_at` batch update |
 | `outbox.returned` | `outbox_returned_total` | Counter | none | Once per message the broker returned as unroutable, inside the confirm-future completion that reports the row unconfirmed |
 | `renewals.processed` | `renewals_processed_total{outcome="..."}` | Counter | `outcome=succeeded \| failed \| invalid \| submitted` | Per processed delivery at its decision point: after successful finalization, at either terminal-failure return, when validation rejects the message, or after an SDD collection is parked submitted |
-| `settlements.processed` | `settlements_processed_total{outcome="..."}` | Counter | `outcome=settled \| failed \| charged_back \| invalid` | Per settlement delivery at validation or its accepted outcome; terminal redeliveries count as processings |
+| `settlements.processed` | `settlements_processed_total{outcome="...",bank="..."}` | Counter | `outcome=settled \| failed \| charged_back \| invalid`; `bank=bank-a \| bank-b \| unknown` | Per settlement delivery at validation or its accepted outcome; terminal redeliveries count as processings; invalid deliveries with no payment attribution use `unknown` |
+| `settlements.latency` | `settlements_latency_seconds_count/_sum/_max{bank="..."}` | Timer | `bank=bank-a \| bank-b` | Submission-to-terminal round trip, recorded once when a settled or failed guarded payment update succeeds |
 | `settlement.webhooks.received` | `settlement_webhooks_received_total{result="..."}` | Counter | `result=accepted \| duplicate \| unauthorized \| rejected` | Once per webhook request after its receiver decision |
 
 All counter series are registered eagerly and therefore render as `0.0` from boot;
-`verify.sh` depends on that property. The renewal outcome taxonomy is bounded to
-`succeeded`, `failed`, `invalid`, and `submitted`. Transient or unexpected failures increment no
-outcome counter because they have no decided business outcome; retries remain visible
-through the listener timer's `result="failure"` tag.
+`verify.sh` depends on that property. Settlement outcome×bank pairs and each
+bank's latency timer are likewise registered at startup, so both bank series
+exist before the first callback. The renewal outcome taxonomy is bounded to
+`succeeded`, `failed`, `invalid`, and `submitted`. Transient or unexpected failures
+increment no outcome counter because they have no decided business outcome;
+retries remain visible through the listener timer's `result="failure"` tag.
 
 | Micrometer meter | Prometheus series | Tags |
 |---|---|---|
@@ -534,10 +551,8 @@ Every remaining `application.yaml` key has a real consumer.
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |
 | `payment.provider.base-url` (consumer) | `PaymentProviderProperties`, `PspClient`; compose overrides with `PAYMENT_PROVIDER_BASE_URL` | alive |
 | `payment.provider.timeout-ms` (consumer) | `PaymentProviderProperties`, `PspClient` connect + read timeout | alive |
-| `bank.id` (consumer) | `BankProperties`, `BillingService`; compose overrides with `BANK_ID` | alive |
-| `bank.base-url` (consumer) | `BankProperties`, `BankClient`; compose overrides with `BANK_BASE_URL` | alive |
 | `bank.timeout-ms` (consumer) | `BankProperties`, `BankClient` connect + read timeout | alive |
-| `bank.webhook-secret` (consumer) | `BankProperties`, `BankWebhookController`; compose `BANK_WEBHOOK_SECRET`, shared with the configured mock-bank instance | alive |
+| `bank.registry[]` id/base URL/webhook secret/countries (consumer) | `BankProperties`, `BankRegistry`, `BankClient`, `BillingService`, `BankWebhookController`; compose overrides entries through indexed `BANK_REGISTRY_*` env vars and each secret matches its mock-bank instance | alive |
 | `spring.rabbitmq.listener.simple.*` (consumer) | Spring Boot AMQP autoconfig + `ListenerRetryConfig` (`max-attempts`) | alive |
 | `management.endpoints.web.exposure.include` (producer) | actuator exposure for `health`, `info`, `metrics`, `prometheus`, and `renewal-job` | alive |
 | `management.endpoints.web.exposure.include` (consumer) | actuator exposure for `health`, `info`, `metrics`, and `prometheus`; the compose healthcheck relies on `health` | alive |
@@ -559,12 +574,13 @@ customer number. Every seeded subscription is due on the seed day, so
 `scripts/load-test.sh` adds more due-today volume to a running stack without a
 reseed.
 
-The mock bank is likewise configured entirely by compose-only envs, deliberately
-absent from the `application.yaml` table: `BANK_HTTP_PORT`, `BANK_ID`,
-`BANK_SCHEME`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`,
-`BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`,
-`BANK_WEBHOOK_RETRY_MAX_ATTEMPTS`, and
-`BANK_WEBHOOK_RETRY_BACKOFF_SECONDS`.
+The mock-bank instances are likewise configured entirely by compose-only envs,
+deliberately absent from the `application.yaml` table: bank-a uses the `BANK_*`
+variables and bank-b uses the corresponding `BANK_B_*` host-port, secret, and
+delay variables; each container receives its own `BANK_ID`, `BANK_SCHEME`,
+`BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`,
+`BANK_SETTLEMENT_DELAY_SECONDS`, and `BANK_CHARGEBACK_LAG_SECONDS`. The retry
+cap/backoff retain the image defaults.
 
 `CONSUMER_LISTENER_CONCURRENCY` (default 1) passes straight
 through to `spring.rabbitmq.listener.simple.concurrency`, and the consumer's host ports
@@ -585,7 +601,8 @@ The deploy images' env contracts (`FLYWAY_*`, `POSTGRES_*`) are catalogued under
 | `localhost:8080` | producer — `/actuator/health`, `/actuator/prometheus`, `POST /actuator/renewal-job?force=true`, `GET /actuator/renewal-job/{executionId}` |
 | `localhost:8081` | consumer's first replica — `/actuator/health` (since [R1](roadmap.md#r1)), `/actuator/prometheus`, `POST /webhooks/bank/{bankId}`; scaled replicas bind 8082–8083 with the same endpoints; container-internal 8080 |
 | `localhost:8084` | mock PSP (WireMock) — POST `/psp/charges`; admin/journal at `/__admin`; moved off 8082 by [R20](roadmap.md#r20) (consumer replica range) |
-| `localhost:8085` | mock bank (FastAPI) — `POST /collections`, `GET /collections/{id}`, `/health`, `/metrics` |
+| `localhost:8085` | mock bank-a (FastAPI, BE+FR fast profile) — `POST /collections`, `GET /collections/{id}`, `/health`, `/metrics` |
+| `localhost:8086` | mock bank-b (same image, NL+IE slow profile) — `POST /collections`, `GET /collections/{id}`, `/health`, `/metrics` |
 | `localhost:9090` | Prometheus — targets, `/api/v1/query`, `/-/healthy` |
 | `localhost:3000` | Grafana — `payfold-pipeline` dashboard, anonymous viewer access |
 | `localhost:5672` / `15672` | RabbitMQ AMQP / management UI (creds from `.env`) |
@@ -607,10 +624,10 @@ architecture-independent jar once instead of emulating Maven under QEMU.
 | Image (`ghcr.io/diblan/…`) | Contents | Run pattern | Config (env) |
 |---|---|---|---|
 | `payfold-renewal-producer` | producer Spring Boot jar | long-running service; port 8080, `/actuator/health` | the compose `renewal-producer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_ROUTINGKEY`, `APP_TIMEZONE`, `APP_SCHEDULECRON`, `TZ` |
-| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, `PAYMENT_PROVIDER_BASE_URL`, `BANK_ID`, `BANK_BASE_URL`, `TZ` |
+| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, `PAYMENT_PROVIDER_BASE_URL`, indexed `BANK_REGISTRY_*`, `TZ` |
 | `payfold-migrations` | `flyway/flyway:11` + `db-migrations/V*.sql`, `CMD ["migrate"]` | run-to-completion Job; exit 0 = success; re-run on a current schema is a no-op (asserted by `verify.sh`) | `FLYWAY_URL`, `FLYWAY_USER`, `FLYWAY_PASSWORD`, `FLYWAY_CONNECT_RETRIES` (image default 30) |
 | `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS`, `SEED_SDD_PERCENT`, `SEED_SDD_RULE_PERCENT` |
-| `payfold-mock-bank` | FastAPI mock bank (source + pinned pure-python deps) | long-running service; port 8080, `/health` | `BANK_ID`, `BANK_SCHEME`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `TZ` |
+| `payfold-mock-bank` | FastAPI mock bank (source + pinned pure-python deps) | long-running service; port 8080, `/health`; compose runs ×2 differently profiled instances | `BANK_ID`, `BANK_SCHEME`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `TZ` |
 
 Compose builds `payfold-migrations` and `payfold-seed-data-gen` itself (the flyway
 and seed-data services) instead of bind-mounting host paths, so the local stack

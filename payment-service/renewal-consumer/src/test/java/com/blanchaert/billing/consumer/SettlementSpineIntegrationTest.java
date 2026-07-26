@@ -4,6 +4,7 @@ import com.blanchaert.billing.consumer.config.SettlementTopology;
 import com.blanchaert.billing.consumer.model.RenewalRequested;
 import com.blanchaert.billing.consumer.model.SettlementReceived;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.springframework.amqp.core.AmqpAdmin;
 import org.springframework.amqp.core.Message;
@@ -50,8 +51,10 @@ import static org.awaitility.Awaitility.await;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @Testcontainers
 class SettlementSpineIntegrationTest {
-    private static final String BANK_ID = "bank-test";
-    private static final String WEBHOOK_SECRET = "spine-test-secret";
+    private static final String BANK_A_ID = "bank-a";
+    private static final String BANK_B_ID = "bank-b";
+    private static final String BANK_A_SECRET = "bank-a-secret";
+    private static final String BANK_B_SECRET = "bank-b-secret";
 
     @Container
     @ServiceConnection
@@ -77,10 +80,15 @@ class SettlementSpineIntegrationTest {
                 + wireMock.getMappedPort(8080);
         registry.add("payment.provider.base-url", () -> wireMockUrl);
         registry.add("payment.provider.timeout-ms", () -> "1000");
-        registry.add("bank.base-url", () -> wireMockUrl);
         registry.add("bank.timeout-ms", () -> "1000");
-        registry.add("bank.id", () -> BANK_ID);
-        registry.add("bank.webhook-secret", () -> WEBHOOK_SECRET);
+        registry.add("bank.registry[0].id", () -> BANK_A_ID);
+        registry.add("bank.registry[0].base-url", () -> wireMockUrl + "/bank-a");
+        registry.add("bank.registry[0].webhook-secret", () -> BANK_A_SECRET);
+        registry.add("bank.registry[0].countries", () -> "BE");
+        registry.add("bank.registry[1].id", () -> BANK_B_ID);
+        registry.add("bank.registry[1].base-url", () -> wireMockUrl + "/bank-b");
+        registry.add("bank.registry[1].webhook-secret", () -> BANK_B_SECRET);
+        registry.add("bank.registry[1].countries", () -> "NL");
     }
 
     @LocalServerPort
@@ -98,21 +106,24 @@ class SettlementSpineIntegrationTest {
     @Autowired
     private ObjectMapper objectMapper;
 
+    @Autowired
+    private MeterRegistry meters;
+
     @Test
     void duplicateWebhookInsertsOneRowAndFinalizesOnce() throws Exception {
         SubmittedPayment fixture = parkSubmitted("01");
         byte[] webhook = webhook(
                 fixture.collectionId(), 1, "settled", null);
 
-        assertThat(postWebhook(BANK_ID, webhook, sign(webhook, WEBHOOK_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, webhook, sign(webhook, BANK_A_SECRET)))
                 .isEqualTo(200);
-        assertThat(postWebhook(BANK_ID, webhook, sign(webhook, WEBHOOK_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, webhook, sign(webhook, BANK_A_SECRET)))
                 .isEqualTo(200);
 
         assertThat(jdbc.queryForObject("""
                 SELECT count(*) FROM settlement_inbox
                 WHERE bank_id = ? AND notification_id = ?
-                """, Long.class, BANK_ID, fixture.collectionId() + ":1")).isEqualTo(1L);
+                """, Long.class, BANK_A_ID, fixture.collectionId() + ":1")).isEqualTo(1L);
 
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             assertThat(paymentStatus(fixture)).isEqualTo("succeeded");
@@ -200,12 +211,12 @@ class SettlementSpineIntegrationTest {
         byte[] validBody = webhook("collection-rejected", 1, "settled", null);
         byte[] garbage = "not json".getBytes(StandardCharsets.UTF_8);
 
-        assertThat(postWebhook(BANK_ID, validBody, sign(validBody, "wrong-secret")))
+        assertThat(postWebhook(BANK_A_ID, validBody, sign(validBody, "wrong-secret")))
                 .isEqualTo(401);
-        assertThat(postWebhook(BANK_ID, garbage, sign(garbage, WEBHOOK_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, garbage, sign(garbage, BANK_A_SECRET)))
                 .isEqualTo(400);
         assertThat(postWebhook(
-                "unknown-bank", validBody, sign(validBody, WEBHOOK_SECRET)))
+                "unknown-bank", validBody, sign(validBody, BANK_A_SECRET)))
                 .isEqualTo(404);
 
         assertThat(jdbc.queryForObject(
@@ -214,11 +225,35 @@ class SettlementSpineIntegrationTest {
     }
 
     @Test
+    void webhookSecretsArePerBank() throws Exception {
+        SubmittedPayment fixture = parkSubmitted("09", "NL");
+        byte[] settled =
+                webhook(BANK_B_ID, fixture.collectionId(), 1, "settled", null);
+
+        assertThat(postWebhook(BANK_B_ID, settled, sign(settled, BANK_A_SECRET)))
+                .isEqualTo(401);
+        assertThat(jdbc.queryForObject("""
+                SELECT count(*) FROM settlement_inbox
+                WHERE bank_id = ? AND notification_id = ?
+                """, Long.class, BANK_B_ID, fixture.collectionId() + ":1")).isZero();
+
+        assertThat(postWebhook(BANK_B_ID, settled, sign(settled, BANK_B_SECRET)))
+                .isEqualTo(200);
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            assertThat(paymentStatus(fixture)).isEqualTo("succeeded");
+            assertThat(meters.get("settlements.latency")
+                    .tag("bank", BANK_B_ID)
+                    .timer()
+                    .count()).isGreaterThanOrEqualTo(1L);
+        });
+    }
+
+    @Test
     void failedOutcomeIsTerminalWithReason() throws Exception {
         SubmittedPayment fixture = parkSubmitted("05");
         byte[] webhook = webhook(fixture.collectionId(), 1, "failed", "AM04");
 
-        assertThat(postWebhook(BANK_ID, webhook, sign(webhook, WEBHOOK_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, webhook, sign(webhook, BANK_A_SECRET)))
                 .isEqualTo(200);
 
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
@@ -247,11 +282,11 @@ class SettlementSpineIntegrationTest {
         byte[] settled = webhook(fixture.collectionId(), 1, "settled", null);
         byte[] chargedBack = webhook(fixture.collectionId(), 2, "charged_back", "MD06");
 
-        assertThat(postWebhook(BANK_ID, settled, sign(settled, WEBHOOK_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, settled, sign(settled, BANK_A_SECRET)))
                 .isEqualTo(200);
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(fixture)).isEqualTo("succeeded"));
-        assertThat(postWebhook(BANK_ID, chargedBack, sign(chargedBack, WEBHOOK_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, chargedBack, sign(chargedBack, BANK_A_SECRET)))
                 .isEqualTo(200);
 
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
@@ -280,24 +315,24 @@ class SettlementSpineIntegrationTest {
         byte[] settled = webhook(fixture.collectionId(), 1, "settled", null);
         byte[] chargedBack = webhook(fixture.collectionId(), 2, "charged_back", "MD06");
 
-        assertThat(postWebhook(BANK_ID, settled, sign(settled, WEBHOOK_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, settled, sign(settled, BANK_A_SECRET)))
                 .isEqualTo(200);
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(fixture)).isEqualTo("succeeded"));
-        assertThat(postWebhook(BANK_ID, chargedBack, sign(chargedBack, WEBHOOK_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, chargedBack, sign(chargedBack, BANK_A_SECRET)))
                 .isEqualTo(200);
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(fixture)).isEqualTo("charged_back"));
         Instant firstChargedBackAt = chargedBackAt(fixture);
 
-        assertThat(postWebhook(BANK_ID, chargedBack, sign(chargedBack, WEBHOOK_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, chargedBack, sign(chargedBack, BANK_A_SECRET)))
                 .isEqualTo(200);
 
         await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
             assertThat(jdbc.queryForObject("""
                     SELECT count(*) FROM settlement_inbox
                     WHERE bank_id = ? AND notification_id = ?
-                    """, Long.class, BANK_ID, fixture.collectionId() + ":2")).isEqualTo(1L);
+                    """, Long.class, BANK_A_ID, fixture.collectionId() + ":2")).isEqualTo(1L);
             assertThat(paymentStatus(fixture)).isEqualTo("charged_back");
             assertThat(jdbc.queryForObject("""
                     SELECT failure_reason FROM payment WHERE collection_id = ?
@@ -344,6 +379,11 @@ class SettlementSpineIntegrationTest {
     }
 
     private SubmittedPayment parkSubmitted(String ibanSuffix) throws Exception {
+        return parkSubmitted(ibanSuffix, "BE");
+    }
+
+    private SubmittedPayment parkSubmitted(String ibanSuffix, String country)
+            throws Exception {
         UUID customerId = UUID.randomUUID();
         UUID subscriptionId = UUID.randomUUID();
         UUID planId = jdbc.queryForObject(
@@ -357,10 +397,10 @@ class SettlementSpineIntegrationTest {
         jdbc.update("""
                 INSERT INTO customer (id, email, name, status, payment_method,
                 debtor_iban, mandate_reference, country)
-                VALUES (?, ?, ?, 'active', 'sdd', ?, ?, 'BE')
+                VALUES (?, ?, ?, 'active', 'sdd', ?, ?, ?)
                 """, customerId, "settlement-" + customerId + "@example.com",
                 "Settlement Test Customer", "BE68000000000000" + ibanSuffix,
-                "MNDT-" + customerId.toString().substring(0, 8));
+                "MNDT-" + customerId.toString().substring(0, 8), country);
         jdbc.update("""
                 INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
                 VALUES (?, ?, ?, 'active', ?)
@@ -384,8 +424,14 @@ class SettlementSpineIntegrationTest {
 
     private byte[] webhook(
             String collectionId, int sequence, String outcome, String reason) {
+        return webhook(BANK_A_ID, collectionId, sequence, outcome, reason);
+    }
+
+    private byte[] webhook(
+            String bankId, String collectionId, int sequence,
+            String outcome, String reason) {
         String reasonJson = reason == null ? "null" : "\"" + reason + "\"";
-        return ("{\"schema_version\":1,\"bank_id\":\"" + BANK_ID
+        return ("{\"schema_version\":1,\"bank_id\":\"" + bankId
                 + "\",\"notification_id\":\"" + collectionId + ":" + sequence
                 + "\",\"collection_id\":\"" + collectionId
                 + "\",\"outcome\":\"" + outcome + "\",\"reason\":" + reasonJson
@@ -396,7 +442,7 @@ class SettlementSpineIntegrationTest {
     private SettlementReceived settlement(
             String collectionId, int sequence, String outcome, String reason) {
         return new SettlementReceived(
-                1, collectionId + ":" + sequence, BANK_ID, collectionId,
+                1, collectionId + ":" + sequence, BANK_A_ID, collectionId,
                 outcome, reason, "2030-01-01T00:00:00+00:00");
     }
 

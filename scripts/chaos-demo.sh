@@ -2,7 +2,7 @@
 # Narrated chaos demo for a RUNNING Payfold stack.
 #
 # Scenes: pipeline, poison isolation, worker loss, scale-out, broker restart,
-# and chargebacks under slow/fast bank profiles.
+# chargebacks under slow/fast profiles, and per-country slow-bank lag/drain.
 #
 # Usage:
 #   scripts/chaos-demo.sh [--auto] [--timeout SECONDS]
@@ -53,6 +53,7 @@ RMQ_EXCHANGE="$(env_val RABBITMQ_EXCHANGE billing.renewals)"
 RMQ_RK="$(env_val RABBITMQ_ROUTINGKEY renewal.requested)"
 PSP_FAIL_HEX="$(env_val PSP_FAIL_HEX 0)"
 BANK_PORT="$(env_val BANK_HTTP_PORT 8085)"
+BANK_B_PORT="$(env_val BANK_B_HTTP_PORT 8086)"
 RMQ_DLQ="billing.renewals.dlq"
 SETTLEMENT_DLQ="billing.settlements.dlq"
 
@@ -155,6 +156,11 @@ broker_up() {
 
 bank_up() {
   curl -fsS "http://localhost:${BANK_PORT}/health" 2>/dev/null \
+    | grep -q '"status":"ok"'
+}
+
+bank_b_up() {
+  curl -fsS "http://localhost:${BANK_B_PORT}/health" 2>/dev/null \
     | grep -q '"status":"ok"'
 }
 
@@ -345,6 +351,49 @@ SQL
   return 1
 }
 
+seed_routed_cohort() {
+  local bank="$1" country="$2" n="$3" seed_out
+  note "seeding ${n} clean SDD subscriptions for ${bank} (${country})…"
+  if ! seed_out="$(docker compose exec -T postgres psql -U "$PGUSER" -d "$PGDB" -v ON_ERROR_STOP=1 <<SQL
+WITH seed_plan AS (
+    SELECT id, interval FROM plan
+    WHERE interval = CASE WHEN (now() - interval '1 month') + interval '1 month' = now()
+                          THEN 'month' ELSE 'year' END
+    ORDER BY name LIMIT 1
+), new_customers AS (
+    INSERT INTO customer (
+        id, email, name, payment_method, debtor_iban, mandate_reference, country
+    )
+    SELECT gen_random_uuid(),
+           'chaos-7-${bank}-${RUN_TAG}-' || n || '@example.test',
+           'Chaos 7 ${bank} Customer ' || n,
+           'sdd',
+           '${country}00' || lpad(n::text, 12, '0') || '01',
+           'MNDT-CHAOS-7-${bank}-' || n,
+           '${country}'
+    FROM generate_series(1, ${n}) n
+    RETURNING id
+)
+INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
+SELECT gen_random_uuid(), c.id, (SELECT id FROM seed_plan), 'active',
+       CASE WHEN (SELECT interval FROM seed_plan) = 'year'
+            THEN now() - INTERVAL '1 year' ELSE now() - INTERVAL '1 month' END
+FROM new_customers c;
+ANALYZE customer;
+ANALYZE subscription;
+SQL
+)"; then
+    fail "scene 7 seeded ${bank} cohort" "psql failed: ${seed_out}"
+    return 1
+  fi
+  if echo "$seed_out" | grep -q "INSERT 0 ${n}$"; then
+    pass "scene 7 seeded ${bank} cohort (${n} clean ${country} SDD renewals)"
+    return 0
+  fi
+  fail "scene 7 seeded ${bank} cohort" "unexpected psql output: ${seed_out}"
+  return 1
+}
+
 responsive_consumer_count() {
   local count=0 port
   for port in $(seq "$CONSUMER_PORT" "$CONSUMER_PORT_END"); do
@@ -369,6 +418,7 @@ wait_until "producer /actuator/health UP" producer_up || summary
 wait_until "consumer /actuator/health UP" consumer_up || summary
 wait_until "RabbitMQ management API reachable" broker_up || summary
 wait_until "mock-bank /health ok" bank_up || summary
+wait_until "mock-bank-b /health ok" bank_b_up || summary
 wait_until "starting outbox fully published" outbox_drained || summary
 wait_until "starting main queue empty" main_queue_empty || summary
 wait_until "starting due-today rows exactly billed" billed_ok || summary
@@ -748,6 +798,50 @@ settlements_dlq_empty() {
   [[ "$(queue_depth "$SETTLEMENT_DLQ")" == "0" ]]
 }
 wait_until "scene 6 settlements DLQ empty" settlements_dlq_empty
+
+pause_between_scenes
+
+scene 7 "Country routing makes the slow bank lag, then its backlog drains"
+note "Watch the per-bank settlement latency and outcome panels: bank-a (BE) clears before deliberately slow bank-b (NL)."
+SCENE_7_SIZE=20
+seed_routed_cohort bank-a BE "$SCENE_7_SIZE" || summary
+seed_routed_cohort bank-b NL "$SCENE_7_SIZE" || summary
+trigger_and_wait "scene 7 renewal job trigger" || summary
+wait_until "scene 7 outbox fully published" outbox_drained || summary
+
+scene_7_terminal_count() {
+  q "SELECT count(*) FROM payment p
+JOIN charge ch ON ch.id = p.charge_id
+JOIN subscription s ON s.id = ch.subscription_id
+JOIN customer c ON c.id = s.customer_id
+WHERE c.email LIKE 'chaos-7-$1-${RUN_TAG}-%@example.test'
+  AND p.bank_id = '$1'
+  AND p.status IN ('succeeded','failed','charged_back')"
+}
+scene_7_submitted_count() {
+  q "SELECT count(*) FROM payment p
+JOIN charge ch ON ch.id = p.charge_id
+JOIN subscription s ON s.id = ch.subscription_id
+JOIN customer c ON c.id = s.customer_id
+WHERE c.email LIKE 'chaos-7-$1-${RUN_TAG}-%@example.test'
+  AND p.bank_id = '$1'
+  AND p.status = 'submitted'"
+}
+scene_7_fast_done_slow_lagging() {
+  local fast_terminal slow_submitted
+  fast_terminal="$(scene_7_terminal_count bank-a)"
+  slow_submitted="$(scene_7_submitted_count bank-b)"
+  [[ "$fast_terminal" == "$SCENE_7_SIZE"
+    && "$slow_submitted" =~ ^[0-9]+$
+    && "$slow_submitted" -ge 1 ]]
+}
+wait_until "scene 7 bank-a cohort fully terminal while bank-b still has a submitted backlog" scene_7_fast_done_slow_lagging || summary
+
+scene_7_slow_drained() {
+  [[ "$(scene_7_terminal_count bank-b)" == "$SCENE_7_SIZE"
+    && "$(scene_7_submitted_count bank-b)" == "0" ]]
+}
+wait_until "scene 7 bank-b submitted backlog drained fully terminal" scene_7_slow_drained
 
 echo
 note "epilogue: returning the stack to one renewal-consumer replica…"

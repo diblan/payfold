@@ -103,6 +103,29 @@ services:
       timeout: 3s
       retries: 20
 
+  # Same image, different profile — D15's bank N+1 claim, proven; bank-b is
+  # deliberately the slow bank.
+  mock-bank-b:
+    build:
+      context: ./mock-bank
+    image: payfold-mock-bank:latest
+    container_name: mock-bank-b
+    environment:
+      BANK_ID: bank-b
+      BANK_SCHEME: sepa_core
+      BANK_WEBHOOK_URL: http://renewal-consumer:8080/webhooks/bank/bank-b
+      BANK_WEBHOOK_SECRET: ${BANK_B_WEBHOOK_SECRET:-payfold-dev-secret-b}
+      BANK_SETTLEMENT_DELAY_SECONDS: ${BANK_B_SETTLEMENT_DELAY_SECONDS:-8}
+      BANK_CHARGEBACK_LAG_SECONDS: ${BANK_B_CHARGEBACK_LAG_SECONDS:-10}
+      TZ: ${TZ}
+    ports:
+      - "${BANK_B_HTTP_PORT:-8086}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8080/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   # Seed data runs from the same payfold-seed-data-gen image CI publishes
   # (D11/R18): seeder source, JDBC driver, and name data are baked in at build
   # time; entrypoint and working dir come from the image.
@@ -186,9 +209,14 @@ services:
       RABBITMQ_QUEUE: ${RABBITMQ_QUEUE}
       RABBITMQ_ROUTINGKEY: ${RABBITMQ_ROUTINGKEY}
       PAYMENT_PROVIDER_BASE_URL: http://mock-psp:8080
-      BANK_ID: ${BANK_ID:-bank-a}
-      BANK_BASE_URL: http://mock-bank:8080
-      BANK_WEBHOOK_SECRET: ${BANK_WEBHOOK_SECRET:-payfold-dev-secret}
+      BANK_REGISTRY_0_ID: bank-a
+      BANK_REGISTRY_0_BASE_URL: http://mock-bank:8080
+      BANK_REGISTRY_0_WEBHOOK_SECRET: ${BANK_WEBHOOK_SECRET:-payfold-dev-secret}
+      BANK_REGISTRY_0_COUNTRIES: BE,FR
+      BANK_REGISTRY_1_ID: bank-b
+      BANK_REGISTRY_1_BASE_URL: http://mock-bank-b:8080
+      BANK_REGISTRY_1_WEBHOOK_SECRET: ${BANK_B_WEBHOOK_SECRET:-payfold-dev-secret-b}
+      BANK_REGISTRY_1_COUNTRIES: NL,IE
     ports:
       - "${CONSUMER_HTTP_PORT:-8081}-${CONSUMER_HTTP_PORT_END:-8083}:8080"
     depends_on:
@@ -199,6 +227,8 @@ services:
       mock-psp:
         condition: service_healthy
       mock-bank:
+        condition: service_healthy
+      mock-bank-b:
         condition: service_healthy
       flyway:
         condition: service_completed_successfully

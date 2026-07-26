@@ -72,11 +72,19 @@ class RenewalListenerIntegrationTest {
 
     @DynamicPropertySource
     static void pspProperties(DynamicPropertyRegistry registry) {
-        registry.add("payment.provider.base-url", () -> "http://" + mockPsp.getHost() + ":" + mockPsp.getMappedPort(8080));
+        String wireMockUrl =
+                "http://" + mockPsp.getHost() + ":" + mockPsp.getMappedPort(8080);
+        registry.add("payment.provider.base-url", () -> wireMockUrl);
         registry.add("payment.provider.timeout-ms", () -> "1000");
-        registry.add("bank.base-url", () -> "http://" + mockPsp.getHost() + ":" + mockPsp.getMappedPort(8080));
         registry.add("bank.timeout-ms", () -> "1000");
-        registry.add("bank.id", () -> "bank-test");
+        registry.add("bank.registry[0].id", () -> "bank-a");
+        registry.add("bank.registry[0].base-url", () -> wireMockUrl + "/bank-a");
+        registry.add("bank.registry[0].webhook-secret", () -> "bank-a-secret");
+        registry.add("bank.registry[0].countries", () -> "BE");
+        registry.add("bank.registry[1].id", () -> "bank-b");
+        registry.add("bank.registry[1].base-url", () -> wireMockUrl + "/bank-b");
+        registry.add("bank.registry[1].webhook-secret", () -> "bank-b-secret");
+        registry.add("bank.registry[1].countries", () -> "NL");
     }
 
     @Autowired
@@ -489,7 +497,7 @@ class RenewalListenerIntegrationTest {
                 String.class, idempotencyKey)).isEqualTo("SEPA_DD");
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT bank_id FROM payment WHERE idempotency_key = ?",
-                String.class, idempotencyKey)).isEqualTo("bank-test");
+                String.class, idempotencyKey)).isEqualTo("bank-a");
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT collection_id FROM payment WHERE idempotency_key = ?",
                 String.class, idempotencyKey)).isEqualTo(idempotencyKey);
@@ -507,7 +515,7 @@ class RenewalListenerIntegrationTest {
                 (rs, rowNum) -> rs.getTimestamp(1).toInstant(), subscriptionId);
         assertThat(renewedAt).isEqualTo(originalRenewedAt.atOffset(ZoneOffset.UTC).toInstant());
         assertThat(pspRequestCount(subscriptionId)).isZero();
-        assertThat(bankRequestCount(idempotencyKey)).isEqualTo(1);
+        assertThat(bankRequestCount("bank-a", idempotencyKey)).isEqualTo(1);
 
         await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).until(
                 () -> amqpAdmin.getQueueInfo("billing.renewals.dlq").getMessageCount() == 0
@@ -517,6 +525,64 @@ class RenewalListenerIntegrationTest {
                         .tag("outcome", "submitted")
                         .counter()
                         .count() - submittedBefore).isEqualTo(1.0));
+    }
+
+    @Test
+    void sddRoutingIsDeterministicByCountry() throws JsonProcessingException {
+        UUID beCustomerId = UUID.randomUUID();
+        UUID nlCustomerId = UUID.randomUUID();
+        UUID beSubscriptionId = UUID.randomUUID();
+        UUID nlSubscriptionId = UUID.randomUUID();
+        UUID planId = jdbcTemplate.queryForObject(
+                "SELECT id FROM plan WHERE name = 'Standard'", UUID.class);
+        LocalDate dueDate = LocalDate.of(2027, 4, 15);
+        String beKey = "sub-" + beSubscriptionId + "|" + dueDate;
+        String nlKey = "sub-" + nlSubscriptionId + "|" + dueDate;
+
+        insertSddCustomer(beCustomerId, "BE6800000000000001", "BE");
+        insertSddCustomer(nlCustomerId, "NL9100000000000001", "NL");
+        jdbcTemplate.update("""
+                INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
+                VALUES (?, ?, ?, 'active', ?), (?, ?, ?, 'active', ?)
+                """,
+                beSubscriptionId, beCustomerId, planId,
+                dueDate.minusMonths(1).atStartOfDay().atOffset(ZoneOffset.UTC),
+                nlSubscriptionId, nlCustomerId, planId,
+                dueDate.minusMonths(1).atStartOfDay().atOffset(ZoneOffset.UTC));
+
+        RenewalRequested beRenewal = new RenewalRequested(
+                1, UUID.randomUUID(), beSubscriptionId, beCustomerId, planId, "month",
+                1499, "EUR", beKey, dueDate.toString(), dueDate.toString(),
+                dueDate.plusMonths(1).toString(), "2027-04-15T00:00:00.000Z");
+        RenewalRequested nlRenewal = new RenewalRequested(
+                1, UUID.randomUUID(), nlSubscriptionId, nlCustomerId, planId, "month",
+                1499, "EUR", nlKey, dueDate.toString(), dueDate.toString(),
+                dueDate.plusMonths(1).toString(), "2027-04-15T00:00:00.000Z");
+
+        rabbitTemplate.convertAndSend(
+                "billing.renewals", "renewal.requested",
+                MessageBuilder.withBody(objectMapper.writeValueAsBytes(beRenewal))
+                        .setContentType(MessageProperties.CONTENT_TYPE_JSON)
+                        .build());
+        rabbitTemplate.convertAndSend(
+                "billing.renewals", "renewal.requested",
+                MessageBuilder.withBody(objectMapper.writeValueAsBytes(nlRenewal))
+                        .setContentType(MessageProperties.CONTENT_TYPE_JSON)
+                        .build());
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT bank_id FROM payment WHERE idempotency_key = ?",
+                    String.class, beKey)).isEqualTo("bank-a");
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT bank_id FROM payment WHERE idempotency_key = ?",
+                    String.class, nlKey)).isEqualTo("bank-b");
+        });
+
+        assertThat(bankRequestCount("bank-a", beKey)).isEqualTo(1);
+        assertThat(bankRequestCount("bank-b", beKey)).isZero();
+        assertThat(bankRequestCount("bank-b", nlKey)).isEqualTo(1);
+        assertThat(bankRequestCount("bank-a", nlKey)).isZero();
     }
 
     @Test
@@ -589,7 +655,7 @@ class RenewalListenerIntegrationTest {
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM charge WHERE subscription_id = ?",
                 Long.class, subscriptionId)).isEqualTo(1L);
-        assertThat(bankRequestCount(idempotencyKey)).isEqualTo(1);
+        assertThat(bankRequestCount("bank-a", idempotencyKey)).isEqualTo(1);
         assertThat(amqpAdmin.getQueueInfo("billing.renewals.dlq").getMessageCount()).isZero();
     }
 
@@ -612,7 +678,7 @@ class RenewalListenerIntegrationTest {
                 originalRenewedAt.atOffset(ZoneOffset.UTC));
 
         String stub = """
-                {"priority":5,"request":{"method":"POST","urlPath":"/collections","bodyPatterns":[{"matchesJsonPath":{"expression":"$.collection_id","equalTo":"%s"}}]},"response":{"status":500}}
+                {"priority":5,"request":{"method":"POST","urlPath":"/bank-a/collections","bodyPatterns":[{"matchesJsonPath":{"expression":"$.collection_id","equalTo":"%s"}}]},"response":{"status":500}}
                 """.formatted(failingKey);
         RestClient.create()
                 .post()
@@ -654,7 +720,7 @@ class RenewalListenerIntegrationTest {
                 (rs, rowNum) -> rs.getTimestamp(1).toInstant(), subscriptionId);
         assertThat(renewedAt).isEqualTo(originalRenewedAt.atOffset(ZoneOffset.UTC).toInstant());
         assertThat(pspRequestCount(subscriptionId)).isZero();
-        assertThat(bankRequestCount(failingKey)).isEqualTo(5);
+        assertThat(bankRequestCount("bank-a", failingKey)).isEqualTo(5);
 
         Message deadLetter = rabbitTemplate.receive("billing.renewals.dlq", 5000);
         assertThat(deadLetter).isNotNull();
@@ -954,10 +1020,11 @@ class RenewalListenerIntegrationTest {
         return objectMapper.readTree(response).path("count").asInt();
     }
 
-    private int bankRequestCount(String collectionId) throws JsonProcessingException {
+    private int bankRequestCount(String bank, String collectionId)
+            throws JsonProcessingException {
         String request = """
-                {"method":"POST","urlPath":"/collections","bodyPatterns":[{"matchesJsonPath":{"expression":"$.collection_id","equalTo":"%s"}}]}
-                """.formatted(collectionId);
+                {"method":"POST","urlPath":"/%s/collections","bodyPatterns":[{"matchesJsonPath":{"expression":"$.collection_id","equalTo":"%s"}}]}
+                """.formatted(bank, collectionId);
         String response = RestClient.create()
                 .post()
                 .uri("http://" + mockPsp.getHost() + ":" + mockPsp.getMappedPort(8080) + "/__admin/requests/count")
@@ -969,15 +1036,20 @@ class RenewalListenerIntegrationTest {
     }
 
     private void insertSddCustomer(UUID customerId, String debtorIban) {
+        insertSddCustomer(customerId, debtorIban, "BE");
+    }
+
+    private void insertSddCustomer(
+            UUID customerId, String debtorIban, String country) {
         jdbcTemplate.update("""
                 INSERT INTO customer (id, email, name, status, payment_method,
                 debtor_iban, mandate_reference, country)
-                VALUES (?, ?, ?, 'active', 'sdd', ?, ?, 'BE')
+                VALUES (?, ?, ?, 'active', 'sdd', ?, ?, ?)
                 """, customerId, "sdd-test-" + customerId + "@example.com",
                 // mandate_reference is VARCHAR(35) (the SEPA UMR maximum): a full
                 // UUID suffix would overflow it, eight hex chars keep it unique enough.
                 "SDD Test Customer", debtorIban,
-                "MNDT-TEST-" + customerId.toString().substring(0, 8));
+                "MNDT-TEST-" + customerId.toString().substring(0, 8), country);
     }
 
     // Pin subscription ids so the deterministic PSP suffix rules cannot make existing tests flaky.

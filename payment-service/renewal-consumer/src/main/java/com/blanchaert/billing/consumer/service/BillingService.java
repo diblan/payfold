@@ -2,6 +2,7 @@ package com.blanchaert.billing.consumer.service;
 
 import com.blanchaert.billing.consumer.bank.BankClient;
 import com.blanchaert.billing.consumer.config.BankProperties;
+import com.blanchaert.billing.consumer.config.BankRegistry;
 import com.blanchaert.billing.consumer.model.RenewalRequested;
 import com.blanchaert.billing.consumer.psp.PspChargeOutcome;
 import com.blanchaert.billing.consumer.psp.PspClient;
@@ -24,18 +25,18 @@ public class BillingService {
     private final JdbcTemplate jdbc;
     private final PspClient psp;
     private final BankClient bank;
-    private final BankProperties bankProps;
+    private final BankRegistry bankRegistry;
     private final Counter processedSucceeded;
     private final Counter processedFailed;
     private final Counter processedInvalid;
     private final Counter processedSubmitted;
 
     public BillingService(JdbcTemplate jdbc, PspClient psp, BankClient bank,
-                          BankProperties bankProps, MeterRegistry meters) {
+                          BankRegistry bankRegistry, MeterRegistry meters) {
         this.jdbc = jdbc;
         this.psp = psp;
         this.bank = bank;
-        this.bankProps = bankProps;
+        this.bankRegistry = bankRegistry;
         this.processedSucceeded = processedCounter(meters, "succeeded");
         this.processedFailed = processedCounter(meters, "failed");
         this.processedInvalid = processedCounter(meters, "invalid");
@@ -51,7 +52,7 @@ public class BillingService {
         }
 
         CustomerBilling customerBilling = jdbc.query("""
-                        SELECT payment_method, debtor_iban, mandate_reference
+                        SELECT payment_method, debtor_iban, mandate_reference, country
                         FROM customer
                         WHERE id = ?
                         """,
@@ -59,12 +60,23 @@ public class BillingService {
                         ? new CustomerBilling(
                                 rs.getString("payment_method"),
                                 rs.getString("debtor_iban"),
-                                rs.getString("mandate_reference"))
+                                rs.getString("mandate_reference"),
+                                rs.getString("country"))
                         : null,
                 evt.customer_id());
         if (customerBilling == null) {
             processedInvalid.increment();
             throw invalid(evt, "customer_id", "customer not found");
+        }
+
+        BankProperties.BankEntry bankEntry = null;
+        if ("sdd".equals(customerBilling.paymentMethod())) {
+            bankEntry = bankRegistry.byCountry(customerBilling.country());
+            if (bankEntry == null) {
+                processedInvalid.increment();
+                throw invalid(evt, "customer_id",
+                        "no bank routes country " + customerBilling.country());
+            }
         }
 
         LocalDate dueDate = LocalDate.parse(evt.due_date());
@@ -86,14 +98,14 @@ public class BillingService {
                 // healed by redelivery re-submitting the same collection_id, which
                 // the bank deduplicates (200 duplicate). collection_id IS the
                 // idempotency key: one renewal, one collection, forever.
-                bank.submitCollection(idem, evt.amount_cents(), evt.currency(),
+                bank.submitCollection(bankEntry.id(), idem, evt.amount_cents(), evt.currency(),
                         customerBilling.debtorIban(), customerBilling.mandateReference(), evt.due_date());
                 jdbc.update("""
                                 UPDATE payment
                                 SET status = 'submitted', bank_id = ?, collection_id = ?
                                 WHERE id = ? AND status = 'pending'
                                 """,
-                        bankProps.id(), idem, paymentId);
+                        bankEntry.id(), idem, paymentId);
             }
             // Parked or already handled: settlement finalizes via the R23c inbox
             // spine, never here. Nothing is finalized on the submission path.
@@ -239,6 +251,7 @@ public class BillingService {
                 Timestamp.valueOf(ldt), subscriptionId);
     }
 
-    record CustomerBilling(String paymentMethod, String debtorIban, String mandateReference) {
+    record CustomerBilling(
+            String paymentMethod, String debtorIban, String mandateReference, String country) {
     }
 }

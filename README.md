@@ -57,6 +57,9 @@ This README stays a quickstart; everything deeper belongs in `docs/`.
    - `rabbitmq`: RabbitMQ 3.13 with the management UI exposed locally
    - `mock-psp`: WireMock mock payment provider (port `8084`), declining a
      deterministic `PSP_FAIL_HEX` slice of renewals
+   - `mock-bank` / `mock-bank-b`: two instances of the same SEPA counterparty
+     image; bank-a serves BE+FR on port `8085`, while deliberately slow bank-b
+     serves NL+IE on port `8086`
    - `renewal-producer`: Spring Boot billing engine (port `8080`)
    - `renewal-consumer`: Spring Boot payment service (port `8081`; scaled
      replicas bind up to `8083`)
@@ -144,9 +147,12 @@ consumers splitting the queue, and a broker restart absorbed without a
 double-billed cent. Scene 6 switches the mock bank to a slow profile so the
 submitted SDD backlog is visible, then proves MD06 chargebacks leave payments
 `charged_back`, invoices `disputed`, settled charges intact, and subscriptions
-advanced before restoring the fast profile. Every scene *asserts* its invariant
-(exact card/SDD per-row terminal states, DLQ depths, per-replica counters)
-rather than just showing it; watch it live on the provisioned Grafana dashboard at
+advanced before restoring the fast profile. Scene 7 then sends equal clean SDD
+cohorts through the country registry: BE clears through fast bank-a while NL is
+still visibly `submitted` at slow bank-b, whose backlog subsequently drains.
+Every scene *asserts* its invariant (exact card/SDD per-row terminal states,
+DLQ depths, per-replica counters, and per-bank lag) rather than just showing it;
+watch it live on the provisioned Grafana dashboard at
 `http://localhost:3000/d/payfold-pipeline`.
 
 ```bash

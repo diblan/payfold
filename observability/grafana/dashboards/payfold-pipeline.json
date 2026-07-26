@@ -291,8 +291,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (outcome) (rate(settlements_processed_total[1m]))",
-          "legendFormat": "{{outcome}}"
+          "expr": "sum by (outcome, bank) (rate(settlements_processed_total[1m]))",
+          "legendFormat": "{{bank}} {{outcome}}"
         }
       ],
       "options": {
@@ -337,6 +337,59 @@
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
         "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Settlement latency by bank (mean)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 40, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": { "lineWidth": 2, "fillOpacity": 8, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (bank) (rate(settlements_latency_seconds_sum[5m])) / sum by (bank) (rate(settlements_latency_seconds_count[5m]))",
+          "legendFormat": "{{bank}}"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Settlements processed by bank",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 40, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "text", "value": null }]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (bank) (settlements_processed_total)",
+          "legendFormat": "{{bank}}"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name"
       }
     }
   ]

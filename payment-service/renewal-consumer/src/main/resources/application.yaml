@@ -30,10 +30,16 @@ payment:
     timeout-ms: 2000
 
 bank:
-  id: bank-a
-  base-url: http://localhost:8085
   timeout-ms: 2000
-  webhook-secret: payfold-dev-secret
+  registry:
+    - id: bank-a
+      base-url: http://localhost:8085
+      webhook-secret: payfold-dev-secret
+      countries: BE,FR
+    - id: bank-b
+      base-url: http://localhost:8086
+      webhook-secret: payfold-dev-secret-b
+      countries: NL,IE
 
 management:
   endpoints:

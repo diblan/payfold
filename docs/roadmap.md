@@ -413,7 +413,7 @@ IBAN rules ([G7](invariants.md#g7)); the demo scene runs green; the dashboard
 outcome split includes chargebacks. Re-triggers [R24](#r24).
 
 <a id="r23e"></a>
-### [ ] R23e — Multi-bank: per-country routing, one slow bank
+### [x] R23e — Multi-bank: per-country routing, one slow bank
 **Scope:** compose runs ≥2 instances of the same mock-bank image with different
 profiles (one fast, one slow — [D15](decisions.md#d15)'s "bank N+1 is a compose
 entry" claim, proven); consumer gains a bank registry (customer country →
@@ -459,6 +459,24 @@ don't clone repos. The demo script makes recording reproducible, so re-recording
 after [R23](#r23) reshapes the flow is cheap and expected.
 **Done when:** the README embeds (or links) the recording near the top and every
 claim shown matches the measured numbers in quality.md/README.
+
+<a id="r27"></a>
+### [ ] R27 — chaos-demo scene 2: backlog precondition races the management API
+**Scope:** `scripts/chaos-demo.sh` only.
+Scene 2's "poison injected mid-drain with good-message backlog" precondition
+reads the management API's `messages` counter exactly once right after the
+outbox publishes. That counter refreshes on a ~5s stats interval, so the single
+read can return a pre-publish `0` while the queue actually holds the scene's
+backlog — the same measurement race [R17](#r17) fixed inside `verify.sh`
+(first observed here 2026-07-26 during [R23e](#r23e)'s acceptance run: depth=0
+reported, the immediately following poison-routing and drain steps all passed,
+and a full re-run was clean). Converting the read to a bounded
+poll-until-nonzero fixes the measurement without weakening the asserted
+condition; if polling shows the backlog can genuinely drain before any sample,
+the scene's cohort size (not the poll) is the lever.
+**Done when:** the precondition polls with a bounded timeout like its
+verify.sh siblings and a full `chaos-demo.sh --auto` run passes it on a fresh
+stack.
 
 <a id="r26"></a>
 ### [ ] R26 — Dunning: failed collections get a lifecycle ([D16](decisions.md#d16)) *(epic — blocked on [R23](#r23); split at execution)*

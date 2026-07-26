@@ -78,6 +78,7 @@ RMQ_EXCHANGE="$(env_val RABBITMQ_EXCHANGE billing.renewals)"
 RMQ_RK="$(env_val RABBITMQ_ROUTINGKEY renewal.requested)"
 PSP_FAIL_HEX="$(env_val PSP_FAIL_HEX 0)"
 BANK_PORT="$(env_val BANK_HTTP_PORT 8085)"
+BANK_B_PORT="$(env_val BANK_B_HTTP_PORT 8086)"
 RMQ_DLQ="billing.renewals.dlq"
 SETTLEMENT_MAIN="billing.settlements.main"
 SETTLEMENT_DLQ="billing.settlements.dlq"
@@ -133,6 +134,7 @@ consumer_up() {
 }
 consumer_running() { docker compose ps --status running --services 2>/dev/null | grep -qx renewal-consumer; }
 bank_up() { curl -fsS "http://localhost:${BANK_PORT}/health" 2>/dev/null | grep -q '"status":"ok"'; }
+bank_b_up() { curl -fsS "http://localhost:${BANK_B_PORT}/health" 2>/dev/null | grep -q '"status":"ok"'; }
 
 outbox_drained() { [[ "$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NULL')" == "0" ]]; }
 
@@ -328,6 +330,7 @@ fi
 
 # R23a: the mock bank is part of the stack's definition of working.
 wait_for "mock-bank /health ok" bank_up
+wait_for "mock-bank-b /health ok" bank_b_up
 
 wait_for "producer /actuator/prometheus serves outbox counters" producer_prometheus_ready || summary
 wait_for "consumer /actuator/prometheus serves renewals counter" consumer_prometheus_ready || summary
@@ -516,12 +519,40 @@ if [[ "$UNTRACED" == "0" ]]; then
 else
   fail "every terminal SDD payment traces to an inbox notification" "count=${UNTRACED:-error}"
 fi
-BANK_GIVEUPS="$(curl -fsS "http://localhost:${BANK_PORT}/metrics" 2>/dev/null | grep '^bank_webhook_giveups_total ' | awk '{print $2}')"
-if [[ "$BANK_GIVEUPS" == "0.0" ]]; then
-  pass "mock bank webhook give-ups are zero"
+
+# R23e: per-bank attribution. The compose default routing is bank-a: BE,FR;
+# bank-b: NL,IE — assert the stored attribution matches it row-for-row, and
+# each bank's inbox share matches its routed cohort exactly.
+ROUTING_MISMATCH="$(q "SELECT count(*) FROM payment p JOIN charge ch ON ch.id = p.charge_id JOIN subscription s ON s.id = ch.subscription_id JOIN customer c ON c.id = s.customer_id
+WHERE p.channel = 'SEPA_DD' AND p.idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')
+  AND p.bank_id IS DISTINCT FROM CASE WHEN c.country IN ('BE','FR') THEN 'bank-a' ELSE 'bank-b' END")"
+if [[ "$ROUTING_MISMATCH" == "0" ]]; then
+  pass "every SDD payment routed to its country's bank (BE,FR→bank-a; NL,IE→bank-b)"
 else
-  fail "mock bank webhook give-ups are zero" "value=${BANK_GIVEUPS:-unreadable}"
+  fail "every SDD payment routed to its country's bank" "count=${ROUTING_MISMATCH:-error}"
 fi
+for BANK in bank-a bank-b; do
+  if [[ "$BANK" == "bank-a" ]]; then COUNTRIES="('BE','FR')"; else COUNTRIES="('NL','IE')"; fi
+  EXPECTED_BANK_INBOX="$(q "SELECT count(*) + count(*) FILTER (WHERE right(c.debtor_iban, 2) = '96') FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id
+WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND c.country IN ${COUNTRIES}")"
+  ACTUAL_BANK_INBOX="$(q "SELECT count(*) FROM settlement_inbox WHERE bank_id = '${BANK}'")"
+  if [[ -n "$EXPECTED_BANK_INBOX" && "$ACTUAL_BANK_INBOX" == "$EXPECTED_BANK_INBOX" ]]; then
+    pass "${BANK} inbox rows match its routed cohort exactly (${ACTUAL_BANK_INBOX})"
+  else
+    fail "${BANK} inbox rows match its routed cohort exactly" "expected=${EXPECTED_BANK_INBOX:-error} actual=${ACTUAL_BANK_INBOX:-error}"
+  fi
+done
+
+for BANK_AND_PORT in "bank-a:${BANK_PORT}" "bank-b:${BANK_B_PORT}"; do
+  BANK="${BANK_AND_PORT%%:*}"
+  PORT="${BANK_AND_PORT#*:}"
+  BANK_GIVEUPS="$(curl -fsS "http://localhost:${PORT}/metrics" 2>/dev/null | grep '^bank_webhook_giveups_total ' | awk '{print $2}')"
+  if [[ "$BANK_GIVEUPS" == "0.0" ]]; then
+    pass "${BANK} webhook give-ups are zero"
+  else
+    fail "${BANK} webhook give-ups are zero" "value=${BANK_GIVEUPS:-unreadable}"
+  fi
+done
 
 FAILED_FINALIZED="$(q "SELECT count(*) FROM payment p JOIN charge c ON c.id = p.charge_id WHERE p.status = 'failed' AND c.status <> 'pending'")"
 if [[ "$FAILED_FINALIZED" == "0" ]]; then
