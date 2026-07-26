@@ -135,6 +135,23 @@ scripts/verify.sh --no-up --timeout 3600
 scripts/load-test.sh 50000
 ```
 
+## Run the chaos demo
+
+One command demonstrates the failure modes the architecture exists for —
+poison messages dead-lettering while good traffic flows, a killed worker
+losing nothing and draining its backlog on recovery, three competing
+consumers splitting the queue, and a broker restart absorbed without a
+double-billed cent. Every scene *asserts* its invariant (exact per-row
+terminal states, DLQ depths, per-replica counters) rather than just showing
+it; watch it live on the provisioned Grafana dashboard at
+`http://localhost:3000/d/payfold-pipeline`.
+
+```bash
+docker compose up -d --build     # if not already running
+scripts/chaos-demo.sh            # paced; press enter between scenes
+scripts/chaos-demo.sh --auto     # unattended, asserts everything
+```
+
 ## Stopping and cleaning up
 
 - Press `Ctrl+C` in the terminal running `docker compose up` to stop the stack.

@@ -277,7 +277,7 @@ observability containers affect verify.sh decided at execution under
 [G7](invariants.md#g7) (tighten or leave, never loosen).
 
 <a id="r22"></a>
-### [ ] R22 — Scripted chaos demo
+### [x] R22 — Scripted chaos demo
 **Scope:** `scripts/chaos-demo.sh`, README section; no service changes.
 One command, scene-based, each scene *asserting* the invariant it demonstrates
 (not just showing it): poison → DLQ within 30s while good messages keep flowing
