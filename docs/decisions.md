@@ -358,3 +358,64 @@ automatically) points at a third method — customer-initiated push payment with
 open-invoice reconciliation, which is exactly what the dormant
 `bank_tx`/`recon_match` tables await. Stays a non-goal until its own decision
 entry.
+
+## D18 — R28 recovery design: pull-shaped reconciliation sweeper, delivery loss as a deterministic rule — 2026-08-01 — active
+<a id="d18"></a>
+Design outcome of the R28 read (2026-07-31 session).
+
+**The gap, precisely:** a counterparty's webhook delivery is bounded-loud by
+design (R23a) and its entire state — collection records AND pending deliveries —
+is one in-memory dict per instance (`app.state.records`, single-worker,
+verified in source). So the outcome can strand two ways: (1) retry exhaustion
+(give-up counted, record retained), and (2) container recreate (everything
+gone; `GET /collections/{id}` → 404). Widening the retry envelope (the R23f
+mitigation) only stretches the fuse on (1) and does nothing for (2).
+
+**Decision shape — pull, not push-harder:** real SEPA reporting is pull-shaped
+(EBICS-fetched pain.002/camt.054) precisely so a missed push cannot strand
+state. R28 adopts that: a consumer-side recovery sweeper (the R7
+advisory-lock + page-scan pattern, same shape R26's dunning sweeper will use,
+deliberately separate task) scans payments stuck `submitted` older than a
+scaled threshold (`RECOVERY_STALE_AFTER_SECONDS`, default > the worst-case
+delivery envelope + settlement delay + chargeback lag) and re-queries the
+owning counterparty per the registry:
+
+- `GET /collections/{id}` → 200 with a terminal classification: the sweeper
+  synthesizes the missing settlement INTO `settlement_inbox` (bank id + the
+  bank's stored notification id), and the existing relay → queue → listener
+  spine finalizes it. The inbox unique constraint dedupes against a webhook
+  that did arrive late — recovery and delivery can race safely (G2 by
+  construction, no new idempotency machinery).
+- `GET /collections/{id}` → 404 (restart amnesia): the sweeper RESUBMITS the
+  collection with the same collection id. Outcomes are deterministic from
+  IBAN/token, so resubmission reproduces the same classification and fresh
+  notifications — the bank's amnesia is harmless by design. (This is why R8's
+  deterministic-outcome trick keeps paying: recovery needs no stored truth at
+  the counterparty.)
+- No counterparty resend endpoint. It would add surface and still die to (2).
+
+**Deterministic verify.sh modeling — delivery loss as a bank rule:** a new
+IBAN/token suffix (e.g. `95`... note: 95 is earmarked for R26b's
+retry-then-settle rule — use `94`) classifies normally but NEVER schedules
+notifications ("silent bank"). The 94-cohort can only complete through the
+sweeper, so verify.sh asserts: zero stuck `submitted` including the 94-cohort,
+every 94-payment terminal with an inbox row, and `settlements_recovered_total`
+exactly equal to the 94-cohort size. No timing games, no outage choreography —
+the R6 "design races out" rule applied to recovery. The chaos demo gets the
+LIVE version: kill cardnet mid-drain (`--no-deps` recreate), watch the stranded
+cohort recover on the sweeper tick.
+
+**Observability:** `recovery_sweeps_total{result=recovered|resubmitted|noop}` +
+log per recovered collection; dashboard panel on the settlement row.
+
+**Scope boundaries:** dropped CHARGEBACK notifications (payment already
+`succeeded`, so staleness-by-`submitted` never re-checks it) are explicitly OUT
+— that is full statement reconciliation, i.e. the dormant
+`bank_tx`/`recon_match` tables' future promotion, and gets its own decision
+entry when it comes. R26 boundary per the split draft: the recovery sweeper
+reacts to MISSING signals, dunning to RECEIVED ones; they share the scheduled
+task pattern, never a trigger.
+
+**Cost estimate:** mock-bank +1 rule (tag bump rides R28), one consumer scheduled
+task + config rows, verify.sh tightening, no schema change (inbox rows are the
+write path; a `settlements_recovered_total` counter carries provenance).
