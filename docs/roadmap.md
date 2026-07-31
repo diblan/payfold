@@ -531,6 +531,21 @@ retriable state (`ignoreExceptionsInstanceOf(EmptyResultDataAccessException)`)
 with asserted conditions and timeouts unchanged (timeouts still fail loudly with
 the last miss as cause); the consumer suite is green; verify.sh untouched.
 
+<a id="r31"></a>
+### [x] R31 — Keyset-scan payload assert contradicts its own clamp-day seed
+**Scope:** `ScanKeysetPaginationTest` only; no production code.
+[R16](#r16) made the test's due-today seeding clamp-day-safe: on days with no
+`+1 month` preimage the seed helper switches to a year-interval plan, and the
+`period_end` assertion follows `seedInterval` — but the payload `interval`
+assertion still hardcoded `"month"`. First fired on the 2026-07-31 Actions run
+(build 30667459146, the first CI run to land on a clamp day since the test
+exists): the seeded year plan echoed `interval: "year"` and the field check
+went red while every other producer test passed. Local runs on non-clamp days
+are green — the red is calendar-dependent, not environmental.
+**Done when:** the payload `interval` assertion compares against `seedInterval`
+(the payload must echo the plan the seed chose, on both branches); the
+producer suite is green; verify.sh untouched.
+
 <a id="r30"></a>
 ### [ ] R30 — Re-measure the drain story on the async spine
 **Scope:** measurement + docs only (README, quality.md "Measured scale runs",

@@ -166,7 +166,7 @@ class ScanKeysetPaginationTest {
         assertThat(payload.get("subscription_id").asText()).isEqualTo(SUBSCRIPTION_1.toString());
         assertThat(payload.get("customer_id").asText()).isEqualTo(CUSTOMER_ID.toString());
         assertThat(payload.get("plan_id").asText()).isEqualTo(plan.id().toString());
-        assertThat(payload.get("interval").asText()).isEqualTo("month");
+        assertThat(payload.get("interval").asText()).isEqualTo(seedInterval);
         assertThat(payload.get("amount_cents").asLong()).isEqualTo(plan.priceCents());
         assertThat(payload.get("currency").asText()).isEqualTo(plan.currency());
         assertThat(payload.get("due_date").asText()).isEqualTo(dueDate);
