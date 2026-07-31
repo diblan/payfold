@@ -2,7 +2,8 @@
 # Narrated chaos demo for a RUNNING Payfold stack.
 #
 # Scenes: pipeline, poison isolation, worker loss, scale-out, broker restart,
-# chargebacks under slow/fast profiles, and per-country slow-bank lag/drain.
+# chargebacks under slow/fast profiles, per-country slow-bank lag/drain, and
+# counterparty-amnesia recovery.
 #
 # Usage:
 #   scripts/chaos-demo.sh [--auto] [--timeout SECONDS]
@@ -363,7 +364,7 @@ SQL
 }
 
 seed_routed_cohort() {
-  local bank="$1" country="$2" n="$3" seed_out
+  local bank="$1" country="$2" n="$3" seed_out scene_number="${ROUTED_SCENE:-7}"
   note "seeding ${n} clean SDD subscriptions for ${bank} (${country})…"
   if ! seed_out="$(docker compose exec -T postgres psql -U "$PGUSER" -d "$PGDB" -v ON_ERROR_STOP=1 <<SQL
 WITH seed_plan AS (
@@ -376,11 +377,11 @@ WITH seed_plan AS (
         id, email, name, payment_method, debtor_iban, mandate_reference, country
     )
     SELECT gen_random_uuid(),
-           'chaos-7-${bank}-${RUN_TAG}-' || n || '@example.test',
-           'Chaos 7 ${bank} Customer ' || n,
+           'chaos-${scene_number}-${bank}-${RUN_TAG}-' || n || '@example.test',
+           'Chaos ${scene_number} ${bank} Customer ' || n,
            'sdd',
            '${country}00' || lpad(n::text, 12, '0') || '01',
-           'MNDT-CHAOS-7-${bank}-' || n,
+           'MNDT-CHAOS-${scene_number}-${bank}-' || n,
            '${country}'
     FROM generate_series(1, ${n}) n
     RETURNING id
@@ -394,14 +395,14 @@ ANALYZE customer;
 ANALYZE subscription;
 SQL
 )"; then
-    fail "scene 7 seeded ${bank} cohort" "psql failed: ${seed_out}"
+    fail "scene ${scene_number} seeded ${bank} cohort" "psql failed: ${seed_out}"
     return 1
   fi
   if echo "$seed_out" | grep -q "INSERT 0 ${n}$"; then
-    pass "scene 7 seeded ${bank} cohort (${n} clean ${country} SDD renewals)"
+    pass "scene ${scene_number} seeded ${bank} cohort (${n} clean ${country} SDD renewals)"
     return 0
   fi
-  fail "scene 7 seeded ${bank} cohort" "unexpected psql output: ${seed_out}"
+  fail "scene ${scene_number} seeded ${bank} cohort" "unexpected psql output: ${seed_out}"
   return 1
 }
 
@@ -832,6 +833,7 @@ pause_between_scenes
 scene 7 "Country routing makes the slow bank lag, then its backlog drains"
 note "Watch the per-bank settlement latency and outcome panels: bank-a (BE) clears before deliberately slow bank-b (NL)."
 SCENE_7_SIZE=20
+ROUTED_SCENE=7
 seed_routed_cohort bank-a BE "$SCENE_7_SIZE" || summary
 seed_routed_cohort bank-b NL "$SCENE_7_SIZE" || summary
 trigger_and_wait "scene 7 renewal job trigger" || summary
@@ -870,6 +872,63 @@ scene_7_slow_drained() {
     && "$(scene_7_submitted_count bank-b)" == "0" ]]
 }
 wait_until "scene 7 bank-b submitted backlog drained fully terminal" scene_7_slow_drained
+
+pause_between_scenes
+
+scene 8 "Counterparty amnesia (D18/R28): a recreated bank forgets, the sweeper re-queries and resubmits — nothing stays stranded"
+note "Watch the recovery panel: the point is pull-shaped recovery — no resend endpoint, no manual intervention."
+SCENE_8_SIZE=20
+ROUTED_SCENE=8
+seed_routed_cohort bank-b NL "$SCENE_8_SIZE" || summary
+trigger_and_wait "scene 8 renewal job trigger" || summary
+wait_until "scene 8 outbox fully published" outbox_drained || summary
+
+scene_8_payment_count() {
+  q "SELECT count(*) FROM payment p
+JOIN charge ch ON ch.id = p.charge_id
+JOIN subscription s ON s.id = ch.subscription_id
+JOIN customer c ON c.id = s.customer_id
+WHERE c.email LIKE 'chaos-8-bank-b-${RUN_TAG}-%@example.test'
+  AND p.bank_id = 'bank-b'
+  AND p.status = '$1'"
+}
+scene_8_all_submitted() {
+  [[ "$(scene_8_payment_count submitted)" == "$SCENE_8_SIZE" ]]
+}
+wait_until "scene 8 all ${SCENE_8_SIZE} payments visibly parked submitted" scene_8_all_submitted || summary
+
+SCENE_8_RESUBMITTED_BEFORE="$(consumer_sum '^recovery_sweeps_total\{.*result="resubmitted"')"
+if [[ "$SCENE_8_RESUBMITTED_BEFORE" =~ ^[0-9]+$ ]]; then
+  pass "scene 8 fleet resubmitted-counter baseline captured (${SCENE_8_RESUBMITTED_BEFORE})"
+else
+  fail "scene 8 fleet resubmitted-counter baseline captured" "value=${SCENE_8_RESUBMITTED_BEFORE}"
+  summary
+fi
+
+if docker compose up -d --no-deps --force-recreate mock-bank-b; then
+  pass "scene 8 recreated mock-bank-b and erased its in-memory collection state"
+else
+  fail "scene 8 recreated mock-bank-b" "docker compose up failed"
+  summary
+fi
+wait_until "scene 8 recreated mock-bank-b healthcheck passed" bank_b_up || summary
+
+# Recovery budget: stale 30s + sweep tick 10s + resubmitted settlement 8s is
+# approximately under a minute in the compose demo profile.
+scene_8_recovered() {
+  [[ "$(scene_8_payment_count succeeded)" == "$SCENE_8_SIZE"
+    && "$(scene_8_payment_count submitted)" == "0" ]]
+}
+wait_until "scene 8 full cohort succeeded and zero submitted remain" scene_8_recovered
+
+SCENE_8_RESUBMITTED_AFTER="$(consumer_sum '^recovery_sweeps_total\{.*result="resubmitted"')"
+if [[ "$SCENE_8_RESUBMITTED_AFTER" =~ ^[0-9]+$ ]] \
+  && (( SCENE_8_RESUBMITTED_AFTER - SCENE_8_RESUBMITTED_BEFORE >= 1 )); then
+  pass "scene 8 recovery visibly resubmitted at least one forgotten collection"
+else
+  fail "scene 8 recovery visibly resubmitted at least one forgotten collection" \
+    "before=${SCENE_8_RESUBMITTED_BEFORE} after=${SCENE_8_RESUBMITTED_AFTER}"
+fi
 
 echo
 note "epilogue: returning the stack to one renewal-consumer replica…"

@@ -364,6 +364,8 @@ wait_for "grafana serves the provisioned pipeline dashboard" grafana_dashboard_p
 M_INS_BEFORE="$(prom_val "$PRODUCER_PORT" '^outbox_inserted_total ')"
 M_PUB_BEFORE="$(prom_val "$PRODUCER_PORT" '^outbox_published_total ')"
 M_PROC_BEFORE="$(consumer_prom_sum '^renewals_processed_total\{.*outcome="(succeeded|failed|submitted)"')"
+M_RECOVERED_BEFORE="$(consumer_prom_sum '^settlements_recovered_total')"
+[[ "$M_RECOVERED_BEFORE" == "absent" ]] && M_RECOVERED_BEFORE=0
 DB_OUTBOX_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox')"
 DB_PUB_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NOT NULL')"
 
@@ -574,6 +576,52 @@ WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND c.country IN ${
     fail "${BANK} inbox rows match its routed cohort exactly" "expected=${EXPECTED_BANK_INBOX:-error} actual=${ACTUAL_BANK_INBOX:-error}"
   fi
 done
+
+# --- R28: deterministic recovery of the silent (suffix-94) cohorts (D18) ---
+N_SDD_SILENT="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '94'")"
+N_CARD_SILENT="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(c.card_token, 2) = '94'")"
+SEED_SDD_SILENT_PERCENT_VAL="$(env_val SEED_SDD_SILENT_PERCENT 2)"
+if [[ "$SEED_SDD_SILENT_PERCENT_VAL" != "0" && "$N_SDD_SILENT" == "0" ]]; then
+  fail "silent SDD cohort present when SEED_SDD_SILENT_PERCENT > 0" "N_SDD_SILENT=0 with SEED_SDD_SILENT_PERCENT=${SEED_SDD_SILENT_PERCENT_VAL}"
+else
+  pass "silent SDD cohort present when SEED_SDD_SILENT_PERCENT > 0 (${N_SDD_SILENT})"
+fi
+SEED_CARD_SILENT_PERCENT_VAL="$(env_val SEED_CARD_SILENT_PERCENT 2)"
+if [[ "$SEED_CARD_SILENT_PERCENT_VAL" != "0" && "$N_CARD_SILENT" == "0" ]]; then
+  fail "silent card cohort present when SEED_CARD_SILENT_PERCENT > 0" "N_CARD_SILENT=0 with SEED_CARD_SILENT_PERCENT=${SEED_CARD_SILENT_PERCENT_VAL}"
+else
+  pass "silent card cohort present when SEED_CARD_SILENT_PERCENT > 0 (${N_CARD_SILENT})"
+fi
+
+EXPECTED_SILENT=$((N_SDD_SILENT + N_CARD_SILENT))
+ACTUAL_SILENT_SUCCEEDED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id JOIN payment p ON p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(o.due_date, 'YYYY-MM-DD')
+WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '94') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '94')) AND p.status = 'succeeded'")"
+if [[ "$ACTUAL_SILENT_SUCCEEDED" == "$EXPECTED_SILENT" ]]; then
+  pass "every silent payment succeeded through recovery (${ACTUAL_SILENT_SUCCEEDED})"
+else
+  fail "every silent payment succeeded through recovery" "expected=${EXPECTED_SILENT} actual=${ACTUAL_SILENT_SUCCEEDED:-error}"
+fi
+
+ACTUAL_SILENT_INBOX="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id JOIN payment p ON p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(o.due_date, 'YYYY-MM-DD') JOIN settlement_inbox i ON i.bank_id = p.bank_id AND i.notification_id = p.collection_id || ':1'
+WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '94') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '94'))")"
+if [[ "$ACTUAL_SILENT_INBOX" == "$EXPECTED_SILENT" ]]; then
+  pass "every silent payment has a synthesized inbox row (${ACTUAL_SILENT_INBOX})"
+else
+  fail "every silent payment has a synthesized inbox row" "expected=${EXPECTED_SILENT} actual=${ACTUAL_SILENT_INBOX:-error}"
+fi
+
+recovered_metric_delta_matches() {
+  local current
+  current="$(consumer_prom_sum '^settlements_recovered_total')"
+  [[ "$current" =~ ^[0-9]+$ ]] \
+    && (( current - M_RECOVERED_BEFORE == EXPECTED_SILENT ))
+}
+if [[ "$M_RECOVERED_BEFORE" =~ ^[0-9]+$ ]]; then
+  wait_for "settlements_recovered_total delta matches the silent cohorts exactly (${EXPECTED_SILENT})" recovered_metric_delta_matches
+else
+  fail "settlements_recovered_total delta matches the silent cohorts exactly (${EXPECTED_SILENT})" \
+    "invalid baseline=${M_RECOVERED_BEFORE}"
+fi
 
 for BANK_AND_PORT in "bank-a:${BANK_PORT}" "bank-b:${BANK_B_PORT}" "cardnet:${CARDNET_PORT}"; do
   BANK="${BANK_AND_PORT%%:*}"

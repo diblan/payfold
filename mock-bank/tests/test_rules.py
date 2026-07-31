@@ -1,6 +1,11 @@
 import pytest
 
-from app.rules import notification_plan, outcome_for
+from app.rules import (
+    card_verdict_for,
+    is_silent,
+    notification_plan,
+    outcome_for,
+)
 
 
 @pytest.mark.parametrize(
@@ -18,6 +23,20 @@ def test_rule_suffixes(suffix, expected):
 
 def test_clean_iban_settles():
     assert outcome_for("BE68539007547034") == ("settled", None)
+
+
+def test_silent_suffix_matches_iban_and_card_token_shapes():
+    assert is_silent("BE68539007547094")
+    assert is_silent("tok-0000000094")
+    assert not is_silent("BE68539007547001")
+    assert not is_silent("tok-0000000001")
+    assert not is_silent("BE68539007547099")
+    assert not is_silent("tok-0000000099")
+
+
+def test_silent_suffix_still_classifies_normally():
+    assert outcome_for("BE68539007547094") == ("settled", None)
+    assert card_verdict_for("tok-0000000094") == ("authorized", None)
 
 
 def test_notification_plan_for_settled_collection():

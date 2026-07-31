@@ -476,7 +476,7 @@ verify.sh siblings and a full `chaos-demo.sh --auto` run passes it on a fresh
 stack.
 
 <a id="r28"></a>
-### [ ] R28 — Webhook exhaustion strands submitted payments (no re-delivery path)
+### [x] R28 — Webhook exhaustion strands submitted payments (no re-delivery path)
 **Scope:** design first — likely consumer-side (a scheduled sweeper that
 re-queries counterparties for stale `submitted` payments via
 `GET /collections/{id}`), possibly with a counterparty-side resend endpoint.

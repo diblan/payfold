@@ -11,6 +11,12 @@ CARD_RULE_SUFFIXES = {
     "96": ("authorized_then_chargeback", "fraud_dispute"),
 }
 
+SILENT_SUFFIXES = {"94"}
+
+
+def is_silent(identifier: str) -> bool:
+    return identifier[-2:] in SILENT_SUFFIXES
+
 
 def outcome_for(iban: str) -> tuple[str, str | None]:
     return RULE_SUFFIXES.get(iban[-2:], ("settled", None))

@@ -227,6 +227,15 @@ after its raw payload is durably inserted into `settlement_inbox`; uniqueness on
 `200`. The path bank id, whose secret was verified, is the trusted bank
 attribution.
 
+A consumer-side recovery sweeper makes this path pull-shaped as well as pushed:
+it pages through stale `submitted` payments under a transaction-scoped advisory
+lock and re-queries the owning counterparty. A stored sequence-1 outcome is
+synthesized into the same `settlement_inbox`, whose unique constraint safely
+dedupes a late webhook; a `404` means restart amnesia and resubmits the same
+collection id, safe because the counterparty's outcome is deterministic. This
+mirrors pull-shaped SEPA reporting and prevents a missed push from stranding a
+payment ([D18](decisions.md#d18)).
+
 Each inbox row is also its own outbox. A scheduled relay claims up to 100
 unpublished rows with `FOR UPDATE SKIP LOCKED`, so replicas safely compete,
 normalizes each payload to `settlement.received` v1, and waits synchronously for
@@ -305,11 +314,41 @@ only a generic test-time HTTP stub in Java integration tests.
 A new collection returns `202` with `status: accepted` and `duplicate: false`,
 stores its classified outcome and notification states, and schedules delivery.
 Repeating a `collection_id` returns `200` with `duplicate: true` and schedules
-nothing. `GET /collections/{collection_id}` exposes the stored submission,
-classification, and each notification's `scheduled` / `delivered` / `gave_up`
-state. `/health` reports the bank identity and scheme. `/metrics` exposes the
-Prometheus counters `bank_collections_received_total`,
-`bank_webhook_delivered_total`, and `bank_webhook_giveups_total`.
+nothing. `GET /collections/{collection_id}` returns the full stored record: the
+submitted fields, top-level classification and response fields, plus the stored
+notification plan:
+
+```json
+{
+  "collection_id": "collection-123",
+  "amount_cents": 1499,
+  "currency": "EUR",
+  "debtor_iban": "BE68000000601701",
+  "mandate_reference": "MNDT-6017",
+  "due_date": "2026-08-01",
+  "outcome": "settled",
+  "reason": null,
+  "response_status": "accepted",
+  "response_reason": null,
+  "notifications": [
+    {
+      "seq": 1,
+      "outcome": "settled",
+      "reason": null,
+      "notification_id": "collection-123:1",
+      "state": "scheduled"
+    }
+  ]
+}
+```
+
+Notification state is one of `scheduled`, `delivered`, `gave_up`, or
+`suppressed`. For card records the request carries `card_token` instead of SDD
+debtor fields, the top-level `outcome` remains the authorization verdict, and
+settlement is represented only in `notifications[]`. `/health` reports the bank
+identity and scheme. `/metrics` exposes the Prometheus counters
+`bank_collections_received_total`, `bank_webhook_delivered_total`, and
+`bank_webhook_giveups_total`.
 
 The IBAN rule is deliberately small and deterministic:
 
@@ -319,7 +358,11 @@ The IBAN rule is deliberately small and deterministic:
 | `98` | failed | `failed` | `AC04` — account closed |
 | `97` | failed | `failed` | `MD01` — no valid mandate |
 | `96` | settled then charged back | `settled`, then `charged_back` | `MD06` — payer objection after settlement |
+| `94` | settled | `settled` suppressed | none |
 | any other suffix | settled | `settled` | none |
+
+Suffix `94` classifies normally but never notifies, modeling deliverability loss
+as a deterministic rule ([D18](decisions.md#d18)).
 
 Each rule-bearing suffix is 1% of a uniform two-digit tail. More importantly,
 later verifier sub-items can predict every result directly in SQL as
@@ -346,7 +389,11 @@ through the same webhook/inbox/queue/listener spine as SDD.
 | `99` | declined | none | `insufficient_funds` |
 | `98` | declined | none | `do_not_honor` |
 | `96` | authorized | `settled`, then `charged_back` | `fraud_dispute` on chargeback |
+| `94` | authorized | `settled` suppressed | none |
 | any other suffix | authorized | `settled` | none |
+
+Suffix `94` classifies normally but never notifies, modeling deliverability loss
+as a deterministic rule ([D18](decisions.md#d18)).
 
 Repeating a card `collection_id` returns HTTP `200` with the same stored
 `authorized` or `declined` verdict and `duplicate: true`; it never schedules an
@@ -418,6 +465,8 @@ Micrometer converts dots in meter names to underscores for Prometheus and append
 | `settlements.processed` | `settlements_processed_total{outcome="...",bank="..."}` | Counter | `outcome=settled \| failed \| charged_back \| invalid`; `bank=bank-a \| bank-b \| cardnet \| unknown` | Per settlement delivery at validation or its accepted outcome; terminal redeliveries count as processings; invalid deliveries with no payment attribution use `unknown` |
 | `settlements.latency` | `settlements_latency_seconds_count/_sum/_max{bank="..."}` | Timer | `bank=bank-a \| bank-b \| cardnet` | Submission-to-terminal round trip, recorded once when a settled or failed guarded payment update succeeds |
 | `settlement.webhooks.received` | `settlement_webhooks_received_total{result="..."}` | Counter | `result=accepted \| duplicate \| unauthorized \| rejected` | Once per webhook request after its receiver decision |
+| `settlements.recovered` | `settlements_recovered_total` | Counter | none | Once when the recovery sweeper synthesizes a missing sequence-1 settlement into the inbox |
+| `recovery.sweeps` | `recovery_sweeps_total{result="..."}` | Counter | `result=recovered \| resubmitted \| noop` | Once per stale-payment recovery action after query, synthesis/resubmission, or inbox-race no-op |
 
 All counter series are registered eagerly and therefore render as `0.0` from boot;
 `verify.sh` depends on that property. Settlement outcome×bank pairs and each
@@ -521,9 +570,9 @@ Unpublished = `published_at IS NULL`.
 
 ## Configuration truth table
 
-Every remaining `application.yaml` key has a real consumer.
+Every runtime configuration key below has a real consumer.
 
-| Key (application.yaml) | Consumed by | Status |
+| Configuration key | Consumed by | Status |
 |---|---|---|
 | `spring.application.name` (both) | Spring Boot application identity | alive |
 | `spring.datasource.*` | Spring Boot autoconfig (overridden by compose `SPRING_DATASOURCE_*`) | alive (placeholder values in yaml) |
@@ -539,6 +588,10 @@ Every remaining `application.yaml` key has a real consumer.
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |
 | `bank.timeout-ms` (consumer) | `BankProperties`, `BankClient` connect + read timeout | alive |
 | `bank.registry[]` id/scheme/base URL/webhook secret/countries (consumer) | `BankProperties`, `BankRegistry`, `BankClient`, `BillingService`, `BankWebhookController`; `countries` is required only for `sepa_core`, and the registry requires exactly one `card` entry; compose overrides indexed `BANK_REGISTRY_*` env vars | alive |
+| `RECOVERY_STALE_AFTER_SECONDS` (consumer; yaml `recovery.stale-after-seconds`) | `RecoveryProperties`, `RecoverySweeper`; compose overrides the 300 s application default with 30 s for verify/demo | alive |
+| `RECOVERY_SWEEP_INTERVAL_MS` (consumer; yaml `recovery.sweep-interval-ms`) | `RecoveryProperties`, `RecoverySweeper`; compose overrides the 60000 ms application default with 10000 ms for verify/demo | alive |
+| `SEED_SDD_SILENT_PERCENT` (seeder) | `CustomerSeeder`; compose-only deterministic suffix-94 share inside the SDD cohort | alive |
+| `SEED_CARD_SILENT_PERCENT` (seeder) | `CustomerSeeder`; compose-only deterministic suffix-94 share inside the card cohort | alive |
 | `spring.rabbitmq.listener.simple.*` (consumer) | Spring Boot AMQP autoconfig + `ListenerRetryConfig` (`max-attempts`) | alive |
 | `management.endpoints.web.exposure.include` (producer) | actuator exposure for `health`, `info`, `metrics`, `prometheus`, and `renewal-job` | alive |
 | `management.endpoints.web.exposure.include` (consumer) | actuator exposure for `health`, `info`, `metrics`, and `prometheus`; the compose healthcheck relies on `health` | alive |
@@ -550,21 +603,22 @@ and RabbitMQ; local `.env` values can still select bind-mount paths. The consume
 compose healthcheck hits `/actuator/health`, served by actuator since
 [R1](roadmap.md#r1).
 
-Seed configuration is compose-only, deliberately absent from the table above
-(the table covers `application.yaml` keys): `SEED_CUSTOMERS` (default 15000),
-`SEED_SDD_PERCENT` (default 20), `SEED_SDD_RULE_PERCENT` (default 4), and
-`SEED_CARD_RULE_PERCENT` (default 4) are read by `CustomerSeeder` in the seed
-container. They deterministically partition customers and assign rule-bearing
-IBAN/card-token suffixes from the global customer number. Every seeded
+Seed configuration is compose-only: `SEED_CUSTOMERS` (default 15000),
+`SEED_SDD_PERCENT` (default 20), `SEED_SDD_RULE_PERCENT` (default 4),
+`SEED_CARD_RULE_PERCENT` (default 4),
+`SEED_SDD_SILENT_PERCENT` (default 2), and `SEED_CARD_SILENT_PERCENT` (default
+2) are read by `CustomerSeeder` in the seed container. They deterministically
+partition customers and assign rule-bearing or silent IBAN/card-token suffixes
+from the global customer number. Every seeded
 subscription is due on the seed day, so
 `SEED_CUSTOMERS` directly sets the size of the day's renewal batch;
 `scripts/load-test.sh` adds more due-today volume to a running stack without a
 reseed.
 
 The mock-counterparty instances are likewise configured entirely by compose-only
-envs, deliberately absent from the `application.yaml` table: bank-a uses the
-`BANK_*` variables, bank-b uses the corresponding `BANK_B_*` values, and cardnet
-uses `CARDNET_*`; each container receives its own `BANK_ID`, `BANK_SCHEME`,
+envs: bank-a uses the `BANK_*` variables, bank-b uses the corresponding
+`BANK_B_*` values, and cardnet uses `CARDNET_*`; each container receives its own
+`BANK_ID`, `BANK_SCHEME`,
 `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`,
 `BANK_SETTLEMENT_DELAY_SECONDS`, and `BANK_CHARGEBACK_LAG_SECONDS`. All three
 share the compose-set delivery envelope `BANK_WEBHOOK_RETRY_MAX_ATTEMPTS` /
@@ -614,9 +668,9 @@ architecture-independent jar once instead of emulating Maven under QEMU.
 | Image (`ghcr.io/diblan/…`) | Contents | Run pattern | Config (env) |
 |---|---|---|---|
 | `payfold-renewal-producer` | producer Spring Boot jar | long-running service; port 8080, `/actuator/health` | the compose `renewal-producer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_ROUTINGKEY`, `APP_TIMEZONE`, `APP_SCHEDULECRON`, `TZ` |
-| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, indexed `BANK_REGISTRY_*` including scheme, `TZ` |
+| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, indexed `BANK_REGISTRY_*` including scheme, `RECOVERY_STALE_AFTER_SECONDS`, `RECOVERY_SWEEP_INTERVAL_MS`, `TZ` |
 | `payfold-migrations` | `flyway/flyway:11` + `db-migrations/V*.sql`, `CMD ["migrate"]` | run-to-completion Job; exit 0 = success; re-run on a current schema is a no-op (asserted by `verify.sh`) | `FLYWAY_URL`, `FLYWAY_USER`, `FLYWAY_PASSWORD`, `FLYWAY_CONNECT_RETRIES` (image default 30) |
-| `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS`, `SEED_SDD_PERCENT`, `SEED_SDD_RULE_PERCENT`, `SEED_CARD_RULE_PERCENT` |
+| `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS`, `SEED_SDD_PERCENT`, `SEED_SDD_RULE_PERCENT`, `SEED_SDD_SILENT_PERCENT`, `SEED_CARD_RULE_PERCENT`, `SEED_CARD_SILENT_PERCENT` |
 | `payfold-mock-bank` | FastAPI mock counterparty (source + pinned pure-python deps) | long-running service; port 8080, `/health`; compose runs two SEPA instances and one card instance | `BANK_ID`, `BANK_SCHEME`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `BANK_WEBHOOK_RETRY_MAX_ATTEMPTS`, `BANK_WEBHOOK_RETRY_BACKOFF_SECONDS`, `TZ` |
 
 Compose builds `payfold-migrations` and `payfold-seed-data-gen` itself (the flyway

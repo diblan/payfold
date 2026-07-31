@@ -13,6 +13,7 @@ from app.delivery import BANK_COLLECTIONS_RECEIVED, deliver
 from app.rules import (
     card_notification_plan,
     card_verdict_for,
+    is_silent,
     notification_plan,
     outcome_for,
 )
@@ -135,11 +136,17 @@ def create_app(
                 submission.collection_id, submission.debtor_iban
             )
 
+        silent = is_silent(
+            submission.card_token
+            if settings.scheme == "card"
+            else submission.debtor_iban
+        )
+
         notifications = [
             {
                 **planned,
                 "notification_id": f"{submission.collection_id}:{planned['seq']}",
-                "state": "scheduled",
+                "state": "suppressed" if silent else "scheduled",
             }
             for planned in plan
         ]
@@ -155,8 +162,9 @@ def create_app(
         }
         records[submission.collection_id] = record
         BANK_COLLECTIONS_RECEIVED.inc()
-        for notification_record in notifications:
-            schedule(record, notification_record)
+        if not silent:
+            for notification_record in notifications:
+                schedule(record, notification_record)
 
         content = {
             "collection_id": submission.collection_id,

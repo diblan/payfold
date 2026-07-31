@@ -112,6 +112,46 @@ async def test_authorized_card_delivers_one_settled_webhook():
     ) == ("card-1:1", "settled", None)
 
 
+async def test_silent_card_authorizes_and_stores_suppressed_settlement():
+    captured = []
+
+    async def handler(request):
+        captured.append(request)
+        return httpx.Response(200, request=request)
+
+    webhook_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    application = create_app(settings(), webhook_client)
+    api = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
+    )
+    async with api, webhook_client:
+        response = await api.post(
+            "/collections", json=submission(token="tok-0000000094")
+        )
+
+        assert response.status_code == 202
+        assert response.json() == {
+            "collection_id": "card-1",
+            "status": "authorized",
+            "duplicate": False,
+        }
+        assert application.state.tasks == set()
+        assert captured == []
+
+        record = (await api.get("/collections/card-1")).json()
+        assert record["outcome"] == "authorized"
+        assert record["notifications"] == [
+            {
+                "seq": 1,
+                "outcome": "settled",
+                "reason": None,
+                "notification_id": "card-1:1",
+                "state": "suppressed",
+            }
+        ]
+
+
 async def test_chargeback_card_delivers_settlement_then_dispute_in_order():
     captured = []
     api, webhook = await clients(captured)

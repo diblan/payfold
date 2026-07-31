@@ -174,6 +174,48 @@ async def test_duplicate_submission_does_not_reschedule():
         assert len(captured) == 1
 
 
+async def test_silent_submission_is_stored_but_never_scheduled():
+    captured = []
+
+    async def handler(request):
+        captured.append(request)
+        return httpx.Response(200, request=request)
+
+    webhook_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    application = create_app(settings(), webhook_client)
+    api = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://t",
+    )
+    async with api, webhook_client:
+        response = await api.post(
+            "/collections",
+            json=submission(collection_id="silent-sdd", iban="BE68539007547094"),
+        )
+
+        assert response.status_code == 202
+        assert response.json() == {
+            "collection_id": "silent-sdd",
+            "status": "accepted",
+            "duplicate": False,
+        }
+        assert application.state.tasks == set()
+        assert captured == []
+
+        stored = await api.get("/collections/silent-sdd")
+        assert stored.status_code == 200
+        assert stored.json()["outcome"] == "settled"
+        assert stored.json()["notifications"] == [
+            {
+                "seq": 1,
+                "outcome": "settled",
+                "reason": None,
+                "notification_id": "silent-sdd:1",
+                "state": "suppressed",
+            }
+        ]
+
+
 async def test_invalid_submissions_return_422():
     async def handler(request):
         return httpx.Response(200, request=request)

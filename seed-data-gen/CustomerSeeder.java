@@ -45,15 +45,29 @@ public class CustomerSeeder {
         int howMany = args.length > 1 ? Integer.parseInt(args[1]) : seedTarget();   // number of customers to insert
         int sddPercent = seedPercent("SEED_SDD_PERCENT", 20);
         int sddRulePercent = seedPercent("SEED_SDD_RULE_PERCENT", 4);
+        int sddSilentPercent = seedPercent("SEED_SDD_SILENT_PERCENT", 2);
         int cardRulePercent = seedPercent("SEED_CARD_RULE_PERCENT", 4);
-        if (sddRulePercent < 0 || sddPercent < sddRulePercent || sddPercent > 100) {
+        int cardSilentPercent = seedPercent("SEED_CARD_SILENT_PERCENT", 2);
+        if (sddRulePercent < 0 || sddSilentPercent < 0
+                || sddPercent < 0 || sddPercent > 100) {
             throw new IllegalStateException(
-                    "Seed payment-method percentages must satisfy 0 <= "
-                            + "SEED_SDD_RULE_PERCENT <= SEED_SDD_PERCENT <= 100");
+                    "SEED_SDD_PERCENT, SEED_SDD_RULE_PERCENT, and "
+                            + "SEED_SDD_SILENT_PERCENT must be between 0 and 100");
         }
-        if (cardRulePercent < 0 || cardRulePercent > 100) {
+        if (sddRulePercent + sddSilentPercent > sddPercent) {
             throw new IllegalStateException(
-                    "SEED_CARD_RULE_PERCENT must satisfy 0 <= value <= 100");
+                    "SEED_SDD_RULE_PERCENT + SEED_SDD_SILENT_PERCENT "
+                            + "must be <= SEED_SDD_PERCENT");
+        }
+        if (cardRulePercent < 0 || cardSilentPercent < 0) {
+            throw new IllegalStateException(
+                    "SEED_CARD_RULE_PERCENT and SEED_CARD_SILENT_PERCENT "
+                            + "must be >= 0");
+        }
+        if (sddPercent + cardRulePercent + cardSilentPercent > 100) {
+            throw new IllegalStateException(
+                    "SEED_SDD_PERCENT + SEED_CARD_RULE_PERCENT + "
+                            + "SEED_CARD_SILENT_PERCENT must be <= 100");
         }
 
         // Email numbering starts at the current row count: every run draws from a
@@ -97,7 +111,9 @@ public class CustomerSeeder {
         // ---- Generate + insert ----
         Random rnd = new Random();
         int sddCount = 0;
+        int sddSilentCount = 0;
         int cardRuleCount = 0;
+        int cardSilentCount = 0;
         try (Connection conn = DriverManager.getConnection(url, user, pass)) {
             conn.setAutoCommit(false);
             try (PreparedStatement ps = conn.prepareStatement(INSERT_SQL)) {
@@ -120,20 +136,29 @@ public class CustomerSeeder {
                     String country = null;
                     String cardToken = null;
                     if (sdd) {
-                        String suffix = n % 100 < sddRulePercent
-                                ? new String[]{"99", "98", "97", "96"}[n % 4]
-                                : "01";
+                        String suffix;
+                        if (n % 100 < sddRulePercent) {
+                            suffix = new String[]{"99", "98", "97", "96"}[n % 4];
+                        } else if (n % 100 >= sddPercent - sddSilentPercent) {
+                            suffix = "94";
+                        } else {
+                            suffix = "01";
+                        }
+                        if ("94".equals(suffix)) sddSilentCount++;
                         debtorIban = "BE68" + String.format("%010d", n) + suffix;
                         mandateReference = "MNDT-" + n;
                         country = countryFor(loc);
                         sddCount++;
                     } else {
                         boolean cardRule = n % 100 >= 100 - cardRulePercent;
+                        boolean cardSilent = !cardRule
+                                && n % 100 >= 100 - cardRulePercent - cardSilentPercent;
                         String suffix = cardRule
                                 ? new String[]{"99", "98", "96"}[n % 3]
-                                : "01";
+                                : cardSilent ? "94" : "01";
                         cardToken = "tok-" + String.format("%010d", n) + suffix;
                         if (cardRule) cardRuleCount++;
+                        if (cardSilent) cardSilentCount++;
                     }
 
                     ps.setObject(1, java.util.UUID.randomUUID());
@@ -160,7 +185,8 @@ public class CustomerSeeder {
 
         System.out.println("✅ Inserted " + howMany
                 + " customers with locale-aware names & emails (" + sddCount
-                + " SDD, " + cardRuleCount + " rule-bearing cards).");
+                + " SDD, " + sddSilentCount + " silent SDD, " + cardRuleCount
+                + " rule-bearing cards, " + cardSilentCount + " silent cards).");
     }
 
     // Seed target: CLI arg wins, then the SEED_CUSTOMERS env var (passed through by

@@ -32,6 +32,10 @@ build/
 ### VS Code ###
 .vscode/
 
+### Python (mock-bank) ###
+__pycache__/
+*.pyc
+
 ### Logs ###
 *.log
 *.tmp

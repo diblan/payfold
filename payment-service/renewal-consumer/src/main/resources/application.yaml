@@ -42,6 +42,13 @@ bank:
       base-url: http://localhost:8087
       webhook-secret: payfold-dev-secret-card
 
+recovery:
+  # Application default exceeds the worst-case delivery envelope + settlement
+  # delay + chargeback lag (D18), so a merely-slow webhook is never swept in a
+  # real deployment; the compose stack overrides to seconds for verify/demo.
+  stale-after-seconds: 300
+  sweep-interval-ms: 60000
+
 management:
   endpoints:
     web:

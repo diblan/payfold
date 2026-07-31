@@ -6,10 +6,12 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 @Component
@@ -90,6 +92,24 @@ public class BankClient {
         }
     }
 
+    public CollectionStatus getCollection(String bankId, String collectionId) {
+        if (bankRegistry.byId(bankId) == null) {
+            throw new IllegalStateException("unknown bank id " + bankId);
+        }
+        RestClient restClient = clients.get(bankId);
+        try {
+            return restClient.get()
+                    .uri("/collections/{id}", collectionId)
+                    .retrieve()
+                    .body(CollectionStatus.class);
+        } catch (HttpClientErrorException.NotFound notFound) {
+            return null;
+        } catch (RestClientException exception) {
+            throw new BankSubmissionException(
+                    "collection status query failed for " + collectionId, exception);
+        }
+    }
+
     record CollectionSubmission(String collection_id, long amount_cents,
                                 String currency, String debtor_iban,
                                 String mandate_reference, String due_date) {
@@ -101,5 +121,14 @@ public class BankClient {
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     record CardResponse(String status, String reason) {
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record CollectionStatus(String collection_id,
+                                   List<NotificationEntry> notifications) {
+        @JsonIgnoreProperties(ignoreUnknown = true)
+        public record NotificationEntry(int seq, String outcome, String reason,
+                                        String notification_id, String state) {
+        }
     }
 }
