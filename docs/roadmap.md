@@ -34,6 +34,8 @@ re-triggers [R24](#r24), still open).
 SEPA phase (2026-07-26): [R23](#r23) split per [D15](decisions.md#d15)/[D17](decisions.md#d17)
 into R23a → R23b → R23c → R23d → R23e → R23f, strictly in order;
 R23 → R26 ([D16](decisions.md#d16)).
+Dunning phase (2026-08-01): [R26](#r26) split into R26a → R26b → R26c → R26d,
+strictly in order; the [D16](decisions.md#d16) gate ([R23](#r23)) is closed.
 
 <a id="r1"></a>
 ### [x] R1 — Consumer bootstrap hygiene
@@ -500,17 +502,96 @@ demonstrably reaches its bank-side terminal state without manual
 intervention, bounded-time; verify.sh models the recovery deterministically.
 
 <a id="r26"></a>
-### [ ] R26 — Dunning: failed collections get a lifecycle ([D16](decisions.md#d16)) *(epic — blocked on [R23](#r23); split at execution)*
+### [ ] R26 — Dunning: failed collections get a lifecycle ([D16](decisions.md#d16)) *(epic — split 2026-08-01 into R26a–R26d below; check when all four are checked)*
 **Scope (promotion-level):** consumes [R23](#r23)'s terminal outcomes — no new
 service, no notification channels. Per-reason retry policy (AM04 insufficient
 funds retriable on a schedule; AC04 closed account and MD01 no mandate are not),
 a `past_due` grace lifecycle on the subscription, bounded attempts ending in
 cancellation; schema via new migrations ([G3](invariants.md#g3)).
+**Design spine (pre-decided):** every terminal reason maps to exactly one
+dunning class — `retriable` (AM04, `insufficient_funds`), `hard_fail` (AC04,
+MD01, `do_not_honor`), `dispute` (MD06, `fraud_dispute`) — in consumer config,
+not the DB (policies are code-shaped, outcomes are data-shaped). Re-collections
+are consumer-internal: a new submission through the existing
+`BillingService` → counterparty → settlement spine with collection id
+`sub-<id>|<due_date>|a<attempt>` — never a new `renewal.requested` message
+([G1](invariants.md#g1) stays about renewals; both contracts stay at v1,
+[G8](invariants.md#g8)). One env-tunable grace deadline per class in config,
+a single `grace_until` column in the DB. Dunning touches subscription `status`
+only, never period math (consistent with [R23d](#r23d) keeping the advance).
+Retry schedule and deadlines are env-tunable seconds (`DUNNING_*`), fast for
+verify, visible for demo. The dunning sweeper reuses the [R7](#r7)
+advisory-lock scheduled-task pattern and stays separate from [R28](#r28)'s
+recovery sweeper: dunning reacts to RECEIVED signals, recovery to MISSING
+ones — a stranded `submitted` payment has no terminal reason and is invisible
+to dunning by design (the sweepers compose, neither depends on the other).
 **Done when (epic-level):** a retriable failed collection demonstrably
 re-collects on schedule and settles or exhausts into cancellation; a chargeback
 moves the subscription through the grace lifecycle instead of being a dead-end
-fact; verify.sh models the retry outcomes deterministically; detailed sub-item
-acceptance criteria are written when the epic is split.
+fact; verify.sh models the retry outcomes deterministically.
+
+<a id="r26a"></a>
+### [ ] R26a — Terminal outcomes enter the grace lifecycle (no retries yet)
+**Scope:** new migration: `subscription` gains `grace_until TIMESTAMPTZ` and
+`past_due` joins the status vocabulary (V1 already documents `canceled`);
+consumer config gains the reason→class map and per-class grace seconds; the
+settlement listener, on terminal `failed`/`charged_back`, applies the class:
+any class → subscription `past_due` with a deadline (chargebacks per
+[D16](decisions.md#d16) stop being dead-end facts; the [R23d](#r23d) "stays
+advanced" period math is untouched — only `status` moves). `BillingService`'s
+synchronous card-decline branch applies the same map — a card auth decline is
+a terminal failure too, and [R26c](#r26c)'s cancellation matrix counts the
+card 98/99 cohorts. Dashboard gains a `past_due` depth panel.
+**Done when:** integration tests prove each reason class moves an `active`
+subscription to `past_due` exactly once, idempotent under settlement
+redelivery ([G2](invariants.md#g2)); verify.sh asserts exact `past_due` counts
+predicted from the IBAN/token rules ([G7](invariants.md#g7) tightening); a
+redelivered chargeback still yields one `past_due` transition.
+
+<a id="r26b"></a>
+### [ ] R26b — Scheduled re-collection for retriable failures
+**Scope:** `payment` rows gain `attempt` (int, default 1, part of a new unique
+key with the collection id family); dunning sweeper (advisory-locked, scaled
+schedule `DUNNING_RETRY_DELAY_SECONDS`) picks `past_due` subscriptions whose
+latest payment is `failed` with a `retriable` reason and submits attempt N+1
+through the normal spine; mock-bank gains ONE new deterministic rule so
+recovery is testable: IBAN/token suffix `95` = fail AM04 (/
+`insufficient_funds`) on attempt 1, settle on attempt ≥ 2 — attempt-indexed
+off the stored collection history, same recomputable-rule spirit as
+[R8](#r8)/[R23a](#r23a). Settled retry → subscription back to `active`,
+`past_due` cleared. The rule change alters the published mock-bank image —
+tag proposal expected.
+**Done when:** a suffix-95 customer demonstrably fails, re-collects after the
+scaled delay, settles, and returns to `active` — end to end in verify.sh with
+exact counts (95-cohort = recovered, 99-cohort = still failing); duplicate
+sweeper ticks never double-submit an attempt (constraint-keyed,
+[G2](invariants.md#g2) style); `hard_fail` and `dispute` reasons are provably
+never retried; the dunning sweeper provably ignores `submitted` rows
+regardless of age ([R28](#r28) boundary).
+
+<a id="r26c"></a>
+### [ ] R26c — Bounded exhaustion and grace expiry end in cancellation
+**Scope:** `DUNNING_MAX_ATTEMPTS` (retriable path) and grace-deadline
+enforcement (all classes): the sweeper cancels subscriptions whose retriable
+attempts exhausted (suffix 99 never settles) or whose `grace_until` passed
+without recovery (`hard_fail`, `dispute`); cancellation uses V1's documented
+`canceled` status, is terminal and idempotent; dashboard outcome split gains
+cancellations.
+**Done when:** verify.sh predicts exactly which seeded customers end
+`canceled` vs re-`active` from suffix arithmetic alone (99 →
+exhausted-canceled, 95 → recovered, 98/97 + card 98 → grace-expired-canceled,
+96 + card 96 → dispute-grace-canceled) and asserts the counts; a canceled
+subscription is never re-collected; re-running the sweeper is a no-op
+([G2](invariants.md#g2)).
+
+<a id="r26d"></a>
+### [ ] R26d — The dunning story: chaos scene + README
+**Scope:** `scripts/chaos-demo.sh` gains a dunning scene: the suffix-95 cohort
+visibly fails, goes `past_due` on the dashboard, recovers on retry; the 99
+cohort exhausts into cancellation — both asserted, not narrated ([R22](#r22)
+rule); README + architecture.md dunning section; [R24](#r24) re-record note.
+**Done when:** the scene runs green on a fresh stack `--auto`; every claim in
+the README dunning paragraph matches an assertion in the scene or verify.sh.
 
 <a id="r29"></a>
 ### [x] R29 — Consumer integration polls abort on missing rows instead of retrying
