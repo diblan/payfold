@@ -8,6 +8,7 @@ import com.blanchaert.billing.consumer.service.InvalidRenewalMessageException;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
+import org.awaitility.core.ConditionFactory;
 import org.junit.jupiter.api.Test;
 import org.springframework.amqp.core.AmqpAdmin;
 import org.springframework.amqp.core.Message;
@@ -17,6 +18,7 @@ import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -152,7 +154,7 @@ class RenewalListenerIntegrationTest {
                 .count();
         rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", message);
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             Long submittedPayments = jdbcTemplate.queryForObject("""
                     SELECT count(*)
                     FROM payment
@@ -161,12 +163,12 @@ class RenewalListenerIntegrationTest {
             assertThat(submittedPayments).isEqualTo(1L);
         });
         publishSettlement(idempotencyKey, "cardnet", "settled", null, 1);
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(jdbcTemplate.queryForObject(
                         "SELECT status FROM payment WHERE idempotency_key = ?",
                         String.class, idempotencyKey)).isEqualTo("succeeded"));
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(registry.get("renewals.processed")
                         .tag("outcome", "submitted")
                         .tag("method", "card")
@@ -244,7 +246,7 @@ class RenewalListenerIntegrationTest {
                         .setContentType(MessageProperties.CONTENT_TYPE_JSON)
                         .build());
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             Long sentinelPayments = jdbcTemplate.queryForObject("""
                     SELECT count(*) FROM payment
                     WHERE idempotency_key = ? AND status = 'submitted'
@@ -252,7 +254,7 @@ class RenewalListenerIntegrationTest {
             assertThat(sentinelPayments).isEqualTo(1L);
         });
         publishSettlement(sentinelKey, "cardnet", "settled", null, 1);
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(jdbcTemplate.queryForObject(
                         "SELECT status FROM payment WHERE idempotency_key = ?",
                         String.class, sentinelKey)).isEqualTo("succeeded"));
@@ -287,7 +289,7 @@ class RenewalListenerIntegrationTest {
                 (rs, rowNum) -> rs.getTimestamp(1).toInstant(), failingSubscriptionId);
         assertThat(renewedAt).isEqualTo(originalRenewedAt.atOffset(ZoneOffset.UTC).toInstant());
 
-        await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).until(
+        awaitDb().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).until(
                 () -> amqpAdmin.getQueueInfo("billing.renewals.dlq").getMessageCount() == 0);
         assertThat(amqpAdmin.getQueueInfo("billing.renewals.main").getMessageCount()).isZero();
         assertThat(bankRequestCount("cardnet", failingKey)).isEqualTo(1);
@@ -344,7 +346,7 @@ class RenewalListenerIntegrationTest {
         rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", message);
 
         // The absence of an authorization verdict is not a decline.
-        await().atMost(Duration.ofSeconds(45)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(45)).untilAsserted(() ->
                 assertThat(amqpAdmin.getQueueInfo("billing.renewals.dlq").getMessageCount())
                         .isEqualTo(1));
 
@@ -437,7 +439,7 @@ class RenewalListenerIntegrationTest {
         rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", failingMessage);
         rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", sentinelMessage);
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             Long sentinelPayments = jdbcTemplate.queryForObject("""
                     SELECT count(*) FROM payment
                     WHERE idempotency_key = ? AND status = 'submitted'
@@ -445,7 +447,7 @@ class RenewalListenerIntegrationTest {
             assertThat(sentinelPayments).isEqualTo(1L);
         });
         publishSettlement(sentinelKey, "cardnet", "settled", null, 1);
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(jdbcTemplate.queryForObject(
                         "SELECT status FROM payment WHERE idempotency_key = ?",
                         String.class, sentinelKey)).isEqualTo("succeeded"));
@@ -512,7 +514,7 @@ class RenewalListenerIntegrationTest {
                 .count();
         rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", message);
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             Long submittedPayments = jdbcTemplate.queryForObject("""
                     SELECT count(*) FROM payment
                     WHERE idempotency_key = ? AND status = 'submitted'
@@ -545,10 +547,10 @@ class RenewalListenerIntegrationTest {
         assertThat(bankRequestCount("cardnet", idempotencyKey)).isZero();
         assertThat(bankRequestCount("bank-a", idempotencyKey)).isEqualTo(1);
 
-        await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).until(
+        awaitDb().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).until(
                 () -> amqpAdmin.getQueueInfo("billing.renewals.dlq").getMessageCount() == 0
                         && amqpAdmin.getQueueInfo("billing.renewals.main").getMessageCount() == 0);
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(registry.get("renewals.processed")
                         .tag("outcome", "submitted")
                         .tag("method", "sdd")
@@ -599,7 +601,7 @@ class RenewalListenerIntegrationTest {
                         .setContentType(MessageProperties.CONTENT_TYPE_JSON)
                         .build());
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             assertThat(jdbcTemplate.queryForObject(
                     "SELECT bank_id FROM payment WHERE idempotency_key = ?",
                     String.class, beKey)).isEqualTo("bank-a");
@@ -663,7 +665,7 @@ class RenewalListenerIntegrationTest {
         rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", renewalMessage);
         rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", sentinelMessage);
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             Long sentinelPayments = jdbcTemplate.queryForObject("""
                     SELECT count(*) FROM payment
                     WHERE idempotency_key = ? AND status = 'submitted'
@@ -724,7 +726,7 @@ class RenewalListenerIntegrationTest {
                 .build();
         rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", message);
 
-        await().atMost(Duration.ofSeconds(45)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(45)).untilAsserted(() ->
                 assertThat(amqpAdmin.getQueueInfo("billing.renewals.dlq").getMessageCount())
                         .isEqualTo(1));
 
@@ -825,7 +827,7 @@ class RenewalListenerIntegrationTest {
         rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", renewalMessage);
         rabbitTemplate.convertAndSend("billing.renewals", "renewal.requested", sentinelMessage);
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             Long sentinelPayments = jdbcTemplate.queryForObject("""
                     SELECT count(*)
                     FROM payment
@@ -841,7 +843,7 @@ class RenewalListenerIntegrationTest {
                 """, Long.class, idempotencyKey);
         assertThat(submittedPayments).isEqualTo(1L);
         publishSettlement(idempotencyKey, "cardnet", "settled", null, 1);
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(jdbcTemplate.queryForObject(
                         "SELECT status FROM payment WHERE idempotency_key = ?",
                         String.class, idempotencyKey)).isEqualTo("succeeded"));
@@ -998,7 +1000,7 @@ class RenewalListenerIntegrationTest {
                         .setContentType(MessageProperties.CONTENT_TYPE_JSON)
                         .build());
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             Long submittedPayments = jdbcTemplate.queryForObject("""
                     SELECT count(*)
                     FROM payment
@@ -1007,7 +1009,7 @@ class RenewalListenerIntegrationTest {
             assertThat(submittedPayments).isEqualTo(1L);
         });
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(amqpAdmin.getQueueInfo("billing.renewals.dlq").getMessageCount()).isEqualTo(2));
 
         Message firstDeadLetter = rabbitTemplate.receive("billing.renewals.dlq", 5000);
@@ -1022,6 +1024,12 @@ class RenewalListenerIntegrationTest {
                         new String(invalidBody, StandardCharsets.UTF_8)));
 
         assertThat(amqpAdmin.getQueueInfo("billing.renewals.main").getMessageCount()).isZero();
+    }
+
+    // A poll can fire before the consumer has inserted the row it queries;
+    // a missing row must mean "not yet" (retry), never an instant abort.
+    private static ConditionFactory awaitDb() {
+        return await().ignoreExceptionsInstanceOf(EmptyResultDataAccessException.class);
     }
 
     private int bankRequestCount(String bank, String collectionId)

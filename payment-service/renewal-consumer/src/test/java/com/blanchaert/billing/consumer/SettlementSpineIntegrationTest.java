@@ -5,6 +5,7 @@ import com.blanchaert.billing.consumer.model.RenewalRequested;
 import com.blanchaert.billing.consumer.model.SettlementReceived;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
+import org.awaitility.core.ConditionFactory;
 import org.junit.jupiter.api.Test;
 import org.springframework.amqp.core.AmqpAdmin;
 import org.springframework.amqp.core.Message;
@@ -15,6 +16,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -134,7 +136,7 @@ class SettlementSpineIntegrationTest {
                 WHERE bank_id = ? AND notification_id = ?
                 """, Long.class, BANK_A_ID, fixture.collectionId() + ":1")).isEqualTo(1L);
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             assertThat(paymentStatus(fixture)).isEqualTo("succeeded");
             assertThat(jdbc.queryForObject("""
                     SELECT completed_at IS NOT NULL FROM payment
@@ -166,9 +168,9 @@ class SettlementSpineIntegrationTest {
         rabbitTemplate.convertAndSend(
                 SettlementTopology.EXCHANGE, SettlementTopology.ROUTING_KEY, message);
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(fixture)).isEqualTo("succeeded"));
-        await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+        awaitDb().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
             assertFinalized(fixture);
             assertThat(jdbc.queryForObject(
                     "SELECT count(*) FROM invoice WHERE customer_id = ?",
@@ -201,9 +203,9 @@ class SettlementSpineIntegrationTest {
         rabbitTemplate.convertAndSend(
                 SettlementTopology.EXCHANGE, SettlementTopology.ROUTING_KEY, goodMessage);
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(good)).isEqualTo("succeeded"));
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(amqpAdmin.getQueueInfo(SettlementTopology.DLQ).getMessageCount())
                         .isEqualTo(1));
 
@@ -248,7 +250,7 @@ class SettlementSpineIntegrationTest {
 
         assertThat(postWebhook(BANK_B_ID, settled, sign(settled, BANK_B_SECRET)))
                 .isEqualTo(200);
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             assertThat(paymentStatus(fixture)).isEqualTo("succeeded");
             assertThat(meters.get("settlements.latency")
                     .tag("bank", BANK_B_ID)
@@ -265,7 +267,7 @@ class SettlementSpineIntegrationTest {
         assertThat(postWebhook(BANK_A_ID, webhook, sign(webhook, BANK_A_SECRET)))
                 .isEqualTo(200);
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             assertThat(paymentStatus(fixture)).isEqualTo("failed");
             assertThat(jdbc.queryForObject("""
                     SELECT failure_reason FROM payment WHERE collection_id = ?
@@ -293,12 +295,12 @@ class SettlementSpineIntegrationTest {
 
         assertThat(postWebhook(BANK_A_ID, settled, sign(settled, BANK_A_SECRET)))
                 .isEqualTo(200);
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(fixture)).isEqualTo("succeeded"));
         assertThat(postWebhook(BANK_A_ID, chargedBack, sign(chargedBack, BANK_A_SECRET)))
                 .isEqualTo(200);
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             assertThat(paymentStatus(fixture)).isEqualTo("charged_back");
             assertThat(jdbc.queryForObject("""
                     SELECT failure_reason FROM payment WHERE collection_id = ?
@@ -326,18 +328,18 @@ class SettlementSpineIntegrationTest {
 
         assertThat(postWebhook(BANK_A_ID, settled, sign(settled, BANK_A_SECRET)))
                 .isEqualTo(200);
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(fixture)).isEqualTo("succeeded"));
         assertThat(postWebhook(BANK_A_ID, chargedBack, sign(chargedBack, BANK_A_SECRET)))
                 .isEqualTo(200);
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(fixture)).isEqualTo("charged_back"));
         Instant firstChargedBackAt = chargedBackAt(fixture);
 
         assertThat(postWebhook(BANK_A_ID, chargedBack, sign(chargedBack, BANK_A_SECRET)))
                 .isEqualTo(200);
 
-        await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+        awaitDb().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
             assertThat(jdbc.queryForObject("""
                     SELECT count(*) FROM settlement_inbox
                     WHERE bank_id = ? AND notification_id = ?
@@ -368,12 +370,12 @@ class SettlementSpineIntegrationTest {
 
         rabbitTemplate.convertAndSend(
                 SettlementTopology.EXCHANGE, SettlementTopology.ROUTING_KEY, chargedBack);
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(fixture)).isEqualTo("charged_back"));
 
         rabbitTemplate.convertAndSend(
                 SettlementTopology.EXCHANGE, SettlementTopology.ROUTING_KEY, settled);
-        await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+        awaitDb().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
             assertThat(paymentStatus(fixture)).isEqualTo("charged_back");
             assertThat(renewedAt(fixture.subscriptionId()))
                     .isEqualTo(fixture.originalRenewedAt());
@@ -395,7 +397,7 @@ class SettlementSpineIntegrationTest {
 
         assertThat(postWebhook(CARD_ID, settled, sign(settled, CARD_SECRET)))
                 .isEqualTo(200);
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(fixture)).isEqualTo("succeeded"));
         assertFinalized(fixture);
 
@@ -406,7 +408,7 @@ class SettlementSpineIntegrationTest {
                 CARD_ID, chargedBack, sign(chargedBack, CARD_SECRET)))
                 .isEqualTo(200);
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             assertThat(paymentStatus(fixture)).isEqualTo("charged_back");
             assertThat(jdbc.queryForObject("""
                     SELECT failure_reason FROM payment WHERE collection_id = ?
@@ -458,7 +460,7 @@ class SettlementSpineIntegrationTest {
                 "renewal.requested",
                 jsonMessage(objectMapper.writeValueAsBytes(renewal)));
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(collectionId)).isEqualTo("submitted"));
         return new SubmittedPayment(
                 customerId, subscriptionId, collectionId, periodEnd, originalRenewedAt);
@@ -497,7 +499,7 @@ class SettlementSpineIntegrationTest {
                 "renewal.requested",
                 jsonMessage(objectMapper.writeValueAsBytes(renewal)));
 
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             assertThat(paymentStatus(collectionId)).isEqualTo("submitted");
             assertThat(jdbc.queryForObject(
                     "SELECT bank_id FROM payment WHERE collection_id = ?",
@@ -551,6 +553,12 @@ class SettlementSpineIntegrationTest {
         return MessageBuilder.withBody(body)
                 .setContentType(MessageProperties.CONTENT_TYPE_JSON)
                 .build();
+    }
+
+    // A poll can fire before the consumer has inserted the row it queries;
+    // a missing row must mean "not yet" (retry), never an instant abort.
+    private static ConditionFactory awaitDb() {
+        return await().ignoreExceptionsInstanceOf(EmptyResultDataAccessException.class);
     }
 
     private String paymentStatus(SubmittedPayment fixture) {

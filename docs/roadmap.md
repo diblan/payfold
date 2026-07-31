@@ -514,3 +514,22 @@ re-collects on schedule and settles or exhausts into cancellation; a chargeback
 moves the subscription through the grace lifecycle instead of being a dead-end
 fact; verify.sh models the retry outcomes deterministically; detailed sub-item
 acceptance criteria are written when the epic is split.
+
+<a id="r29"></a>
+### [x] R29 — Consumer integration polls abort on missing rows instead of retrying
+**Scope:** both consumer integration test classes; no production code.
+Awaitility's `untilAsserted` retries only on `AssertionError`, but every DB poll
+in the consumer suite reads via `queryForObject`, which throws
+`EmptyResultDataAccessException` while the awaited row does not exist yet — so a
+poll that fires before the consumer has processed the message aborts the await
+instantly instead of retrying. Latent since [R23c](#r23c) (locally the consume
+always beat the first poll); first fired on the settlement suite's first-ever
+Actions run (2026-07-26, build run 30213487837):
+`redeliveredSettlementMessageDoesNotDoubleFinalize` died ~1 s into its 30 s
+window when a transient broker EOF on the runner delayed consumption past the
+first poll. The [R17](#r17)/[R27](#r27) measurement-race class, test-suite
+flavor: a missing row is "not yet", not "fail now".
+**Done when:** every await in both classes tolerates a missing row as a
+retriable state (`ignoreExceptionsInstanceOf(EmptyResultDataAccessException)`)
+with asserted conditions and timeouts unchanged (timeouts still fail loudly with
+the last miss as cause); the consumer suite is green; verify.sh untouched.
