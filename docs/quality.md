@@ -3,7 +3,7 @@
 Coarse, honest, and **maintained**: any PR touching a module re-grades it in the same
 PR ([G6](invariants.md#g6)). The value of this file is currency, not precision.
 
-Last full re-grade: **2026-07-26** (R13 entropy pass, after R20).
+Last full re-grade: **2026-07-31** (R13 entropy pass, after the R23 epic, R27, and R29).
 
 ## Rubric
 
@@ -22,14 +22,14 @@ Last full re-grade: **2026-07-26** (R13 entropy pass, after R20).
 | `payment-service/renewal-consumer` | **A** | Tested (real-broker integration suite including synchronous card decline, authorization timeout to bounded DLQ, asynchronous card settlement/chargeback, poison isolation, deterministic BE→bank-a/NL→bank-b routing, per-counterparty webhook secrets, and the shared settlement spine, with DB polls that treat a missing row as retriable within their bounded windows, [R29](roadmap.md#r29)), observable (method-tagged eager renewal counters, webhook/settlement counters, per-counterparty latency timers, Prometheus, listener timers, dashboard panels), and documented; both methods now use one registry/client and one durable inbox→queue→listener path, while the removed PSP client can no longer confuse transport failure with a decline; no known behavior defects | — |
 | `db-migrations` | **B** | Clean, ordered, sole schema authority; since R18 also ships as the `payfold-migrations` Job image (SQL baked at build, FLYWAY_* env config), whose no-op re-run `verify.sh` asserts; V6 adds customer payment methods and submitted-payment attribution, V7–V8 add the settlement lifecycle, and V9 adds/backfills the required tokenized card reference; V1 carries aspirational tables (`bank_tx`, `recon_match`, `ledger_entry`) no code uses — harmless but reviewer-confusing | — |
 | `seed-data-gen` | **B** | Seed size parameterized (`SEED_CUSTOMERS`, default 15k, all due today); payment-method, rule-bearing IBAN, and rule-bearing card-token shares use deterministic customer-number arithmetic with no RNG; card suffixes cycle exact auth/chargeback cases, while SDD rows keep card tokens null; emails remain collision-safe across top-ups; the R18 Job image and R16 clamp-day-safe due seeding remain unchanged. No test harness of its own — the arithmetic is checked by end-to-end exact outcome assertions | — |
-| `mock-bank/` (FastAPI) | **B** | One counterparty image now implements `sepa_core` and `card`: deterministic IBAN settlement rules plus token-derived synchronous authorization, async card settlement/chargeback, HMAC-signed delivery, bounded exponential retry, duplicate stored-verdict semantics, and loud give-up metrics; pytest covers both schemes including default/decline/chargeback rules, no-notification declines, ordered callbacks, duplicates, and model isolation; compose healthchecks all three instances | — |
+| `mock-bank/` (FastAPI) | **B** | One counterparty image now implements `sepa_core` and `card`: deterministic IBAN settlement rules plus token-derived synchronous authorization, async card settlement/chargeback, HMAC-signed delivery, bounded exponential retry, duplicate stored-verdict semantics, and loud give-up metrics; pytest covers both schemes including default/decline/chargeback rules, no-notification declines, ordered callbacks, duplicates, and model isolation; compose healthchecks all three instances; pending deliveries are in-memory asyncio tasks, so a container recreate silently drops not-yet-fired notifications | [R28](roadmap.md#r28) |
 | `docker-compose.yaml` + config | **B** | Stack ordering and healthchecks pass; yaml contains only consumed keys; flyway and seed-data run the published image shapes; the WireMock PSP service and `payment.provider.*` surface are removed, while the same counterparty image runs bank-a, bank-b, and cardnet on port 8087 with a scheme-aware registry; Prometheus/Grafana, scale-safe consumer ports, and confirm-gated settlement relay configuration remain intact | — |
 | `docs/` + harness | **B** | CI uses pinned Maven wrappers and real-container integration suites; `verify.sh` covers trigger/idempotency/poison behavior, exact token- and IBAN-predicted outcomes and reasons, method-tagged renewal counters, all-payment zero-stuck and inbox reconciliation, per-counterparty exact inbox shares, health, and zero give-ups; `scripts/chaos-demo.sh` keeps seven asserted scenes and now seeds clean cards for delivery demonstrations while cards settle asynchronously on the same spine | — |
 
 ## Test coverage
 
 Both services have JUnit 5 integration coverage backed by Testcontainers 2.x and the
-real V1–V8 migrations. The producer has a context smoke test and a confirm-gating job test
+real V1–V9 migrations. The producer has a context smoke test and a confirm-gating job test
 against a real-PostgreSQL container with publisher futures faked; the latter proves
 unconfirmed rows stay unpublished and are re-picked.
 `PublisherReturnGatingTest` extends that recipe one level deeper — the

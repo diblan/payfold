@@ -29,14 +29,11 @@ Scope insurance. Promoting any of these onto the roadmap requires a
 
 Ordering principle: *repair the feedback loop → correctness → resilience → scale → story*.
 Dependencies: R1, R2 → R3 → R4–R8; R4 → R5; R10 → R11, R12.
-Story phase (2026-07-26): R20 → R22; R21 → R22; R22 → R24 ([R17](#r17) pairs
-naturally with [R20](#r20)'s scale runs; [R23](#r23) re-triggers [R24](#r24)).
+Story phase (2026-07-26): R20 → R22; R21 → R22; R22 → R24 ([R23](#r23)
+re-triggers [R24](#r24), still open).
 SEPA phase (2026-07-26): [R23](#r23) split per [D15](decisions.md#d15)/[D17](decisions.md#d17)
 into R23a → R23b → R23c → R23d → R23e → R23f, strictly in order;
-R23 → R26 ([D16](decisions.md#d16)). Between [R23b](#r23b) and [R23c](#r23c) the
-SDD cohort parks in `submitted` while cards settle as today ([D17](decisions.md#d17))
-— a tag proposed from that window must say so, and the seeded SDD share should
-stay low until the loop closes.
+R23 → R26 ([D16](decisions.md#d16)).
 
 <a id="r1"></a>
 ### [x] R1 — Consumer bootstrap hygiene
@@ -159,7 +156,7 @@ the code; full re-grade of [quality.md](quality.md); prune stale roadmap notes.
 **Done when:** the checklist above is completed and quality.md's re-grade date is
 updated. **No behavior changes allowed** in this session type.
 
-*Last run: 2026-07-26 (after R20, commit c390bc6 — 3rd run).*
+*Last run: 2026-07-31 (after the R23 epic + R29, commit ab206b9 — 4th run).*
 
 <a id="r14"></a>
 ### [x] R14 — Migrate to Testcontainers 2.x
@@ -533,3 +530,20 @@ flavor: a missing row is "not yet", not "fail now".
 retriable state (`ignoreExceptionsInstanceOf(EmptyResultDataAccessException)`)
 with asserted conditions and timeouts unchanged (timeouts still fail loudly with
 the last miss as cause); the consumer suite is green; verify.sh untouched.
+
+<a id="r30"></a>
+### [ ] R30 — Re-measure the drain story on the async spine
+**Scope:** measurement + docs only (README, quality.md "Measured scale runs",
+architecture.md honesty table); no behavior changes.
+Every published consumer number (~48/s sustained from [R12](#r12); 524/s at
+listener concurrency 8 and 105/s at ×3 replicas from [R20](#r20)) predates
+[R23f](#r23f): a card consume then settled synchronously inside the handler, so
+"renewals drained" meant "renewals finished". Since R23f a consume is a fast
+auth + an async settlement, and the same probe measures two different
+quantities: renewals-queue drain rate and end-to-end settlement completion
+(every payment terminal, zero stuck `submitted`). Flagged (not re-measured) by
+the 2026-07-31 R13 pass, which era-scoped the README/architecture claims.
+**Done when:** quality.md gains an async-era measured-scale entry reporting
+BOTH quantities for the documented 100k run and both [R20](#r20) lever
+configurations; README and the architecture honesty table quote the new
+numbers and drop the era note; verify.sh untouched ([G7](invariants.md#g7)).

@@ -103,6 +103,14 @@ the next run. Both sides are measured on a single-node WSL2 dev laptop running t
 unmodified Compose stack; run details live in [docs/quality.md](docs/quality.md)
 under "Measured scale runs".
 
+> **Era note:** the consumer numbers below were measured before
+> [R23f](docs/roadmap.md#r23f) (2026-07-26), when a card consume settled
+> synchronously inside the message handler. Since R23f a consume is a fast
+> synchronous auth plus an asynchronous settlement on the shared spine, so
+> queue-drain rate and end-to-end completion are related but distinct
+> quantities; re-measuring both on the async pipeline is
+> [R30](docs/roadmap.md#r30).
+
 - **Producer (scan + publish):** 1,015,000 due renewals scanned and published in
   459 s wall at 183 MiB peak heap (1M-row run). At 100k the whole job takes ~22 s —
   a 330k night is roughly 2.5 minutes of publishing.

@@ -15,12 +15,14 @@ understanding to human reviewers as much as they guide agents.
 | Path | What it is |
 |---|---|
 | `billing-engine/renewal-producer/` | Spring Batch job: scan due renewals → `renewal_outbox` → publish to RabbitMQ |
-| `payment-service/renewal-consumer/` | Listener → `BillingService` upsert chain (invoice/charge/payment) |
+| `payment-service/renewal-consumer/` | Renewal listener → `BillingService` (card auth / SDD submit); webhook receiver → `settlement_inbox` → relay → settlement listener finalizes |
 | `db-migrations/` | Flyway migrations — the **only** place schema changes happen |
 | `seed-data-gen/` | JDBC seeders run by compose (`SEED_CUSTOMERS` customers, default 15k, all due today) |
-| `mock-psp/` | WireMock mock PSP: decline-rule mapping templates (`.json.tpl`) rendered by the compose entrypoint |
-| `docker-compose.yaml` | Full local stack: postgres, flyway, seed, rabbitmq, mock-psp, both services |
+| `mock-bank/` | FastAPI mock counterparty — one image, three compose instances (bank-a, bank-b, cardnet): deterministic IBAN/token outcomes, signed settlement webhooks |
+| `docker-compose.yaml` | Full local stack: postgres, flyway, seed, rabbitmq, three mock-counterparty instances, both services, Prometheus + Grafana |
+| `observability/` | Prometheus config + Grafana provisioning and the `payfold-pipeline` dashboard JSON |
 | `scripts/verify.sh` | End-to-end check; **the definition of "working"** |
+| `scripts/chaos-demo.sh` | Scene-based chaos demo; every scene asserts the invariant it shows |
 | `docs/architecture.md` | System map, message flow, scale math, config truth table |
 | `docs/invariants.md` | Golden rules G1–G8 with HELD/VIOLATED status |
 | `docs/decisions.md` | Decision log |
@@ -72,8 +74,9 @@ stricter (G7).
 
 ## Non-goals (summary — full list with rationale in docs/roadmap.md)
 
-No Kubernetes. No real PSP or money movement. No auth/tenancy. No UI. No dunning,
-proration, refunds, or tax. No event-sourcing rewrite. No third service without a
+No Kubernetes. No real money movement — mock counterparties only. No auth/tenancy.
+No UI. No proration, refunds, or tax (dunning left the list via D16 → R26). No
+event-sourcing rewrite. No services beyond D13's mock counterparty without a
 decision entry.
 
 ## Read-when index

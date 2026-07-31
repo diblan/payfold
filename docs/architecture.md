@@ -20,9 +20,9 @@ Honesty table:
 | Bounded failure handling (DLQ) | Demonstrated — bounded listener retry + DLQ routing; poison-path integration test and `verify.sh` probe; see [G5](invariants.md#g5) |
 | Two-method counterparty path | Demonstrated — SDD and cards share one async settlement spine; card authorization declines synchronously while authorized cards and SDD finalize only from settlement events; exact token/IBAN outcome assertions |
 | Operational observability | Demonstrated — SLF4J logging, Prometheus counters + built-in job/listener timers, `verify.sh` cross-checks metric deltas against DB deltas |
-| Throughput at 330k/day | Measured end to end — producer: 1,015,000 due rows scanned + published in 459 s wall, peak heap 183 MiB; consumer: 100,000 due-today renewals drained in ~30 min (~48/s sustained) in [R12](roadmap.md#r12)'s documented run, so a 330k night is ~2.5 min of publishing plus 1.9–2.2 h of draining — 11–13× the 3.8/s requirement average. Single-node WSL2 dev-laptop numbers; the consumer is the binding constraint (2026-07-21, see quality.md "Measured scale runs") |
+| Throughput at 330k/day | Measured end to end — producer: 1,015,000 due rows scanned + published in 459 s wall, peak heap 183 MiB; consumer: 100,000 due-today renewals drained in ~30 min (~48/s sustained) in [R12](roadmap.md#r12)'s documented run, so a 330k night is ~2.5 min of publishing plus 1.9–2.2 h of draining — 11–13× the 3.8/s requirement average. Single-node WSL2 dev-laptop numbers; the consumer is the binding constraint (2026-07-21, see quality.md "Measured scale runs"). Pre-[R23f](roadmap.md#r23f) sync-card-era numbers; async-spine re-measurement is [R30](roadmap.md#r30) |
 | Horizontal producer scaling | Demonstrated — `FOR UPDATE SKIP LOCKED` page claims + advisory-lock cron guard; exactly-once under two concurrent publishers proven by test (compose still runs a single producer instance) |
-| Consumer scaling levers | Measured — listener concurrency ×8: 100k drained in 191 s (524/s avg, ~10× the ~53/s single-thread baseline); 3 same-host replicas at concurrency 1: 100k in 951 s (105/s, ~2×; RabbitMQ round-robin split 33,335/33,320/33,345) — both full verify.sh-green with fleet-summed exact checks ([R20](roadmap.md#r20), 2026-07-26). Same-host replicas contend for one machine; true multi-node scaling is the external platform repo's KEDA demonstration |
+| Consumer scaling levers | Measured — listener concurrency ×8: 100k drained in 191 s (524/s avg, ~10× the ~53/s single-thread baseline); 3 same-host replicas at concurrency 1: 100k in 951 s (105/s, ~2×; RabbitMQ round-robin split 33,335/33,320/33,345) — both full verify.sh-green with fleet-summed exact checks ([R20](roadmap.md#r20), 2026-07-26). Same-host replicas contend for one machine; true multi-node scaling is the external platform repo's KEDA demonstration. Pre-[R23f](roadmap.md#r23f) sync-card-era numbers; async-spine re-measurement is [R30](roadmap.md#r30) |
 
 ## Component map
 
@@ -566,8 +566,11 @@ envs, deliberately absent from the `application.yaml` table: bank-a uses the
 `BANK_*` variables, bank-b uses the corresponding `BANK_B_*` values, and cardnet
 uses `CARDNET_*`; each container receives its own `BANK_ID`, `BANK_SCHEME`,
 `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`,
-`BANK_SETTLEMENT_DELAY_SECONDS`, and `BANK_CHARGEBACK_LAG_SECONDS`. The retry
-cap/backoff retain the image defaults.
+`BANK_SETTLEMENT_DELAY_SECONDS`, and `BANK_CHARGEBACK_LAG_SECONDS`. All three
+share the compose-set delivery envelope `BANK_WEBHOOK_RETRY_MAX_ATTEMPTS` /
+`BANK_WEBHOOK_RETRY_BACKOFF_SECONDS` (default 8 attempts, 2 s base — wider than
+the image defaults, sized to outlive a chaos-scene consumer outage; the
+recovery story for exhausted deliveries is [R28](roadmap.md#r28)).
 
 `CONSUMER_LISTENER_CONCURRENCY` (default 1) passes straight
 through to `spring.rabbitmq.listener.simple.concurrency`, and the consumer's host ports
@@ -614,7 +617,7 @@ architecture-independent jar once instead of emulating Maven under QEMU.
 | `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, indexed `BANK_REGISTRY_*` including scheme, `TZ` |
 | `payfold-migrations` | `flyway/flyway:11` + `db-migrations/V*.sql`, `CMD ["migrate"]` | run-to-completion Job; exit 0 = success; re-run on a current schema is a no-op (asserted by `verify.sh`) | `FLYWAY_URL`, `FLYWAY_USER`, `FLYWAY_PASSWORD`, `FLYWAY_CONNECT_RETRIES` (image default 30) |
 | `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS`, `SEED_SDD_PERCENT`, `SEED_SDD_RULE_PERCENT`, `SEED_CARD_RULE_PERCENT` |
-| `payfold-mock-bank` | FastAPI mock counterparty (source + pinned pure-python deps) | long-running service; port 8080, `/health`; compose runs two SEPA instances and one card instance | `BANK_ID`, `BANK_SCHEME`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `TZ` |
+| `payfold-mock-bank` | FastAPI mock counterparty (source + pinned pure-python deps) | long-running service; port 8080, `/health`; compose runs two SEPA instances and one card instance | `BANK_ID`, `BANK_SCHEME`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `BANK_WEBHOOK_RETRY_MAX_ATTEMPTS`, `BANK_WEBHOOK_RETRY_BACKOFF_SECONDS`, `TZ` |
 
 Compose builds `payfold-migrations` and `payfold-seed-data-gen` itself (the flyway
 and seed-data services) instead of bind-mounting host paths, so the local stack
