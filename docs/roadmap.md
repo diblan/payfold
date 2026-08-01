@@ -672,3 +672,31 @@ the 2026-07-31 R13 pass, which era-scoped the README/architecture claims.
 BOTH quantities for the documented 100k run and both [R20](#r20) lever
 configurations; README and the architecture honesty table quote the new
 numbers and drop the era note; verify.sh untouched ([G7](invariants.md#g7)).
+
+<a id="r33"></a>
+### [ ] R33 — Verify the dashboard tells the truth, not just that it exists
+**Scope:** `scripts/verify.sh` (+ possibly a small helper); no service changes
+expected; architecture.md observability section per [G6](invariants.md#g6) if
+the metric-name contract wording moves.
+Origin: an external review lens — Birgitta Böckeler's memo on OpenAI's
+harness-engineering article
+(<https://www.martinfowler.com/articles/exploring-gen-ai/harness-engineering-memo.html>)
+observes that agent-first harnesses tend to verify *internal* quality
+mechanically while leaving *externally observable behavior* unverified.
+Payfold's harness is strong on that axis — verify.sh drives the running stack
+end to end (trigger → exact terminal states from the IBAN/token rules →
+Prometheus/DB delta cross-checks → poison → idempotency re-trigger) — with one
+exception: the only human-facing surface, the [R21](#r21) Grafana dashboard
+([D12](decisions.md#d12)'s carve-out from the no-UI non-goal). verify.sh
+asserts Grafana *serves* the provisioned dashboard (`/api/search` finds uid
+`payfold-pipeline`) but never executes a single panel query. A renamed metric
+or a broken PromQL edit leaves a lying dashboard behind a green verify —
+exactly the gap class the memo predicts. Panels have been added by
+[R21](#r21), [R23c](#r23c)–[R23f](#r23f), and [R26a](#r26a); none is
+behavior-verified.
+**Done when:** verify.sh extracts every panel query from the provisioned
+dashboard JSON and asserts each is accepted by live Prometheus and returns at
+least one series after the run's load (bounded poll for scrape-interval lag,
+[R17](#r17) precedent; panels whose series may legitimately be absent get an
+explicit allowlist, decided at execution); a deliberately broken panel query
+demonstrably fails verification; a tightening per [G7](invariants.md#g7).
