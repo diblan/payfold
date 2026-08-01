@@ -627,8 +627,37 @@ are green — the red is calendar-dependent, not environmental.
 (the payload must echo the plan the seed chose, on both branches); the
 producer suite is green; verify.sh untouched.
 
+<a id="r32"></a>
+### [ ] R32 — High-rate consumption saturates the mock counterparties; retry storms DLQ good renewals
+**Scope:** design first — likely counterparty service capacity (a bare
+multi-worker uvicorn is NOT sufficient alone: collection records and pending
+delivery tasks are per-process state, so worker scaling needs a worker-safe
+design) and/or consumer-side submit backpressure and timeout budget; decided
+at execution, with a decision entry if the shape crosses a non-goal.
+Observed 2026-08-01 during [R30](#r30)'s concurrency-8 100k run: the consume
+burst drives each single-worker FastAPI counterparty past its event-loop
+budget — cardnet absorbs ~80% of submissions PLUS one signed webhook delivery
+per settlement on the same loop — so response latency crosses the consumer's
+2 s `bank.timeout-ms`, `BankSubmissionException` rides the bounded listener
+retry, all eight threads park in exponential backoff, and drain collapses
+(measured: 64/s in the first minute, then 0–26/s oscillation with whole
+minutes at zero; 19,797 of 100,000 consumed in 44 min). Exhausted retries
+dead-letter GOOD renewals — 654 in the DLQ, 646 payments stranded `pending` —
+[G5](invariants.md#g5) treats a saturated counterparty like poison. The
+stale-`submitted` backlog meanwhile ages past `RECOVERY_STALE_AFTER_SECONDS`,
+so the [R28](#r28) sweeper adds GET load to the already-saturated banks (its
+own read timeouts logged) — a feedback loop. The retired pre-[R23f](#r23f)
+524/s figure was measured against WireMock (threaded Java, no outbound work);
+the async-era ceiling at high concurrency is the counterparty mock, not the
+consumer. Baseline single-consumer drain (~62/s) is unaffected.
+**Done when:** the [R20](#r20) lever recipe (`CONSUMER_LISTENER_CONCURRENCY=8`,
+`SEED_CUSTOMERS=100000`) completes `verify.sh --no-up --timeout 3600` green
+with zero dead-lettered renewals; the measured drain and end-to-end numbers
+land in quality.md "Measured scale runs"; the architecture honesty-table row
+this item blocks is updated from measured-collapse to measured-throughput.
+
 <a id="r30"></a>
-### [ ] R30 — Re-measure the drain story on the async spine
+### [x] R30 — Re-measure the drain story on the async spine
 **Scope:** measurement + docs only (README, quality.md "Measured scale runs",
 architecture.md honesty table); no behavior changes.
 Every published consumer number (~48/s sustained from [R12](#r12); 524/s at

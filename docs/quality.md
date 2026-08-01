@@ -81,6 +81,40 @@ exact deterministic card-token and SDD-IBAN outcome assertions.
 
 ## Measured scale runs
 
+- **2026-08-01 — async-spine re-measurement (R30, the commit this entry ships
+  in; WSL2 Docker Compose stack).** Since [R23f](roadmap.md#r23f) a consume is
+  a fast synchronous auth/submission while settlement arrives asynchronously,
+  so the sync-card era's one probe is now two quantities: renewals-queue
+  drain (every message consumed) and end-to-end completion (every payment
+  terminal, zero stuck `submitted`). Three fresh-boot 100k-due-today runs on
+  the current system — [R28](roadmap.md#r28)'s recovery sweeper and
+  [R26a](roadmap.md#r26a)'s grace lifecycle included, so each run also
+  recovers its 2,000-payment silent cohort and moves 12,000 subscriptions to
+  `past_due` — windows from `payment` timestamps on the Postgres clock (WSL2
+  JVM-timer skew avoided), rates cross-checked by 60 s Prometheus sampling.
+  *Baseline* (1 replica × concurrency 1): full `verify.sh --no-up` green (151
+  checks); drain 100,000 in **1,606 s = 62.3/s** (~94/s two-minute warm-up,
+  ~58/s sustained); end-to-end completion **1,639 s** — the settlement tail
+  past the last consume is ~33 s (max bank delay + chargeback lag + one
+  recovery-sweep cycle). Faster than the sync era's ~48/s because the handler
+  no longer settles in-line.
+  *3 replicas × concurrency 1* (`--scale renewal-consumer=3`): full verify.sh
+  green; drain 100,000 in **642 s = 156/s, ~2.5× baseline** (burst
+  ~200–360/s, sustained ~110–120/s); end-to-end **675 s** with the same ~33 s
+  tail; RabbitMQ round-robin split **33,338 / 33,307 / 33,355** (0.14%
+  spread).
+  *Concurrency 8* (one JVM, `CONSUMER_LISTENER_CONCURRENCY=8`): **did not
+  complete — measured collapse.** The consume burst saturates the
+  single-worker mock counterparties (cardnet absorbs ~80% of submissions plus
+  one signed webhook delivery per settlement on a single event loop); 2 s
+  submit timeouts ride the bounded listener retry, drain oscillates 0–26/s
+  after a 64/s first minute, and 654 good renewals dead-letter (19,797 of
+  100,000 consumed in 44 min before the run was stopped). Filed as
+  [R32](roadmap.md#r32) with the mechanism. The retired pre-R23f 524/s figure
+  was measured against WireMock, which did no outbound work; the counterparty
+  mock — not the consumer — is the async era's high-concurrency ceiling, and
+  the 3-replica fleet's ~190/s warm-up aggregate clears it cleanly.
+
 - **2026-07-26 — consumer scaling levers (R20, the commit this entry ships in;
   WSL2 Docker Compose stack).** Three fresh-boot 100k-due-today runs, each
   passing the full verify.sh; drain windows measured from `payment` timestamps

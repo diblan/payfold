@@ -103,39 +103,44 @@ the next run. Both sides are measured on a single-node WSL2 dev laptop running t
 unmodified Compose stack; run details live in [docs/quality.md](docs/quality.md)
 under "Measured scale runs".
 
-> **Era note:** the consumer numbers below were measured before
-> [R23f](docs/roadmap.md#r23f) (2026-07-26), when a card consume settled
-> synchronously inside the message handler. Since R23f a consume is a fast
-> synchronous auth plus an asynchronous settlement on the shared spine, so
-> queue-drain rate and end-to-end completion are related but distinct
-> quantities; re-measuring both on the async pipeline is
-> [R30](docs/roadmap.md#r30).
+Since the async settlement spine ([R23f](docs/roadmap.md#r23f)) a consume is a
+fast synchronous auth/submission while settlement arrives later as an event, so
+two quantities are measured (2026-08-01, [R30](docs/roadmap.md#r30)): the
+renewals-queue **drain rate** and **end-to-end completion** — every payment at
+its token/IBAN-predicted terminal state, zero stuck `submitted`, including the
+cohort that only completes through the recovery sweeper.
 
 - **Producer (scan + publish):** 1,015,000 due renewals scanned and published in
   459 s wall at 183 MiB peak heap (1M-row run). At 100k the whole job takes ~22 s —
   a 330k night is roughly 2.5 minutes of publishing.
 - **Consumer (bill + settle):** the documented 100k-due-today run drained all
-  100,000 renewals in ~30 minutes — ~55/s overall, **~48/s sustained** after a
-  ~2-minute warm-up burst. The current verifier requires every renewal to reach
-  its token/IBAN-predicted terminal state through the shared asynchronous
-  settlement spine and idempotent upsert chain.
-  Adjacent runs measured 53/s (same day) and 41/s (against a 1M-deep queue).
-- **Extrapolation:** at the measured 41–48/s, a 330k nightly batch drains in
-  1.9–2.2 hours — **11–13× the 3.8/s average** the 10M/month target requires.
+  100,000 renewals in **1,606 s — 62/s average, ~58/s sustained** after a
+  ~94/s two-minute warm-up; **end-to-end completion took 1,639 s** — the
+  asynchronous settlement tail past the last consume is ~33 s (max bank delay
+  + chargeback lag + one recovery-sweep cycle).
+- **Extrapolation:** at the measured ~58–62/s, a 330k nightly batch drains in
+  ~1.5 hours — **15–16× the 3.8/s average** the 10M/month target requires —
+  and completes settlement about half a minute later.
 
 The single-thread consumer default is the binding constraint — and its two
-scaling levers are measured, not promised (R20, 2026-07-26; both safe by design,
-because idempotency lives in database unique constraints, not in consumer state):
+scaling levers are measured, not promised (re-measured 2026-08-01 on the async
+spine; both safe by design, because idempotency lives in database unique
+constraints, not in consumer state):
 
-- **Listener concurrency ×8** (one JVM, `CONSUMER_LISTENER_CONCURRENCY=8`):
-  100k drained in **191 s — 524/s average, ~10× the baseline** — so a 330k
-  nightly batch drains in ~10.5 minutes.
 - **3 consumer replicas** (`docker compose up --scale renewal-consumer=3`,
-  concurrency 1 each): 100k in 951 s — 105/s, ~2× baseline, with RabbitMQ
-  round-robin splitting the work 33,335 / 33,320 / 33,345. Same-host replicas
-  share one machine, so in-process concurrency is the cheaper local lever;
-  replica scaling is the fault-tolerance and multi-node story (autoscaled
-  across real hardware in the companion platform repo).
+  concurrency 1 each): 100k drained in **642 s — 156/s, ~2.5× baseline** and
+  fully settled in 675 s, with RabbitMQ round-robin splitting the work
+  33,338 / 33,307 / 33,355. A 330k nightly batch drains in ~35 minutes.
+  Same-host replicas share one machine; replica scaling is the
+  fault-tolerance and multi-node story (autoscaled across real hardware in
+  the companion platform repo).
+- **Listener concurrency ×8** (one JVM, `CONSUMER_LISTENER_CONCURRENCY=8`):
+  honestly, **currently collapses at 100k** — the consume burst saturates the
+  single-worker mock counterparties, submit timeouts ride the bounded retry,
+  and good renewals dead-letter. The pre-async 524/s figure was measured
+  against a stub that did no outbound work; making the counterparty survive
+  this lever is [R32](docs/roadmap.md#r32). Measured, not claimed — cuts both
+  ways.
 
 Reproduce it yourself:
 
