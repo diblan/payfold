@@ -419,3 +419,98 @@ task pattern, never a trigger.
 **Cost estimate:** mock-bank +1 rule (tag bump rides R28), one consumer scheduled
 task + config rows, verify.sh tightening, no schema change (inbox rows are the
 write path; a `settlements_recovered_total` counter carries provenance).
+
+## D19 — R32 counterparty capacity: multi-worker cardnet over shared state; timeouts police hangs, not throughput — 2026-08-01 — active
+<a id="d19"></a>
+Design outcome of the R32 read (2026-08-01 session), committed before
+implementation per the item's design-first instruction.
+
+**The bottleneck, quantified:** each mock counterparty is one FastAPI process
+= one event loop = one core (GIL). A collection costs the loop two op groups —
+request handling plus one signed webhook delivery (cardnet: ~80% of submissions
+AND their settlements on one loop) — measured ceiling ~150 collections/s per
+process. The [R30](roadmap.md#r30) conc-8 burst pushes ~500/s at it; latency
+crosses the consumer's 2 s submit timeout, `BankSubmissionException` rides the
+bounded listener retry, and [G5](invariants.md#g5) dead-letters good renewals.
+Two defects, one visible: the counterparty is undersized for the lever the
+README sells, and the consumer treats overload as poison.
+
+**Decision 1 — capacity via uvicorn workers, worker-safe by determinism, not
+shared state:** cardnet runs `--workers N` (`BANK_WORKERS`, image default 1;
+compose sets cardnet via `CARDNET_WORKERS`, default 4 — bank-a/b stay at 1 on
+~10% traffic each). The roadmap's warning holds: records and pending
+deliveries are per-process dicts, and NO shared store is added (a Redis-shaped
+dependency would cross the [D13](decisions.md#d13) no-new-services line for a
+mock's convenience). Instead the per-worker dicts are reclassified: **the
+record store is a cache over deterministic truth, not truth** — every
+cross-worker miss already has a safe answer, all shipped by
+[R28](roadmap.md#r28)/[D18](#d18):
+- a resubmitted collection landing on a worker without the record is treated
+  as new — outcomes and notification ids are deterministic
+  (IBAN/token + `collection_id:seq`), so re-scheduled notifications dedupe in
+  `settlement_inbox` by constraint ([G2](invariants.md#g2) by construction);
+- `GET /collections/{id}` on a worker without the record → 404 → the recovery
+  sweeper resubmits — exactly [D18](#d18)'s amnesia path, now also the
+  worker-miss path (a miss converges: the resubmit seeds that worker's cache);
+- the silent-94 cohort recovers in ≤ a few sweep ticks instead of one (each
+  miss resubmits, each resubmit widens the set of workers holding the record);
+  `settlements_recovered_total` stays exact because synthesis dedupes on the
+  deterministic notification id.
+Worker loss (crash/respawn) is container-recreate amnesia at finer grain —
+already the recovery sweeper's job. This is [R8](roadmap.md#r8)'s
+recomputable-rule trick promoted to a scaling mechanism: determinism is what
+makes state loss — and now state partitioning — free.
+**Consequence for [R26b](roadmap.md#r26b):** the attempt-indexed suffix-95
+rule must derive the attempt from the collection id (`…|a<attempt>`), never
+from stored history — history is per-worker and amnesia-prone by design.
+
+**Decision 2 — metrics must aggregate across workers:** `/metrics` uses
+prometheus_client's multiprocess collector when `PROMETHEUS_MULTIPROC_DIR` is
+set (set in the image; single-process path and tests unchanged without it).
+Verified live on the pinned versions (uvicorn 0.51.0, prometheus-client
+0.26.0, python:3.12-slim): 4 workers on one socket, counter increments from
+all workers aggregate exactly, exposition line format unchanged
+(verify.sh's `^bank_webhook_giveups_total ` grep keeps matching). Prometheus
+does not scrape the banks; the consumers of this endpoint are verify.sh and
+live forensics, both of which need the sum, not one worker's share.
+
+**Decision 3 — the submit timeout polices hangs, not throughput:**
+`bank.timeout-ms` rises 2000 → 10000. The [D14](#d14) precedent cuts both
+ways and lands here on the other side: the listener retry envelope is the
+layer that owns the DLQ deadline ([G5](invariants.md#g5)), and the HTTP
+timeout's only honest job is to unstick a thread from a HUNG counterparty — a
+dead one refuses connections instantly regardless. At 2 s it accidentally
+polices throughput: any transient latency past 2 s converts backlog into
+poison verdicts. At 10 s, a saturated-but-alive counterparty produces slow
+submits, the 8 blocked listener threads ARE the backpressure (closed-loop:
+in-flight ≤ listener concurrency, rate self-regulates to counterparty
+capacity), and nothing dead-letters. Bounded-attempts stays bounded: a hung
+bank now costs ≤ ~65 s per message to DLQ instead of ≤ ~25 s — still loud,
+still finite. No new backpressure machinery: the existing thread-per-message
+bound is the window, sized by `CONSUMER_LISTENER_CONCURRENCY`.
+
+**Decision 4 — the recovery sweeper learns that scheduled ≠ missing:** the
+sweeper currently synthesizes from any stored seq-1 notification. Under load
+that overcounts: a payment can be legitimately stale-`submitted` while its
+webhook is still in flight (delivery lag), and premature synthesis wins the
+race against the webhook, inflating `settlements_recovered_total` past the
+silent cohort — the exact-count assert breaks, and sweeper GETs pile onto the
+saturated counterparty (the feedback loop named in the R32 item). Refinement:
+seq-1 `state = "scheduled"` → noop (the push is coming; [D18](#d18)'s
+MISSING/RECEIVED boundary sharpened — in-flight is neither); `suppressed` /
+`gave_up` → synthesize (genuinely missing); `delivered` → synthesize and let
+the inbox constraint no-op it (the row must already exist). With this table,
+`settlements_recovered_total == silent cohorts` is provable under any load,
+not observed under light load.
+
+**Trade-offs:** kernel accept distribution across workers is skewed under
+light load (measured 61/34/96/9 over 200 concurrent requests) — effective
+capacity is ~2.5–3.5×, not 4×, and that is enough (~500/s vs the ~500–600/s
+conc-8 push, with Decision 3 absorbing the residual); per-worker duplicate
+responses lose the `duplicate: true` marker across workers (the consumer
+never reads it — both paths return 2xx and identical card verdicts); the
+multiprocess metrics path drops per-process python/process gauges from bank
+`/metrics` (nothing consumes them). Not taken: splitting cardnet into
+N compose replicas (JVM DNS caching pins clients to one IP — capacity theater),
+and an async delivery sidecar (a second process model for the same GIL-bound
+budget).
