@@ -514,3 +514,66 @@ multiprocess metrics path drops per-process python/process gauges from bank
 N compose replicas (JVM DNS caching pins clients to one IP — capacity theater),
 and an async delivery sidecar (a second process model for the same GIL-bound
 budget).
+
+## D20 — R26b execution design: re-collections as constraint-keyed payment rows, attempt derived from the collection id — 2026-08-01 — active
+<a id="d20"></a>
+Execution-level decisions for [R26b](roadmap.md#r26b), within the R26 epic's
+pre-decided spine ([D16](decisions.md#d16), the epic header). Committed before
+implementation.
+
+**Retry = a new payment row, keyed before it acts:** attempt N+1 is a fresh
+`payment` row (`attempt` column, V11) inserted with
+`ON CONFLICT ON CONSTRAINT uniq_payment_charge_attempt DO NOTHING` BEFORE any
+bank call — only the inserting winner submits, so duplicate sweeper ticks and
+racing replicas are physically unable to double-submit an attempt
+([G2](invariants.md#g2)'s constraint-not-cache answer, applied to writes the
+sweeper originates). The collection id is the family form
+`sub-<id>|<due_date>|a<attempt>` and doubles as the row's `idempotency_key`
+(stays globally unique; 64-char budget holds — base 51 + `|a<n>` ≤ ~56).
+
+**Attempt is derived from the collection id, never from stored history:** the
+mock-bank's suffix-95 rule (`fail AM04`/`insufficient_funds` on attempt 1,
+settle on attempt ≥ 2) parses `|a(\d+)$` from the submitted id — absence means
+attempt 1. This is [D19](#d19)'s consequence note honored: bank records are a
+per-worker cache and vanish on recreate, so a 404-era resubmission or a
+worker-hop must reproduce the same verdict from the id alone. Restart amnesia
+and multi-worker partitioning cost nothing because the rule needs no memory.
+
+**Per-retry transaction, rollback as cleanup:** insert + submit + mark-
+submitted run in one REQUIRES_NEW transaction per row; any submit failure
+rolls the insert back, so no `pending` orphan can blind the picker (whose
+latest-attempt predicate would otherwise stop seeing the subscription). If
+the bank accepted before a crash, the re-tick resubmits the same id and the
+bank (or a fresh worker, deterministically) answers consistently; the
+vanishingly-rare webhook-before-row race dead-letters the settlement loudly
+([G5](invariants.md#g5)) instead of corrupting state.
+
+**Picker predicate owns every boundary:** `past_due` subscription, LATEST
+attempt (`max(attempt)` subquery) `failed`, reason in the retriable set, and
+`completed_at` older than `DUNNING_RETRY_DELAY_SECONDS`. The retriable-reason
+filter runs IN SQL (named-parameter set from `dunning.classes`) so hard-fail
+rows can never starve the page limit; `submitted` rows are invisible by
+predicate — the [R28](roadmap.md#r28) boundary (dunning reacts to RECEIVED
+signals only) is structural, and an explicit test proves it. Repeated
+failures do NOT reset `grace_until` (`enterGrace` only fires on `active`):
+the grace clock anchors at the first failure, which [R26c](roadmap.md#r26c)'s
+expiry math depends on.
+
+**Recovery clears grace to NULL:** a settled payment that finds its
+subscription `past_due` flips it back to `active` and sets
+`grace_until = NULL` (design default: a deadline outside `past_due` is
+stale data R26c's sweep must never see). Guarded on both sides — payment
+`submitted → succeeded` and subscription `past_due → active` — so settlement
+redelivery and reordered chargebacks stay no-ops.
+
+**Config mirrors the recovery pair:** `DUNNING_RETRY_DELAY_SECONDS`
+(application default 86400 — daily, rulebook-plausible — compose-scaled to
+15 s) and `DUNNING_SWEEP_INTERVAL_MS` (60000 / 10000), the same
+fast-for-verify shape as `RECOVERY_*`. Seeder gains the additive 95-share
+(`SEED_SDD_RETRY_PERCENT` / `SEED_CARD_RETRY_PERCENT`, default 2) next to the
+94 slice. verify.sh widens the retriable-transitions exact delta to the
+99 + 95 cohorts and asserts the 95-cohort's full arc (failed attempt 1 with
+the right reason, settled attempt 2, subscription re-`active` with grace
+cleared) plus never-retried proofs for hard-fail/dispute; nothing about the
+99 cohort's attempt COUNT is asserted (timing-shaped), only its invariants
+(never succeeded, still `past_due`).
