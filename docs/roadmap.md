@@ -700,3 +700,19 @@ least one series after the run's load (bounded poll for scrape-interval lag,
 [R17](#r17) precedent; panels whose series may legitimately be absent get an
 explicit allowlist, decided at execution); a deliberately broken panel query
 demonstrably fails verification; a tightening per [G7](invariants.md#g7).
+
+<a id="r34"></a>
+### [ ] R34 — Chaos-demo terminal predictions predate the 95 re-collection cohort
+**Scope:** `scripts/chaos-demo.sh` only; no service changes.
+[R26b](#r26b) taught verify.sh that the suffix-95 cohort terminates on its
+attempt-2 `|a2` row (fails first by rule, settles on re-collection), but the
+demo's scene SQLs still carry the pre-R26b predictions: a 95 customer is
+predicted `succeeded` at the BASE collection key, which no longer exists as a
+terminal row — a default-seed scene run mismatches (or races the ~25 s
+re-collection cycle). Found by inspection at R26b close; the demo was not
+re-run. Naturally lands with (or just before) [R26d](#r26d)'s dunning scene;
+kept separate because it is a correctness defect in existing scenes, not new
+story.
+**Done when:** every scene's terminal-prediction SQL mirrors verify.sh's
+95-aware form (attempt-2 key for the 95 cohort, base keys elsewhere); a full
+`chaos-demo.sh --auto` runs green on a fresh default-seed stack.
