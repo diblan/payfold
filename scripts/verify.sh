@@ -366,6 +366,12 @@ M_PUB_BEFORE="$(prom_val "$PRODUCER_PORT" '^outbox_published_total ')"
 M_PROC_BEFORE="$(consumer_prom_sum '^renewals_processed_total\{.*outcome="(succeeded|failed|submitted)"')"
 M_RECOVERED_BEFORE="$(consumer_prom_sum '^settlements_recovered_total')"
 [[ "$M_RECOVERED_BEFORE" == "absent" ]] && M_RECOVERED_BEFORE=0
+M_DUNNING_RETRIABLE_BEFORE="$(consumer_prom_sum '^dunning_transitions_total\{class="retriable"')"
+M_DUNNING_HARD_BEFORE="$(consumer_prom_sum '^dunning_transitions_total\{class="hard_fail"')"
+M_DUNNING_DISPUTE_BEFORE="$(consumer_prom_sum '^dunning_transitions_total\{class="dispute"')"
+[[ "$M_DUNNING_RETRIABLE_BEFORE" == "absent" ]] && M_DUNNING_RETRIABLE_BEFORE=0
+[[ "$M_DUNNING_HARD_BEFORE" == "absent" ]] && M_DUNNING_HARD_BEFORE=0
+[[ "$M_DUNNING_DISPUTE_BEFORE" == "absent" ]] && M_DUNNING_DISPUTE_BEFORE=0
 DB_OUTBOX_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox')"
 DB_PUB_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NOT NULL')"
 
@@ -633,6 +639,63 @@ for BANK_AND_PORT in "bank-a:${BANK_PORT}" "bank-b:${BANK_B_PORT}" "cardnet:${CA
     fail "${BANK} webhook give-ups are zero" "value=${BANK_GIVEUPS:-unreadable}"
   fi
 done
+
+# --- R26a: terminal outcomes enter past_due grace exactly once by class ---
+N_PD_RETRIABLE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '99') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '99'))")"
+N_PD_HARD="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) IN ('98','97')) OR (c.payment_method = 'card' AND right(c.card_token, 2) = '98'))")"
+N_PD_DISPUTE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '96') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '96'))")"
+EXPECTED_PAST_DUE=$((N_PD_RETRIABLE + N_PD_HARD + N_PD_DISPUTE))
+
+ACTUAL_PAST_DUE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id WHERE o.due_date = current_date AND s.status = 'past_due'")"
+if [[ "$ACTUAL_PAST_DUE" == "$EXPECTED_PAST_DUE" ]]; then
+  pass "past_due subscriptions match terminal cohorts exactly (${ACTUAL_PAST_DUE})"
+else
+  fail "past_due subscriptions match terminal cohorts exactly" "expected=${EXPECTED_PAST_DUE} actual=${ACTUAL_PAST_DUE:-error}"
+fi
+
+ACTUAL_PAST_DUE_WITH_GRACE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id WHERE o.due_date = current_date AND s.status = 'past_due' AND s.grace_until IS NOT NULL")"
+if [[ "$ACTUAL_PAST_DUE_WITH_GRACE" == "$EXPECTED_PAST_DUE" ]]; then
+  pass "every due-cohort past_due subscription has a grace deadline (${ACTUAL_PAST_DUE_WITH_GRACE})"
+else
+  fail "every due-cohort past_due subscription has a grace deadline" "expected=${EXPECTED_PAST_DUE} actual=${ACTUAL_PAST_DUE_WITH_GRACE:-error}"
+fi
+
+dunning_retriable_metric_delta_matches() {
+  local current
+  current="$(consumer_prom_sum '^dunning_transitions_total\{class="retriable"')"
+  [[ "$current" =~ ^[0-9]+$ ]] \
+    && (( current - M_DUNNING_RETRIABLE_BEFORE == N_PD_RETRIABLE ))
+}
+dunning_hard_metric_delta_matches() {
+  local current
+  current="$(consumer_prom_sum '^dunning_transitions_total\{class="hard_fail"')"
+  [[ "$current" =~ ^[0-9]+$ ]] \
+    && (( current - M_DUNNING_HARD_BEFORE == N_PD_HARD ))
+}
+dunning_dispute_metric_delta_matches() {
+  local current
+  current="$(consumer_prom_sum '^dunning_transitions_total\{class="dispute"')"
+  [[ "$current" =~ ^[0-9]+$ ]] \
+    && (( current - M_DUNNING_DISPUTE_BEFORE == N_PD_DISPUTE ))
+}
+if [[ "$M_DUNNING_RETRIABLE_BEFORE" =~ ^[0-9]+$ ]]; then
+  wait_for "dunning retriable transition delta matches its cohort exactly (${N_PD_RETRIABLE})" dunning_retriable_metric_delta_matches
+else
+  fail "dunning retriable transition delta matches its cohort exactly (${N_PD_RETRIABLE})" \
+    "invalid baseline=${M_DUNNING_RETRIABLE_BEFORE}"
+fi
+if [[ "$M_DUNNING_HARD_BEFORE" =~ ^[0-9]+$ ]]; then
+  wait_for "dunning hard-fail transition delta matches its cohort exactly (${N_PD_HARD})" dunning_hard_metric_delta_matches
+else
+  fail "dunning hard-fail transition delta matches its cohort exactly (${N_PD_HARD})" \
+    "invalid baseline=${M_DUNNING_HARD_BEFORE}"
+fi
+if [[ "$M_DUNNING_DISPUTE_BEFORE" =~ ^[0-9]+$ ]]; then
+  wait_for "dunning dispute transition delta matches its cohort exactly (${N_PD_DISPUTE})" dunning_dispute_metric_delta_matches
+else
+  fail "dunning dispute transition delta matches its cohort exactly (${N_PD_DISPUTE})" \
+    "invalid baseline=${M_DUNNING_DISPUTE_BEFORE}"
+fi
 
 FAILED_FINALIZED="$(q "SELECT count(*) FROM payment p JOIN charge c ON c.id = p.charge_id WHERE p.status = 'failed' AND c.status <> 'pending'")"
 if [[ "$FAILED_FINALIZED" == "0" ]]; then

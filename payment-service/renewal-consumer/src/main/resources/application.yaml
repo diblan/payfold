@@ -49,6 +49,22 @@ recovery:
   stale-after-seconds: 300
   sweep-interval-ms: 60000
 
+dunning:
+  # Every terminal reason maps to exactly one dunning class (D16/R26 spine);
+  # the map is policy and is deliberately yaml-fixed — only the grace windows
+  # are env-tunable (scaled time, fast for verify, visible for demo).
+  classes:
+    AM04: retriable
+    insufficient_funds: retriable
+    AC04: hard_fail
+    MD01: hard_fail
+    do_not_honor: hard_fail
+    MD06: dispute
+    fraud_dispute: dispute
+  retriable-grace-seconds: 604800
+  hard-fail-grace-seconds: 259200
+  dispute-grace-seconds: 1209600
+
 management:
   endpoints:
     web:

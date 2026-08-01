@@ -465,7 +465,7 @@ class RecoverySweeperIntegrationTest {
                     .sorted()
                     .forEach(path -> container.withCopyFileToContainer(
                             MountableFile.forHostPath(path.toString()),
-                            "/docker-entrypoint-initdb.d/" + path.getFileName()));
+                            "/docker-entrypoint-initdb.d/" + paddedMigrationName(path.getFileName().toString())));
         } catch (IOException exception) {
             throw new IllegalStateException(
                     "Could not enumerate migrations in " + migrationDirectory,
@@ -473,6 +473,17 @@ class RecoverySweeperIntegrationTest {
         }
 
         return container;
+    }
+
+    // initdb executes /docker-entrypoint-initdb.d in C-locale filename order,
+    // which puts V10 before V1; pad the version so lexical order is numeric.
+    private static String paddedMigrationName(String fileName) {
+        java.util.regex.Matcher matcher =
+                java.util.regex.Pattern.compile("^V(\\d+)__(.*)$").matcher(fileName);
+        if (!matcher.matches()) {
+            return fileName;
+        }
+        return "V%03d__%s".formatted(Integer.parseInt(matcher.group(1)), matcher.group(2));
     }
 
     private record CounterSnapshot(

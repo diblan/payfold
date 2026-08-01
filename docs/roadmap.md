@@ -531,7 +531,7 @@ moves the subscription through the grace lifecycle instead of being a dead-end
 fact; verify.sh models the retry outcomes deterministically.
 
 <a id="r26a"></a>
-### [ ] R26a — Terminal outcomes enter the grace lifecycle (no retries yet)
+### [x] R26a — Terminal outcomes enter the grace lifecycle (no retries yet)
 **Scope:** new migration: `subscription` gains `grace_until TIMESTAMPTZ` and
 `past_due` joins the status vocabulary (V1 already documents `canceled`);
 consumer config gains the reason→class map and per-class grace seconds; the

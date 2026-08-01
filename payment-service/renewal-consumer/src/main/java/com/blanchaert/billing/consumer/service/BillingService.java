@@ -24,13 +24,16 @@ public class BillingService {
     private final JdbcTemplate jdbc;
     private final BankClient bank;
     private final BankRegistry bankRegistry;
+    private final DunningLifecycle dunningLifecycle;
     private final Map<String, Counter> processedCounters;
 
     public BillingService(JdbcTemplate jdbc, BankClient bank,
-                          BankRegistry bankRegistry, MeterRegistry meters) {
+                          BankRegistry bankRegistry, MeterRegistry meters,
+                          DunningLifecycle dunningLifecycle) {
         this.jdbc = jdbc;
         this.bank = bank;
         this.bankRegistry = bankRegistry;
+        this.dunningLifecycle = dunningLifecycle;
         Map<String, Counter> counters = new HashMap<>();
         for (String method : new String[]{"card", "sdd", "unknown"}) {
             for (String outcome : new String[]{"succeeded", "failed", "invalid", "submitted"}) {
@@ -130,6 +133,7 @@ public class BillingService {
                                 WHERE id = ? AND status = 'pending'
                                 """,
                         verdict.reason(), paymentId);
+                dunningLifecycle.enterGrace(evt.subscription_id(), verdict.reason());
                 log.info("Card authorization declined for {}: {}", idem, verdict.reason());
                 incrementProcessed("failed", "card");
                 return;

@@ -27,7 +27,7 @@ Honesty table:
 ## Component map
 
 ```
-                 ┌─────────────┐   Flyway V1–V9    ┌──────────────┐
+                 ┌─────────────┐   Flyway V1–V10   ┌──────────────┐
                  │   flyway    ├──────────────────▶│              │
                  └─────────────┘                   │  postgres:18 │
                  ┌─────────────┐  SEED_CUSTOMERS   │   (payfold)  │
@@ -214,7 +214,8 @@ answer and schedule nothing, healing the crash window between submission and the
 payment status update.
 
 The payment status vocabulary is `pending`, `submitted`, `succeeded`, `failed`,
-and `charged_back`. The invoice vocabulary is `draft`, `posted`, `paid`,
+and `charged_back`. The subscription vocabulary is `active`, `paused`,
+`past_due`, and `canceled`. The invoice vocabulary is `draft`, `posted`, `paid`,
 `disputed`, and `void`.
 
 The settlement spine closes that asynchronous submission loop. `POST
@@ -254,14 +255,33 @@ invoice's `period_end` at 09:00 local; `failed` records terminal `failed`,
 `charged_back`, records its reason and `charged_back_at`, and wins in either
 arrival order. When the prior state was `succeeded`, the already-paid invoice
 becomes `disputed`; when chargeback arrives first, the invoice remains `posted`
-and a later settlement no-ops. In both cases charge and subscription are
-untouched: a chargeback is a recorded fact, not compensation, and reacting
-belongs to dunning ([D16](decisions.md#d16)). Terminal status guards make every
+and a later settlement no-ops. In both cases the charge and subscription period
+math remain untouched: a chargeback is a recorded fact, not compensation
+([D16](decisions.md#d16)). Terminal payment-status guards make every settlement
 redelivery a no-op.
 
+### Dunning grace lifecycle (R26a)
+
+Every terminal collection reason maps through the consumer's yaml-fixed policy
+to exactly one class: `retriable` (`AM04`, `insufficient_funds`), `hard_fail`
+(`AC04`, `MD01`, `do_not_honor`), or `dispute` (`MD06`, `fraud_dispute`). A
+guarded terminal `failed` or `charged_back` settlement, and the synchronous
+card-decline branch, move an `active` subscription to `past_due` and set its
+single `grace_until` deadline from that class's env-tunable window. Unknown
+reasons conservatively use `hard_fail`. The `status = 'active'` update guard
+makes duplicate hooks and redelivered terminal messages leave the first deadline
+untouched; transition counters increment only when that update succeeds.
+
+This lifecycle changes status only. It never reverses `renewed_at`, so the
+[R23d](roadmap.md#r23d) period advance remains a recorded fact after a
+chargeback. R26a records the deadline but neither retries nor enforces it;
+[R26b](roadmap.md#r26b) adds scheduled re-collection and
+[R26c](roadmap.md#r26c) adds bounded exhaustion and grace expiry.
+
 Card authorization declines are business failures: the payment becomes `failed`,
-the renewal is ACKed, and no settlement notification follows. Failed payments are
-terminal and redelivery does not re-attempt them because dunning is a non-goal.
+the subscription enters the same grace lifecycle, the renewal is ACKed, and no
+settlement notification follows. Failed payments remain terminal in R26a and
+redelivery does not re-attempt them; retries arrive in R26b.
 Authorized cards and SDD stay `submitted` until the settlement listener decides
 their terminal state.
 
@@ -467,11 +487,14 @@ Micrometer converts dots in meter names to underscores for Prometheus and append
 | `settlement.webhooks.received` | `settlement_webhooks_received_total{result="..."}` | Counter | `result=accepted \| duplicate \| unauthorized \| rejected` | Once per webhook request after its receiver decision |
 | `settlements.recovered` | `settlements_recovered_total` | Counter | none | Once when the recovery sweeper synthesizes a missing sequence-1 settlement into the inbox |
 | `recovery.sweeps` | `recovery_sweeps_total{result="..."}` | Counter | `result=recovered \| resubmitted \| noop` | Once per stale-payment recovery action after query, synthesis/resubmission, or inbox-race no-op |
+| `dunning.transitions` | `dunning_transitions_total{class="..."}` | Counter | `class=retriable \| hard_fail \| dispute` | Once when an active subscription enters `past_due`, classified by its terminal reason |
+| `subscriptions.past_due` | `subscriptions_past_due` | Gauge | none | Refreshed every 10 s from the current count of `past_due` subscriptions |
 
 All counter series are registered eagerly and therefore render as `0.0` from boot;
 `verify.sh` depends on that property. Settlement outcome×bank pairs and each
-counterparty's latency timer are likewise registered at startup, so all three series
-exist before the first callback. The renewal outcome taxonomy is bounded to
+counterparty's latency timer are likewise registered at startup, and all three
+dunning-class counters exist before the first transition. The renewal outcome
+taxonomy is bounded to
 `succeeded`, `failed`, `invalid`, and `submitted`, crossed with the bounded
 `card`, `sdd`, and `unknown` method dimension. Transient or unexpected failures
 increment no outcome counter because they have no decided business outcome;
@@ -564,6 +587,7 @@ requires a version bump and decision entry.
 | V7 | durable `settlement_inbox` with unique bank/notification identity and confirm-gated `published_at`; `payment.failure_reason` for terminal ISO outcomes |
 | V8 | `payment.charged_back_at`, separating the dispute timestamp from settlement completion |
 | V9 | tokenized card reference on `customer`, backfilled for legacy cards and required for every card customer |
+| V10 | `subscription.grace_until` plus the partial index supporting current `past_due` depth polling |
 
 `renewal_outbox`: `id, subscription_id, due_date, payload jsonb, created_at, published_at`.
 Unpublished = `published_at IS NULL`.
@@ -590,6 +614,10 @@ Every runtime configuration key below has a real consumer.
 | `bank.registry[]` id/scheme/base URL/webhook secret/countries (consumer) | `BankProperties`, `BankRegistry`, `BankClient`, `BillingService`, `BankWebhookController`; `countries` is required only for `sepa_core`, and the registry requires exactly one `card` entry; compose overrides indexed `BANK_REGISTRY_*` env vars | alive |
 | `RECOVERY_STALE_AFTER_SECONDS` (consumer; yaml `recovery.stale-after-seconds`) | `RecoveryProperties`, `RecoverySweeper`; compose overrides the 300 s application default with 30 s for verify/demo | alive |
 | `RECOVERY_SWEEP_INTERVAL_MS` (consumer; yaml `recovery.sweep-interval-ms`) | `RecoveryProperties`, `RecoverySweeper`; compose overrides the 60000 ms application default with 10000 ms for verify/demo | alive |
+| `dunning.classes.*` (consumer; yaml only) | `DunningProperties`, `DunningLifecycle`; fixed reason-to-class policy, deliberately not env-overridable | alive |
+| `DUNNING_RETRIABLE_GRACE_SECONDS` (consumer; yaml `dunning.retriable-grace-seconds`) | `DunningProperties`, `DunningLifecycle`; compose overrides the 604800 s application default with 60 s for verify/demo | alive |
+| `DUNNING_HARD_FAIL_GRACE_SECONDS` (consumer; yaml `dunning.hard-fail-grace-seconds`) | `DunningProperties`, `DunningLifecycle`; compose overrides the 259200 s application default with 60 s for verify/demo | alive |
+| `DUNNING_DISPUTE_GRACE_SECONDS` (consumer; yaml `dunning.dispute-grace-seconds`) | `DunningProperties`, `DunningLifecycle`; compose overrides the 1209600 s application default with 60 s for verify/demo | alive |
 | `SEED_SDD_SILENT_PERCENT` (seeder) | `CustomerSeeder`; compose-only deterministic suffix-94 share inside the SDD cohort | alive |
 | `SEED_CARD_SILENT_PERCENT` (seeder) | `CustomerSeeder`; compose-only deterministic suffix-94 share inside the card cohort | alive |
 | `spring.rabbitmq.listener.simple.*` (consumer) | Spring Boot AMQP autoconfig + `ListenerRetryConfig` (`max-attempts`) | alive |
@@ -668,7 +696,7 @@ architecture-independent jar once instead of emulating Maven under QEMU.
 | Image (`ghcr.io/diblan/…`) | Contents | Run pattern | Config (env) |
 |---|---|---|---|
 | `payfold-renewal-producer` | producer Spring Boot jar | long-running service; port 8080, `/actuator/health` | the compose `renewal-producer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_ROUTINGKEY`, `APP_TIMEZONE`, `APP_SCHEDULECRON`, `TZ` |
-| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, indexed `BANK_REGISTRY_*` including scheme, `RECOVERY_STALE_AFTER_SECONDS`, `RECOVERY_SWEEP_INTERVAL_MS`, `TZ` |
+| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, indexed `BANK_REGISTRY_*` including scheme, `RECOVERY_STALE_AFTER_SECONDS`, `RECOVERY_SWEEP_INTERVAL_MS`, the three `DUNNING_*_GRACE_SECONDS`, `TZ` |
 | `payfold-migrations` | `flyway/flyway:11` + `db-migrations/V*.sql`, `CMD ["migrate"]` | run-to-completion Job; exit 0 = success; re-run on a current schema is a no-op (asserted by `verify.sh`) | `FLYWAY_URL`, `FLYWAY_USER`, `FLYWAY_PASSWORD`, `FLYWAY_CONNECT_RETRIES` (image default 30) |
 | `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS`, `SEED_SDD_PERCENT`, `SEED_SDD_RULE_PERCENT`, `SEED_SDD_SILENT_PERCENT`, `SEED_CARD_RULE_PERCENT`, `SEED_CARD_SILENT_PERCENT` |
 | `payfold-mock-bank` | FastAPI mock counterparty (source + pinned pure-python deps) | long-running service; port 8080, `/health`; compose runs two SEPA instances and one card instance | `BANK_ID`, `BANK_SCHEME`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `BANK_WEBHOOK_RETRY_MAX_ATTEMPTS`, `BANK_WEBHOOK_RETRY_BACKOFF_SECONDS`, `TZ` |

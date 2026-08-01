@@ -29,12 +29,15 @@ public class SettlementService {
 
     private final JdbcTemplate jdbc;
     private final MeterRegistry meters;
+    private final DunningLifecycle dunningLifecycle;
     private final Map<String, Timer> latencyByBank;
 
     public SettlementService(
-            JdbcTemplate jdbc, MeterRegistry meters, BankRegistry bankRegistry) {
+            JdbcTemplate jdbc, MeterRegistry meters, BankRegistry bankRegistry,
+            DunningLifecycle dunningLifecycle) {
         this.jdbc = jdbc;
         this.meters = meters;
+        this.dunningLifecycle = dunningLifecycle;
         Map<String, Timer> timers = new HashMap<>();
         for (var bank : bankRegistry.entries()) {
             for (String outcome : PROCESSED_OUTCOMES) {
@@ -82,14 +85,18 @@ public class SettlementService {
                     SET status = 'charged_back', failure_reason = ?, charged_back_at = now()
                     WHERE id = ? AND status IN ('submitted', 'succeeded')
                     """, event.reason(), payment.id());
-            if (updated == 1 && "succeeded".equals(payment.status())) {
+            if (updated == 1) {
                 BillingLinks links = billingLinks(payment.chargeId());
-                jdbc.update("""
-                        UPDATE invoice SET status = 'disputed'
-                        WHERE id = ? AND status = 'paid'
-                        """, links.invoiceId());
+                if ("succeeded".equals(payment.status())) {
+                    jdbc.update("""
+                            UPDATE invoice SET status = 'disputed'
+                            WHERE id = ? AND status = 'paid'
+                            """, links.invoiceId());
+                }
+                dunningLifecycle.enterGrace(links.subscriptionId(), event.reason());
             }
-            // D16's recorded-fact boundary leaves the charge and subscription untouched.
+            // D16 keeps period math and the charge untouched; R26a moves only the
+            // subscription status into its grace lifecycle.
             log.info("Chargeback processed (bank_id={}, notification_id={}, collection_id={})",
                     event.bank_id(), event.notification_id(), event.collection_id());
             processedCounter("charged_back", payment.bankId()).increment();
@@ -125,6 +132,8 @@ public class SettlementService {
                 """, event.reason(), payment.id());
         if (updated == 1) {
             recordLatency(payment);
+            BillingLinks links = billingLinks(payment.chargeId());
+            dunningLifecycle.enterGrace(links.subscriptionId(), event.reason());
         }
         processedCounter("failed", payment.bankId()).increment();
     }
