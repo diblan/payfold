@@ -19,8 +19,9 @@
 #
 #   --no-up        skip `docker compose up -d --build` (stack already running)
 #   --timeout N    max seconds to wait for each long condition (default 900 —
-#                  since R26b the terminal waits also cover a full dunning
-#                  re-collection cycle riding behind the drain)
+#                  since R26b the terminal waits also cover dunning
+#                  re-collection cycles riding behind the drain, and since
+#                  R26c the cancellation waits cover exhaustion and expiry)
 #   --poison       run the poison-message DLQ probe (default since R5)
 #   --no-poison    skip poison payload/DLQ checks only; listener metrics stay required
 #
@@ -378,6 +379,10 @@ M_DUNNING_DISPUTE_BEFORE="$(consumer_prom_sum '^dunning_transitions_total\{class
 [[ "$M_DUNNING_RETRIABLE_BEFORE" == "absent" ]] && M_DUNNING_RETRIABLE_BEFORE=0
 [[ "$M_DUNNING_HARD_BEFORE" == "absent" ]] && M_DUNNING_HARD_BEFORE=0
 [[ "$M_DUNNING_DISPUTE_BEFORE" == "absent" ]] && M_DUNNING_DISPUTE_BEFORE=0
+M_CANCEL_EXHAUSTED_BEFORE="$(consumer_prom_sum '^dunning_cancellations_total\{cause="exhausted"')"
+M_CANCEL_EXPIRED_BEFORE="$(consumer_prom_sum '^dunning_cancellations_total\{cause="grace_expired"')"
+[[ "$M_CANCEL_EXHAUSTED_BEFORE" == "absent" ]] && M_CANCEL_EXHAUSTED_BEFORE=0
+[[ "$M_CANCEL_EXPIRED_BEFORE" == "absent" ]] && M_CANCEL_EXPIRED_BEFORE=0
 DB_OUTBOX_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox')"
 DB_PUB_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NOT NULL')"
 
@@ -524,9 +529,8 @@ fi
 # BANK_CHARGEBACK_LAG_SECONDS, so this is a bounded wait, not a single read.
 # Since R26b the exactness is per collection family: base collections stay
 # exactly predictable, the 95 cohort adds exactly one attempt-2 row each, and
-# the 99 cohort's ongoing re-collections are deliberately unasserted here
-# (their count is a function of run length; their invariants are asserted in
-# the R26b block below).
+# the 99 cohort's re-collections are bounded by DUNNING_MAX_ATTEMPTS since
+# R26c and asserted exactly in the cancellation block below.
 N_96_DUE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '96'")"
 N_CARD_AUTH="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(c.card_token, 2) NOT IN ('99','98')")"
 N_CARD_96="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(c.card_token, 2) = '96'")"
@@ -703,24 +707,54 @@ else
   fail "hard-fail and dispute cohorts are never retried" "count=${HARD_OR_DISPUTE_RETRIES:-error}"
 fi
 
-# --- R26a: terminal outcomes enter past_due grace exactly once by class ---
+# --- R26a/R26c: terminal outcomes transit past_due grace and end canceled ---
+# Entries into grace are asserted by the cumulative transition deltas below;
+# the end state is the R26c cancellation matrix, reached on the sweeper's
+# clock (bounded waits, not reads). The past_due peak between the two is
+# timing-shaped and deliberately unasserted.
 N_PD_RETRIABLE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '99') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '99'))")"
 N_PD_HARD="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) IN ('98','97')) OR (c.payment_method = 'card' AND right(c.card_token, 2) = '98'))")"
 N_PD_DISPUTE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '96') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '96'))")"
-EXPECTED_PAST_DUE=$((N_PD_RETRIABLE + N_PD_HARD + N_PD_DISPUTE))
+N_SDD_99="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '99'")"
+EXPECTED_CANCELED=$((N_PD_RETRIABLE + N_PD_HARD + N_PD_DISPUTE))
 
-ACTUAL_PAST_DUE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id WHERE o.due_date = current_date AND s.status = 'past_due'")"
-if [[ "$ACTUAL_PAST_DUE" == "$EXPECTED_PAST_DUE" ]]; then
-  pass "past_due subscriptions match terminal cohorts exactly (${ACTUAL_PAST_DUE})"
+due_cohort_canceled() {
+  local canceled
+  canceled="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id WHERE o.due_date = current_date AND s.status = 'canceled'")"
+  [[ "$canceled" == "$EXPECTED_CANCELED" ]]
+}
+wait_for "due-cohort cancellations match the suffix matrix exactly (${EXPECTED_CANCELED})" due_cohort_canceled
+
+CANCELED_RETRIABLE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND s.status = 'canceled' AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '99') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '99'))")"
+if [[ "$CANCELED_RETRIABLE" == "$N_PD_RETRIABLE" ]]; then
+  pass "99 family ended exhausted-canceled exactly (${CANCELED_RETRIABLE})"
 else
-  fail "past_due subscriptions match terminal cohorts exactly" "expected=${EXPECTED_PAST_DUE} actual=${ACTUAL_PAST_DUE:-error}"
+  fail "99 family ended exhausted-canceled exactly" "expected=${N_PD_RETRIABLE} actual=${CANCELED_RETRIABLE:-error}"
+fi
+CANCELED_HARD="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND s.status = 'canceled' AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) IN ('98','97')) OR (c.payment_method = 'card' AND right(c.card_token, 2) = '98'))")"
+if [[ "$CANCELED_HARD" == "$N_PD_HARD" ]]; then
+  pass "hard-fail family ended grace-expired-canceled exactly (${CANCELED_HARD})"
+else
+  fail "hard-fail family ended grace-expired-canceled exactly" "expected=${N_PD_HARD} actual=${CANCELED_HARD:-error}"
+fi
+CANCELED_DISPUTE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND s.status = 'canceled' AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '96') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '96'))")"
+if [[ "$CANCELED_DISPUTE" == "$N_PD_DISPUTE" ]]; then
+  pass "dispute family ended grace-expired-canceled exactly (${CANCELED_DISPUTE})"
+else
+  fail "dispute family ended grace-expired-canceled exactly" "expected=${N_PD_DISPUTE} actual=${CANCELED_DISPUTE:-error}"
 fi
 
-ACTUAL_PAST_DUE_WITH_GRACE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id WHERE o.due_date = current_date AND s.status = 'past_due' AND s.grace_until IS NOT NULL")"
-if [[ "$ACTUAL_PAST_DUE_WITH_GRACE" == "$EXPECTED_PAST_DUE" ]]; then
-  pass "every due-cohort past_due subscription has a grace deadline (${ACTUAL_PAST_DUE_WITH_GRACE})"
+REMAINING_PAST_DUE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id WHERE o.due_date = current_date AND s.status = 'past_due'")"
+if [[ "$REMAINING_PAST_DUE" == "0" ]]; then
+  pass "no due-cohort subscription remains past_due after enforcement"
 else
-  fail "every due-cohort past_due subscription has a grace deadline" "expected=${EXPECTED_PAST_DUE} actual=${ACTUAL_PAST_DUE_WITH_GRACE:-error}"
+  fail "no due-cohort subscription remains past_due after enforcement" "count=${REMAINING_PAST_DUE:-error}"
+fi
+CANCELED_WITH_GRACE="$(q "SELECT count(*) FROM subscription WHERE status = 'canceled' AND grace_until IS NOT NULL")"
+if [[ "$CANCELED_WITH_GRACE" == "0" ]]; then
+  pass "no canceled subscription retains a grace deadline"
+else
+  fail "no canceled subscription retains a grace deadline" "count=${CANCELED_WITH_GRACE:-error}"
 fi
 
 dunning_retriable_metric_delta_matches() {
@@ -758,6 +792,73 @@ if [[ "$M_DUNNING_DISPUTE_BEFORE" =~ ^[0-9]+$ ]]; then
 else
   fail "dunning dispute transition delta matches its cohort exactly (${N_PD_DISPUTE})" \
     "invalid baseline=${M_DUNNING_DISPUTE_BEFORE}"
+fi
+
+cancel_exhausted_metric_delta_matches() {
+  local current
+  current="$(consumer_prom_sum '^dunning_cancellations_total\{cause="exhausted"')"
+  [[ "$current" =~ ^[0-9]+$ ]] \
+    && (( current - M_CANCEL_EXHAUSTED_BEFORE == N_PD_RETRIABLE ))
+}
+cancel_expired_metric_delta_matches() {
+  local current
+  current="$(consumer_prom_sum '^dunning_cancellations_total\{cause="grace_expired"')"
+  [[ "$current" =~ ^[0-9]+$ ]] \
+    && (( current - M_CANCEL_EXPIRED_BEFORE == N_PD_HARD + N_PD_DISPUTE ))
+}
+if [[ "$M_CANCEL_EXHAUSTED_BEFORE" =~ ^[0-9]+$ ]]; then
+  wait_for "exhausted cancellation delta matches the 99 family exactly (${N_PD_RETRIABLE})" cancel_exhausted_metric_delta_matches
+else
+  fail "exhausted cancellation delta matches the 99 family exactly (${N_PD_RETRIABLE})" \
+    "invalid baseline=${M_CANCEL_EXHAUSTED_BEFORE}"
+fi
+if [[ "$M_CANCEL_EXPIRED_BEFORE" =~ ^[0-9]+$ ]]; then
+  wait_for "grace-expired cancellation delta matches the hard-fail + dispute families exactly ($((N_PD_HARD + N_PD_DISPUTE)))" cancel_expired_metric_delta_matches
+else
+  fail "grace-expired cancellation delta matches the hard-fail + dispute families exactly ($((N_PD_HARD + N_PD_DISPUTE)))" \
+    "invalid baseline=${M_CANCEL_EXPIRED_BEFORE}"
+fi
+
+# R26c bounds the 99 family: exactly DUNNING_MAX_ATTEMPTS total attempts each,
+# every one failed with the class reason — the attempt count stops being
+# run-length-shaped (R26b's deliberate non-assert) and becomes exact.
+DUNNING_MAX_ATTEMPTS_VAL="$(env_val DUNNING_MAX_ATTEMPTS 3)"
+EXPECTED_99_ROWS=$((N_PD_RETRIABLE * DUNNING_MAX_ATTEMPTS_VAL))
+ATTEMPT_99_ROWS="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id JOIN payment p ON (p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(o.due_date, 'YYYY-MM-DD') OR p.idempotency_key LIKE 'sub-' || o.subscription_id || '|' || to_char(o.due_date, 'YYYY-MM-DD') || '|a%') WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '99') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '99'))")"
+if [[ "$ATTEMPT_99_ROWS" == "$EXPECTED_99_ROWS" ]]; then
+  pass "99-family attempts are bounded at DUNNING_MAX_ATTEMPTS exactly (${ATTEMPT_99_ROWS})"
+else
+  fail "99-family attempts are bounded at DUNNING_MAX_ATTEMPTS exactly" "expected=${EXPECTED_99_ROWS} actual=${ATTEMPT_99_ROWS:-error}"
+fi
+ATTEMPT_99_MISMATCH="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id JOIN payment p ON (p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(o.due_date, 'YYYY-MM-DD') OR p.idempotency_key LIKE 'sub-' || o.subscription_id || '|' || to_char(o.due_date, 'YYYY-MM-DD') || '|a%') WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '99') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '99')) AND NOT (p.status = 'failed' AND p.failure_reason = CASE WHEN c.payment_method = 'sdd' THEN 'AM04' ELSE 'insufficient_funds' END)")"
+if [[ "$ATTEMPT_99_MISMATCH" == "0" ]]; then
+  pass "every 99-family attempt failed with its class reason"
+else
+  fail "every 99-family attempt failed with its class reason" "count=${ATTEMPT_99_MISMATCH:-error}"
+fi
+
+# SDD-99 re-collections notify (failed) once each; card-99 re-collections
+# decline synchronously and never notify; the 95 family adds its settled |a2
+# rows — the |a-family inbox is exact, closing the run-length gap.
+EXPECTED_RETRY_FAMILY_INBOX=$((N_SDD_99 * (DUNNING_MAX_ATTEMPTS_VAL - 1) + N_RETRY))
+RETRY_FAMILY_INBOX="$(q "SELECT count(*) FROM settlement_inbox WHERE notification_id LIKE '%|a%'")"
+if [[ "$RETRY_FAMILY_INBOX" == "$EXPECTED_RETRY_FAMILY_INBOX" ]]; then
+  pass "retry-family inbox rows match the bounded prediction exactly (${RETRY_FAMILY_INBOX})"
+else
+  fail "retry-family inbox rows match the bounded prediction exactly" "expected=${EXPECTED_RETRY_FAMILY_INBOX} actual=${RETRY_FAMILY_INBOX:-error}"
+fi
+
+# R26c steady state: with every 99 exhausted and every grace enforced, the
+# sweeper has nothing left to mint — the payment table must freeze across a
+# full sweep interval (the interim-churn caveat, retired and made assertable).
+DUNNING_SWEEP_INTERVAL_VAL="$(env_val DUNNING_SWEEP_INTERVAL_MS 10000)"
+STEADY_PAYMENTS_BEFORE="$(q 'SELECT count(*) FROM payment')"
+sleep $((DUNNING_SWEEP_INTERVAL_VAL / 1000 + 5))
+STEADY_PAYMENTS_AFTER="$(q 'SELECT count(*) FROM payment')"
+if [[ -n "$STEADY_PAYMENTS_BEFORE" && "$STEADY_PAYMENTS_BEFORE" == "$STEADY_PAYMENTS_AFTER" ]]; then
+  pass "payment count frozen across a full sweep interval — dunning steady state (${STEADY_PAYMENTS_AFTER})"
+else
+  fail "payment count frozen across a full sweep interval — dunning steady state" "before=${STEADY_PAYMENTS_BEFORE:-error} after=${STEADY_PAYMENTS_AFTER:-error}"
 fi
 
 # Since R26b a failed attempt legitimately shares its charge with a later
@@ -805,11 +906,10 @@ else
 fi
 
 note "same-day idempotency probe: re-triggering job, expecting zero new records…"
-# Payment count is scoped to attempt 1: the dunning sweeper keeps creating
-# 99-cohort re-collection rows on its own clock (unbounded until R26c), and
-# those are not the renewal job's records — the probe asserts the JOB mints
-# nothing new.
-SNAP_SQL="SELECT (SELECT count(*) FROM renewal_outbox) || '|' || (SELECT count(*) FROM payment WHERE attempt = 1) || '|' || (SELECT count(*) FROM charge) || '|' || (SELECT count(*) FROM invoice)"
+# Post-R26c the sweeper is provably quiescent at this point (exhaustion and
+# expiry enforced and asserted above), so the snapshot covers every payment
+# row — the re-trigger must mint nothing anywhere.
+SNAP_SQL="SELECT (SELECT count(*) FROM renewal_outbox) || '|' || (SELECT count(*) FROM payment) || '|' || (SELECT count(*) FROM charge) || '|' || (SELECT count(*) FROM invoice)"
 SNAP_BEFORE="$(q "$SNAP_SQL")"
 trigger_job
 assert_trigger "idempotency re-trigger"

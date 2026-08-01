@@ -570,7 +570,7 @@ never retried; the dunning sweeper provably ignores `submitted` rows
 regardless of age ([R28](#r28) boundary).
 
 <a id="r26c"></a>
-### [ ] R26c — Bounded exhaustion and grace expiry end in cancellation
+### [x] R26c — Bounded exhaustion and grace expiry end in cancellation
 **Scope:** `DUNNING_MAX_ATTEMPTS` (retriable path) and grace-deadline
 enforcement (all classes): the sweeper cancels subscriptions whose retriable
 attempts exhausted (suffix 99 never settles) or whose `grace_until` passed

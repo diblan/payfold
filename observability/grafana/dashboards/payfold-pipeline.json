@@ -497,6 +497,31 @@
         "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
         "tooltip": { "mode": "multi" }
       }
+    },
+    {
+      "type": "timeseries",
+      "title": "Dunning cancellations/s by cause",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 64, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "mps",
+          "min": 0,
+          "custom": { "lineWidth": 2, "fillOpacity": 8, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cause) (rate(dunning_cancellations_total[1m]))",
+          "legendFormat": "{{cause}}"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      }
     }
   ]
 }

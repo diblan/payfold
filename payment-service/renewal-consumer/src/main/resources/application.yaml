@@ -73,6 +73,10 @@ dunning:
   # Compose scales both down for verify/demo.
   retry-delay-seconds: 86400
   sweep-interval-ms: 60000
+  # Bounded exhaustion (R26c/D21): total attempts (base + re-collections) stop
+  # at max-attempts; the sweeper then cancels the subscription. Grace expiry
+  # is the class-blind backstop for every class.
+  max-attempts: 4
 
 management:
   endpoints:

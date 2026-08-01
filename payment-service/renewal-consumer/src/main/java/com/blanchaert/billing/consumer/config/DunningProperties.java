@@ -12,6 +12,7 @@ public record DunningProperties(Map<String, String> classes,
                                 long hardFailGraceSeconds,
                                 long disputeGraceSeconds,
                                 long retryDelaySeconds,
+                                long maxAttempts,
                                 long sweepIntervalMs) {
 
     public String classFor(String reason) {

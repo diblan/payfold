@@ -33,19 +33,21 @@ public class DunningSweeper {
     private final BankClient bank;
     private final BankRegistry bankRegistry;
     private final DunningProperties properties;
+    private final DunningLifecycle lifecycle;
     private final TransactionTemplate retryTransaction;
     private final Map<String, Counter> retries;
 
     public DunningSweeper(
             JdbcTemplate jdbc, BankClient bank, BankRegistry bankRegistry,
-            DunningProperties properties, PlatformTransactionManager transactionManager,
-            MeterRegistry meters) {
+            DunningProperties properties, DunningLifecycle lifecycle,
+            PlatformTransactionManager transactionManager, MeterRegistry meters) {
         this.jdbc = jdbc;
         this.namedJdbc = new NamedParameterJdbcTemplate(
                 Objects.requireNonNull(jdbc.getDataSource()));
         this.bank = bank;
         this.bankRegistry = bankRegistry;
         this.properties = properties;
+        this.lifecycle = lifecycle;
         this.retryTransaction = new TransactionTemplate(transactionManager);
         this.retryTransaction.setPropagationBehavior(
                 TransactionDefinition.PROPAGATION_REQUIRES_NEW);
@@ -69,13 +71,24 @@ public class DunningSweeper {
         Boolean acquired = jdbc.queryForObject(
                 "SELECT pg_try_advisory_xact_lock(hashtext('dunning-sweeper'))",
                 Boolean.class);
-        if (!Boolean.TRUE.equals(acquired) || properties.retriableReasons().isEmpty()) {
+        if (!Boolean.TRUE.equals(acquired)) {
             return;
         }
+        if (!properties.retriableReasons().isEmpty()) {
+            retryPass();
+            // Exhaustion before expiry: a subscription satisfying both gets the
+            // specific verdict, not the backstop's.
+            lifecycle.cancelExhausted(
+                    properties.retriableReasons(), properties.maxAttempts());
+        }
+        lifecycle.cancelExpired();
+    }
 
+    private void retryPass() {
         MapSqlParameterSource parameters = new MapSqlParameterSource()
                 .addValue("reasons", properties.retriableReasons())
-                .addValue("delaySeconds", properties.retryDelaySeconds());
+                .addValue("delaySeconds", properties.retryDelaySeconds())
+                .addValue("maxAttempts", properties.maxAttempts());
         // The latest-attempt plus failed-status predicate is the R28 boundary:
         // submitted rows stay invisible at any age. Filtering reasons in SQL
         // also prevents hard-fail rows from starving the bounded page.
@@ -91,6 +104,7 @@ public class DunningSweeper {
                           AND p.status = 'failed'
                           AND p.failure_reason IN (:reasons)
                           AND p.completed_at < now() - (:delaySeconds * interval '1 second')
+                          AND p.attempt < :maxAttempts
                           AND p.attempt = (SELECT max(p2.attempt) FROM payment p2
                                            WHERE p2.charge_id = ch.id)
                         ORDER BY p.completed_at

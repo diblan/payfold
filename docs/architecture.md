@@ -279,11 +279,20 @@ re-collection returns the subscription to `active` and clears `grace_until`;
 `submitted` rows are invisible to dunning, which is the [R28](roadmap.md#r28)
 boundary between received failure signals and missing settlement recovery.
 
+Enforcement ([R26c](roadmap.md#r26c), [D21](decisions.md#d21)) is a second act
+on the same sweeper tick: a subscription whose latest attempt failed retriably
+at `DUNNING_MAX_ATTEMPTS` is canceled as *exhausted*, and any `past_due`
+subscription whose `grace_until` has passed is canceled as *grace-expired* —
+the class-blind backstop. Cancellation clears `grace_until`, is terminal and
+idempotent by predicate (`canceled` is invisible to the retry picker, to grace
+entry, and to recovery), and increments
+`dunning_cancellations_total{cause=exhausted|grace_expired}`.
+
 This lifecycle changes status only. It never reverses `renewed_at`, so the
 [R23d](roadmap.md#r23d) period advance remains a recorded fact after a
-chargeback. R26a records the deadline but neither retries nor enforces it;
-[R26b](roadmap.md#r26b) adds scheduled re-collection and
-[R26c](roadmap.md#r26c) adds bounded exhaustion and grace expiry.
+chargeback. R26a recorded the deadline; [R26b](roadmap.md#r26b) added scheduled
+re-collection and [R26c](roadmap.md#r26c) added bounded exhaustion and grace
+expiry — the lifecycle is complete.
 
 Card authorization declines are business failures: the payment becomes `failed`,
 the subscription enters the same grace lifecycle, the renewal is ACKed, and no
@@ -509,12 +518,14 @@ Micrometer converts dots in meter names to underscores for Prometheus and append
 | `dunning.transitions` | `dunning_transitions_total{class="..."}` | Counter | `class=retriable \| hard_fail \| dispute` | Once when an active subscription enters `past_due`, classified by its terminal reason |
 | `dunning.retries` | `dunning_retries_total{outcome="..."}` | Counter | `outcome=submitted \| declined \| duplicate` | Once per dunning retry decision after its attempt row is inserted or deduplicated |
 | `dunning.recoveries` | `dunning_recoveries_total` | Counter | none | Once when a settled retry returns a `past_due` subscription to `active` and clears grace |
+| `dunning.cancellations` | `dunning_cancellations_total{cause="..."}` | Counter | `cause=exhausted \| grace_expired` | Once per subscription the sweeper cancels, by verdict: bounded retriable attempts exhausted, or the grace deadline passed |
 | `subscriptions.past_due` | `subscriptions_past_due` | Gauge | none | Refreshed every 10 s from the current count of `past_due` subscriptions |
 
 All counter series are registered eagerly and therefore render as `0.0` from boot;
 `verify.sh` depends on that property. Settlement outcome×bank pairs and each
 counterparty's latency timer are likewise registered at startup, and all three
-dunning-class counters exist before the first transition. The renewal outcome
+dunning-class counters plus both cancellation-cause counters exist before the
+first transition. The renewal outcome
 taxonomy is bounded to
 `succeeded`, `failed`, `invalid`, and `submitted`, crossed with the bounded
 `card`, `sdd`, and `unknown` method dimension. Transient or unexpected failures
@@ -637,10 +648,11 @@ Every runtime configuration key below has a real consumer.
 | `RECOVERY_STALE_AFTER_SECONDS` (consumer; yaml `recovery.stale-after-seconds`) | `RecoveryProperties`, `RecoverySweeper`; compose overrides the 300 s application default with 30 s for verify/demo | alive |
 | `RECOVERY_SWEEP_INTERVAL_MS` (consumer; yaml `recovery.sweep-interval-ms`) | `RecoveryProperties`, `RecoverySweeper`; compose overrides the 60000 ms application default with 10000 ms for verify/demo; also the initial delay — the first sweep fires one interval after startup, not at boot | alive |
 | `dunning.classes.*` (consumer; yaml only) | `DunningProperties`, `DunningLifecycle`; fixed reason-to-class policy, deliberately not env-overridable | alive |
-| `DUNNING_RETRIABLE_GRACE_SECONDS` (consumer; yaml `dunning.retriable-grace-seconds`) | `DunningProperties`, `DunningLifecycle`; compose overrides the 604800 s application default with 60 s for verify/demo | alive |
+| `DUNNING_RETRIABLE_GRACE_SECONDS` (consumer; yaml `dunning.retriable-grace-seconds`) | `DunningProperties`, `DunningLifecycle`; compose overrides the 604800 s application default with 120 s for verify/demo (bounded exhaustion demonstrably beats the expiry backstop at the compose cadence, D21) | alive |
 | `DUNNING_HARD_FAIL_GRACE_SECONDS` (consumer; yaml `dunning.hard-fail-grace-seconds`) | `DunningProperties`, `DunningLifecycle`; compose overrides the 259200 s application default with 60 s for verify/demo | alive |
 | `DUNNING_DISPUTE_GRACE_SECONDS` (consumer; yaml `dunning.dispute-grace-seconds`) | `DunningProperties`, `DunningLifecycle`; compose overrides the 1209600 s application default with 60 s for verify/demo | alive |
 | `DUNNING_RETRY_DELAY_SECONDS` (consumer; yaml `dunning.retry-delay-seconds`) | `DunningProperties`, `DunningSweeper`; compose overrides the 86400 s application default with 15 s for verify/demo | alive |
+| `DUNNING_MAX_ATTEMPTS` (consumer; yaml `dunning.max-attempts`) | `DunningProperties`, `DunningSweeper`, `DunningLifecycle`; total attempts (base + re-collections) before the sweeper cancels as exhausted; compose overrides the 4 application default with 3 for verify/demo | alive |
 | `DUNNING_SWEEP_INTERVAL_MS` (consumer; yaml `dunning.sweep-interval-ms`) | `DunningProperties`, `DunningSweeper`; compose overrides the 60000 ms application default with 10000 ms for verify/demo; also the initial delay — the first sweep fires one interval after startup, not at boot | alive |
 | `SEED_SDD_SILENT_PERCENT` (seeder) | `CustomerSeeder`; compose-only deterministic suffix-94 share inside the SDD cohort | alive |
 | `SEED_CARD_SILENT_PERCENT` (seeder) | `CustomerSeeder`; compose-only deterministic suffix-94 share inside the card cohort | alive |
@@ -723,7 +735,7 @@ architecture-independent jar once instead of emulating Maven under QEMU.
 | Image (`ghcr.io/diblan/…`) | Contents | Run pattern | Config (env) |
 |---|---|---|---|
 | `payfold-renewal-producer` | producer Spring Boot jar | long-running service; port 8080, `/actuator/health` | the compose `renewal-producer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_ROUTINGKEY`, `APP_TIMEZONE`, `APP_SCHEDULECRON`, `TZ` |
-| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, indexed `BANK_REGISTRY_*` including scheme, `RECOVERY_STALE_AFTER_SECONDS`, `RECOVERY_SWEEP_INTERVAL_MS`, the three `DUNNING_*_GRACE_SECONDS`, `DUNNING_RETRY_DELAY_SECONDS`, `DUNNING_SWEEP_INTERVAL_MS`, `TZ` |
+| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, indexed `BANK_REGISTRY_*` including scheme, `RECOVERY_STALE_AFTER_SECONDS`, `RECOVERY_SWEEP_INTERVAL_MS`, the three `DUNNING_*_GRACE_SECONDS`, `DUNNING_RETRY_DELAY_SECONDS`, `DUNNING_MAX_ATTEMPTS`, `DUNNING_SWEEP_INTERVAL_MS`, `TZ` |
 | `payfold-migrations` | `flyway/flyway:11` + `db-migrations/V*.sql`, `CMD ["migrate"]` | run-to-completion Job; exit 0 = success; re-run on a current schema is a no-op (asserted by `verify.sh`) | `FLYWAY_URL`, `FLYWAY_USER`, `FLYWAY_PASSWORD`, `FLYWAY_CONNECT_RETRIES` (image default 30) |
 | `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS`, `SEED_SDD_PERCENT`, `SEED_SDD_RULE_PERCENT`, `SEED_SDD_SILENT_PERCENT`, `SEED_SDD_RETRY_PERCENT`, `SEED_CARD_RULE_PERCENT`, `SEED_CARD_SILENT_PERCENT`, `SEED_CARD_RETRY_PERCENT` |
 | `payfold-mock-bank` | FastAPI mock counterparty (source + pinned pure-python deps) | long-running service; port 8080, `/health`; compose runs two SEPA instances and one card instance | `BANK_ID`, `BANK_SCHEME`, `BANK_WORKERS`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `BANK_WEBHOOK_RETRY_MAX_ATTEMPTS`, `BANK_WEBHOOK_RETRY_BACKOFF_SECONDS`, `TZ` |
