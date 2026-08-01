@@ -9,7 +9,11 @@
 #   scripts/chaos-demo.sh [--auto] [--timeout SECONDS]
 #
 #   --auto         skip the pause between scenes
-#   --timeout N    max seconds to wait for each long condition (default 600)
+#   --timeout N    max seconds to wait for each long condition (default 1200 —
+#                  on a fresh default-seed stack scene 1 bills the whole 15k
+#                  base cohort at the measured post-R26b single-consumer rate
+#                  (~22/s, see roadmap R36), plus the dunning re-collection
+#                  tails; a pre-billed stack needs nothing near this)
 #
 # Environment:
 #   DEMO_AUTO=1    skip the pause between scenes
@@ -21,7 +25,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-TIMEOUT=600
+TIMEOUT=1200
 AUTO="${DEMO_AUTO:-0}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -178,7 +182,9 @@ main_queue_empty() {
   [[ "$(queue_depth "$RMQ_QUEUE")" == "0" ]]
 }
 
-# Card terminality derives from each customer's stored token.
+# Card terminality derives from each customer's stored token. The 95 cohort
+# (R26b) terminates on its attempt-2 re-collection row (|a2 key): attempt 1
+# fails by rule and the re-collection settles.
 CARD_TERMINAL_MISMATCH_SQL="SELECT count(*) FROM renewal_outbox o
 JOIN subscription s ON s.id = o.subscription_id
 JOIN customer c ON c.id = s.customer_id
@@ -187,6 +193,7 @@ WHERE o.due_date = current_date
   AND NOT EXISTS (
     SELECT 1 FROM payment p
     WHERE p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
+          || CASE WHEN right(c.card_token, 2) = '95' THEN '|a2' ELSE '' END
       AND p.channel = 'CARD'
       AND p.status = CASE WHEN right(c.card_token, 2) IN ('99','98') THEN 'failed'
                           WHEN right(c.card_token, 2) = '96' THEN 'charged_back'
@@ -198,7 +205,8 @@ WHERE o.due_date = current_date
   )"
 
 # SDD terminality includes the bank delay and chargeback lag. The bank
-# attribution and ISO reason are part of the same per-row prediction.
+# attribution and ISO reason are part of the same per-row prediction; the 95
+# cohort terminates on its attempt-2 re-collection row (|a2 key, R26b).
 SDD_TERMINAL_MISMATCH_SQL="SELECT count(*) FROM renewal_outbox o
 JOIN subscription s ON s.id = o.subscription_id
 JOIN customer c ON c.id = s.customer_id
@@ -207,6 +215,7 @@ WHERE o.due_date = current_date
   AND NOT EXISTS (
     SELECT 1 FROM payment p
     WHERE p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
+          || CASE WHEN right(c.debtor_iban, 2) = '95' THEN '|a2' ELSE '' END
       AND p.channel = 'SEPA_DD' AND p.bank_id IS NOT NULL AND p.collection_id IS NOT NULL
       AND p.status = CASE WHEN right(c.debtor_iban, 2) IN ('99','98','97')
                           THEN 'failed' WHEN right(c.debtor_iban, 2) = '96'
@@ -493,9 +502,14 @@ else
   fail "scene 2 poison message published and routed" "response=${PUBLISH_RESPONSE:-empty}"
 fi
 
+# The poison sits behind the scene's FIFO backlog, so its DLQ deadline is
+# queue wait + the bounded listener retry envelope: ~2000 messages at the
+# measured ~22/s single-consumer rate (R36) is ~91s, plus retry backoff and
+# the stats interval — 150s bounds it honestly. G5's bound is on attempts
+# once delivered, not on queue position.
 POISON_DLQ_READY=0
 POISON_WAIT_START=$SECONDS
-while (( SECONDS - POISON_WAIT_START < 60 )); do
+while (( SECONDS - POISON_WAIT_START < 150 )); do
   if [[ "$(queue_depth "$RMQ_DLQ")" == "1" ]]; then
     POISON_DLQ_READY=1
     break
@@ -503,9 +517,9 @@ while (( SECONDS - POISON_WAIT_START < 60 )); do
   sleep 2
 done
 if (( POISON_DLQ_READY )); then
-  pass "scene 2 poison message reached DLQ within 60s"
+  pass "scene 2 poison message reached DLQ within 150s"
 else
-  fail "scene 2 poison message reached DLQ within 60s" \
+  fail "scene 2 poison message reached DLQ within 150s" \
     "if the broker carries pre-R5 queue args, wipe the RabbitMQ volume (docker compose down -v) so the queue is redeclared"
 fi
 

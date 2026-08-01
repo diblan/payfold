@@ -726,8 +726,36 @@ a long test interval structurally silence the schedule; the consumer suite is
 green; verify.sh green (the compose-level first-sweep shift is ≤ one 10 s
 interval, absorbed by the existing bounded polls).
 
+<a id="r36"></a>
+### [ ] R36 — Single-consumer consume cost tripled across R32/R26b (16 ms → 43 ms)
+**Scope:** diagnosis first — measured facts before any fix; likely candidates
+are per-request costs the R32/R26b diffs added on the consume round trip, with
+the counterparty image's multiprocess metrics files
+(`PROMETHEUS_MULTIPROC_DIR`, set for ALL instances including the single-worker
+banks, [D19](decisions.md#d19)) the prime suspect; consumer-side additions
+(V11 constraint arbitration, R26a grace calls) secondary. Design-first if the
+fix changes a published image.
+Observed 2026-08-01 during [R26d](#r26d)'s chaos-demo acceptance: the fresh
+15k+5k scene-1 drain sustained ~22/s at listener concurrency 1 where
+[R30](#r30) measured 62/s three days of commits earlier — Prometheus put the
+renewal listener's mean processing time at 42–50 ms/message across the whole
+drain (2026-08-01 19:35–19:49 CEST) against R30's ~16 ms. Ruled out by
+live forensics: both 10 s sweeper SELECTs execute sub-millisecond at 36k
+payment rows, and post-R26c re-collection churn is bounded-tiny during the
+drain (~1 extra submission/s) — the [R26b](#r26b) session's "churn drags
+conc-1 to ~24/s" attribution was at least incomplete, since bounded churn
+shows the same rate. The system stays correct and verify.sh green; the cost
+is wall-clock only (verify/demo budgets were raised to absorb it: 900 s and
+1200 s).
+**Done when:** the per-consume cost is decomposed with measurements (bank
+round-trip vs consumer DB work vs listener overhead), the regressing
+mechanism is named and either reverted/fixed (conc-1 back near its ~60/s
+baseline, budgets re-tightened accordingly) or accepted with a decision entry
+re-documenting the baseline; quality.md "Measured scale runs" and the README
+numbers reflect whichever truth wins.
+
 <a id="r34"></a>
-### [ ] R34 — Chaos-demo terminal predictions predate the 95 re-collection cohort
+### [x] R34 — Chaos-demo terminal predictions predate the 95 re-collection cohort
 **Scope:** `scripts/chaos-demo.sh` only; no service changes.
 [R26b](#r26b) taught verify.sh that the suffix-95 cohort terminates on its
 attempt-2 `|a2` row (fails first by rule, settles on re-collection), but the
