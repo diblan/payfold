@@ -272,6 +272,13 @@ reasons conservatively use `hard_fail`. The `status = 'active'` update guard
 makes duplicate hooks and redelivered terminal messages leave the first deadline
 untouched; transition counters increment only when that update succeeds.
 
+The dunning sweeper re-collects retriable failures on the
+`DUNNING_RETRY_DELAY_SECONDS` cadence as new, constraint-keyed payment rows through
+the same submission spine (`sub-<id>|<due_date>|a<attempt>`). A settled
+re-collection returns the subscription to `active` and clears `grace_until`;
+`submitted` rows are invisible to dunning, which is the [R28](roadmap.md#r28)
+boundary between received failure signals and missing settlement recovery.
+
 This lifecycle changes status only. It never reverses `renewed_at`, so the
 [R23d](roadmap.md#r23d) period advance remains a recorded fact after a
 chargeback. R26a records the deadline but neither retries nor enforces it;
@@ -378,11 +385,15 @@ The IBAN rule is deliberately small and deterministic:
 | `98` | failed | `failed` | `AC04` — account closed |
 | `97` | failed | `failed` | `MD01` — no valid mandate |
 | `96` | settled then charged back | `settled`, then `charged_back` | `MD06` — payer objection after settlement |
+| `95` | fails, then settles on re-collection | attempt 1 `failed`; attempt ≥ 2 `settled` | `AM04` — insufficient funds, recoverable |
 | `94` | settled | `settled` suppressed | none |
 | any other suffix | settled | `settled` | none |
 
 Suffix `94` classifies normally but never notifies, modeling deliverability loss
 as a deterministic rule ([D18](decisions.md#d18)).
+Suffix `95` is attempt-indexed off the collection id's `|a<attempt>` tail — the
+verdict needs no stored history, so it survives restart amnesia and worker hops
+([D20](decisions.md#d20)).
 
 Each rule-bearing suffix is 1% of a uniform two-digit tail. More importantly,
 later verifier sub-items can predict every result directly in SQL as
@@ -409,11 +420,15 @@ through the same webhook/inbox/queue/listener spine as SDD.
 | `99` | declined | none | `insufficient_funds` |
 | `98` | declined | none | `do_not_honor` |
 | `96` | authorized | `settled`, then `charged_back` | `fraud_dispute` on chargeback |
+| `95` | declined, then authorized on re-collection | attempt ≥ 2 `settled` | `insufficient_funds` on attempt 1 |
 | `94` | authorized | `settled` suppressed | none |
 | any other suffix | authorized | `settled` | none |
 
 Suffix `94` classifies normally but never notifies, modeling deliverability loss
 as a deterministic rule ([D18](decisions.md#d18)).
+Suffix `95` is attempt-indexed off the collection id's `|a<attempt>` tail — the
+verdict needs no stored history, so it survives restart amnesia and worker hops
+([D20](decisions.md#d20)).
 
 Repeating a card `collection_id` returns HTTP `200` with the same stored
 `authorized` or `declined` verdict and `duplicate: true`; it never schedules an
@@ -492,6 +507,8 @@ Micrometer converts dots in meter names to underscores for Prometheus and append
 | `settlements.recovered` | `settlements_recovered_total` | Counter | none | Once when the recovery sweeper synthesizes a missing sequence-1 settlement into the inbox |
 | `recovery.sweeps` | `recovery_sweeps_total{result="..."}` | Counter | `result=recovered \| resubmitted \| noop` | Once per stale-payment recovery action after query, synthesis/resubmission, or inbox-race no-op |
 | `dunning.transitions` | `dunning_transitions_total{class="..."}` | Counter | `class=retriable \| hard_fail \| dispute` | Once when an active subscription enters `past_due`, classified by its terminal reason |
+| `dunning.retries` | `dunning_retries_total{outcome="..."}` | Counter | `outcome=submitted \| declined \| duplicate` | Once per dunning retry decision after its attempt row is inserted or deduplicated |
+| `dunning.recoveries` | `dunning_recoveries_total` | Counter | none | Once when a settled retry returns a `past_due` subscription to `active` and clears grace |
 | `subscriptions.past_due` | `subscriptions_past_due` | Gauge | none | Refreshed every 10 s from the current count of `past_due` subscriptions |
 
 All counter series are registered eagerly and therefore render as `0.0` from boot;
@@ -592,6 +609,7 @@ requires a version bump and decision entry.
 | V8 | `payment.charged_back_at`, separating the dispute timestamp from settlement completion |
 | V9 | tokenized card reference on `customer`, backfilled for legacy cards and required for every card customer |
 | V10 | `subscription.grace_until` plus the partial index supporting current `past_due` depth polling |
+| V11 | `payment.attempt` plus the unique `(charge_id, attempt)` key that makes retry insertion race-safe |
 
 `renewal_outbox`: `id, subscription_id, due_date, payload jsonb, created_at, published_at`.
 Unpublished = `published_at IS NULL`.
@@ -622,8 +640,12 @@ Every runtime configuration key below has a real consumer.
 | `DUNNING_RETRIABLE_GRACE_SECONDS` (consumer; yaml `dunning.retriable-grace-seconds`) | `DunningProperties`, `DunningLifecycle`; compose overrides the 604800 s application default with 60 s for verify/demo | alive |
 | `DUNNING_HARD_FAIL_GRACE_SECONDS` (consumer; yaml `dunning.hard-fail-grace-seconds`) | `DunningProperties`, `DunningLifecycle`; compose overrides the 259200 s application default with 60 s for verify/demo | alive |
 | `DUNNING_DISPUTE_GRACE_SECONDS` (consumer; yaml `dunning.dispute-grace-seconds`) | `DunningProperties`, `DunningLifecycle`; compose overrides the 1209600 s application default with 60 s for verify/demo | alive |
+| `DUNNING_RETRY_DELAY_SECONDS` (consumer; yaml `dunning.retry-delay-seconds`) | `DunningProperties`, `DunningSweeper`; compose overrides the 86400 s application default with 15 s for verify/demo | alive |
+| `DUNNING_SWEEP_INTERVAL_MS` (consumer; yaml `dunning.sweep-interval-ms`) | `DunningProperties`, `DunningSweeper`; compose overrides the 60000 ms application default with 10000 ms for verify/demo | alive |
 | `SEED_SDD_SILENT_PERCENT` (seeder) | `CustomerSeeder`; compose-only deterministic suffix-94 share inside the SDD cohort | alive |
 | `SEED_CARD_SILENT_PERCENT` (seeder) | `CustomerSeeder`; compose-only deterministic suffix-94 share inside the card cohort | alive |
+| `SEED_SDD_RETRY_PERCENT` (seeder) | `CustomerSeeder`; compose-only deterministic suffix-95 share inside the SDD cohort, mirroring the silent slice | alive |
+| `SEED_CARD_RETRY_PERCENT` (seeder) | `CustomerSeeder`; compose-only deterministic suffix-95 share inside the card cohort, mirroring the silent slice | alive |
 | `spring.rabbitmq.listener.simple.*` (consumer) | Spring Boot AMQP autoconfig + `ListenerRetryConfig` (`max-attempts`) | alive |
 | `management.endpoints.web.exposure.include` (producer) | actuator exposure for `health`, `info`, `metrics`, `prometheus`, and `renewal-job` | alive |
 | `management.endpoints.web.exposure.include` (consumer) | actuator exposure for `health`, `info`, `metrics`, and `prometheus`; the compose healthcheck relies on `health` | alive |
@@ -639,9 +661,10 @@ Seed configuration is compose-only: `SEED_CUSTOMERS` (default 15000),
 `SEED_SDD_PERCENT` (default 20), `SEED_SDD_RULE_PERCENT` (default 4),
 `SEED_CARD_RULE_PERCENT` (default 4),
 `SEED_SDD_SILENT_PERCENT` (default 2), and `SEED_CARD_SILENT_PERCENT` (default
-2) are read by `CustomerSeeder` in the seed container. They deterministically
-partition customers and assign rule-bearing or silent IBAN/card-token suffixes
-from the global customer number. Every seeded
+2), plus `SEED_SDD_RETRY_PERCENT` and `SEED_CARD_RETRY_PERCENT` (both default
+2), are read by `CustomerSeeder` in the seed container. They deterministically
+partition customers and assign rule-bearing, silent, or recoverable
+IBAN/card-token suffixes from the global customer number. Every seeded
 subscription is due on the seed day, so
 `SEED_CUSTOMERS` directly sets the size of the day's renewal batch;
 `scripts/load-test.sh` adds more due-today volume to a running stack without a
@@ -700,9 +723,9 @@ architecture-independent jar once instead of emulating Maven under QEMU.
 | Image (`ghcr.io/diblan/…`) | Contents | Run pattern | Config (env) |
 |---|---|---|---|
 | `payfold-renewal-producer` | producer Spring Boot jar | long-running service; port 8080, `/actuator/health` | the compose `renewal-producer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_ROUTINGKEY`, `APP_TIMEZONE`, `APP_SCHEDULECRON`, `TZ` |
-| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, indexed `BANK_REGISTRY_*` including scheme, `RECOVERY_STALE_AFTER_SECONDS`, `RECOVERY_SWEEP_INTERVAL_MS`, the three `DUNNING_*_GRACE_SECONDS`, `TZ` |
+| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, indexed `BANK_REGISTRY_*` including scheme, `RECOVERY_STALE_AFTER_SECONDS`, `RECOVERY_SWEEP_INTERVAL_MS`, the three `DUNNING_*_GRACE_SECONDS`, `DUNNING_RETRY_DELAY_SECONDS`, `DUNNING_SWEEP_INTERVAL_MS`, `TZ` |
 | `payfold-migrations` | `flyway/flyway:11` + `db-migrations/V*.sql`, `CMD ["migrate"]` | run-to-completion Job; exit 0 = success; re-run on a current schema is a no-op (asserted by `verify.sh`) | `FLYWAY_URL`, `FLYWAY_USER`, `FLYWAY_PASSWORD`, `FLYWAY_CONNECT_RETRIES` (image default 30) |
-| `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS`, `SEED_SDD_PERCENT`, `SEED_SDD_RULE_PERCENT`, `SEED_SDD_SILENT_PERCENT`, `SEED_CARD_RULE_PERCENT`, `SEED_CARD_SILENT_PERCENT` |
+| `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS`, `SEED_SDD_PERCENT`, `SEED_SDD_RULE_PERCENT`, `SEED_SDD_SILENT_PERCENT`, `SEED_SDD_RETRY_PERCENT`, `SEED_CARD_RULE_PERCENT`, `SEED_CARD_SILENT_PERCENT`, `SEED_CARD_RETRY_PERCENT` |
 | `payfold-mock-bank` | FastAPI mock counterparty (source + pinned pure-python deps) | long-running service; port 8080, `/health`; compose runs two SEPA instances and one card instance | `BANK_ID`, `BANK_SCHEME`, `BANK_WORKERS`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `BANK_WEBHOOK_RETRY_MAX_ATTEMPTS`, `BANK_WEBHOOK_RETRY_BACKOFF_SECONDS`, `TZ` |
 
 Compose builds `payfold-migrations` and `payfold-seed-data-gen` itself (the flyway

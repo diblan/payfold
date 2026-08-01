@@ -151,6 +151,81 @@ async def test_failed_submission_delivers_reason():
     assert payload["reason"] == "AM04"
 
 
+async def test_retryable_sdd_submission_settles_under_a_new_attempt_id():
+    captured = []
+
+    async def handler(request):
+        captured.append(request)
+        return httpx.Response(200, request=request)
+
+    api, webhook = await clients(handler)
+    base = "sub-retry-sdd|2026-08-01"
+    async with api, webhook:
+        first = await api.post(
+            "/collections",
+            json=submission(collection_id=base, iban="BE68539007547095"),
+        )
+        assert first.status_code == 202
+        assert first.json()["status"] == "accepted"
+        stored_first = (await api.get(f"/collections/{base}")).json()
+        assert stored_first["outcome"] == "failed"
+        assert stored_first["reason"] == "AM04"
+
+        retry_id = base + "|a2"
+        retry = await api.post(
+            "/collections",
+            json=submission(collection_id=retry_id, iban="BE68539007547095"),
+        )
+        assert retry.status_code == 202
+        assert retry.json()["status"] == "accepted"
+        stored_retry = (await api.get(f"/collections/{retry_id}")).json()
+        assert stored_retry["outcome"] == "settled"
+        assert stored_retry["reason"] is None
+        await wait_for_requests(captured, 2)
+
+
+async def test_retryable_card_submission_authorizes_under_a_new_attempt_id():
+    captured = []
+
+    async def handler(request):
+        captured.append(request)
+        return httpx.Response(200, request=request)
+
+    api, webhook = await clients(handler, settings(scheme="card"))
+    base = "sub-retry-card|2026-08-01"
+
+    def card_submission(collection_id):
+        return {
+            "collection_id": collection_id,
+            "amount_cents": 1299,
+            "currency": "EUR",
+            "card_token": "tok-0000000095",
+            "due_date": "2026-08-01",
+        }
+
+    async with api, webhook:
+        first = await api.post("/collections", json=card_submission(base))
+        assert first.status_code == 200
+        assert first.json()["status"] == "declined"
+        assert first.json()["reason"] == "insufficient_funds"
+        stored_first = (await api.get(f"/collections/{base}")).json()
+        assert stored_first["outcome"] == "declined"
+
+        retry_id = base + "|a2"
+        retry = await api.post(
+            "/collections", json=card_submission(retry_id)
+        )
+        assert retry.status_code == 202
+        assert retry.json()["status"] == "authorized"
+        stored_retry = (await api.get(f"/collections/{retry_id}")).json()
+        assert stored_retry["outcome"] == "authorized"
+        assert len(stored_retry["notifications"]) == 1
+        assert stored_retry["notifications"][0]["outcome"] == "settled"
+        assert stored_retry["notifications"][0]["reason"] is None
+        assert stored_retry["notifications"][0]["notification_id"] == retry_id + ":1"
+        await wait_for_requests(captured, 1)
+
+
 async def test_duplicate_submission_does_not_reschedule():
     captured = []
 

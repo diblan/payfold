@@ -68,6 +68,11 @@ dunning:
   retriable-grace-seconds: 604800
   hard-fail-grace-seconds: 259200
   dispute-grace-seconds: 1209600
+  # Re-collection cadence (D20): delay anchors on the failed attempt's
+  # completed_at; the sweep interval mirrors the recovery sweeper's pair.
+  # Compose scales both down for verify/demo.
+  retry-delay-seconds: 86400
+  sweep-interval-ms: 60000
 
 management:
   endpoints:

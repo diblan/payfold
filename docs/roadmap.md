@@ -549,7 +549,7 @@ predicted from the IBAN/token rules ([G7](invariants.md#g7) tightening); a
 redelivered chargeback still yields one `past_due` transition.
 
 <a id="r26b"></a>
-### [ ] R26b — Scheduled re-collection for retriable failures
+### [x] R26b — Scheduled re-collection for retriable failures
 **Scope:** `payment` rows gain `attempt` (int, default 1, part of a new unique
 key with the collection id family); dunning sweeper (advisory-locked, scaled
 schedule `DUNNING_RETRY_DELAY_SECONDS`) picks `past_due` subscriptions whose

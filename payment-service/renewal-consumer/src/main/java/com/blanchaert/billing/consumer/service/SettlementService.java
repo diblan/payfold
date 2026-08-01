@@ -118,6 +118,9 @@ public class SettlementService {
                 jdbc.update("UPDATE subscription SET renewed_at = ? WHERE id = ?",
                         Timestamp.valueOf(links.periodEnd().atTime(9, 0)),
                         links.subscriptionId());
+                // The payment's submitted-to-succeeded guard keeps reordered
+                // chargebacks and settlement redeliveries out of recovery.
+                dunningLifecycle.recoverFromGrace(links.subscriptionId());
                 recordLatency(payment);
             }
             // A terminal payment makes redelivery a no-op through the status guard.

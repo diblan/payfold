@@ -131,15 +131,17 @@ def create_app(
 
         if settings.scheme == "card":
             classified_outcome, classified_reason = card_verdict_for(
-                submission.card_token
+                submission.card_token, submission.collection_id
             )
             response_status = (
                 "declined" if classified_outcome == "declined" else "authorized"
             )
-            plan = card_notification_plan(submission.card_token)
+            plan = card_notification_plan(
+                submission.card_token, submission.collection_id
+            )
         else:
             classified_outcome, classified_reason = outcome_for(
-                submission.debtor_iban
+                submission.debtor_iban, submission.collection_id
             )
             response_status = "accepted"
             plan = notification_plan(

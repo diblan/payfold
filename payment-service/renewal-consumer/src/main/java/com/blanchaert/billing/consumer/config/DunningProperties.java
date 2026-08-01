@@ -3,12 +3,16 @@ package com.blanchaert.billing.consumer.config;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 @ConfigurationProperties(prefix = "dunning")
 public record DunningProperties(Map<String, String> classes,
                                 long retriableGraceSeconds,
                                 long hardFailGraceSeconds,
-                                long disputeGraceSeconds) {
+                                long disputeGraceSeconds,
+                                long retryDelaySeconds,
+                                long sweepIntervalMs) {
 
     public String classFor(String reason) {
         String dunningClass = reason == null ? null : classes.get(reason);
@@ -21,5 +25,12 @@ public record DunningProperties(Map<String, String> classes,
             case "dispute" -> disputeGraceSeconds;
             default -> hardFailGraceSeconds;
         };
+    }
+
+    public Set<String> retriableReasons() {
+        return classes.entrySet().stream()
+                .filter(entry -> "retriable".equals(entry.getValue()))
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toUnmodifiableSet());
     }
 }

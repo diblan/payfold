@@ -18,7 +18,9 @@
 #   scripts/verify.sh [--no-up] [--timeout SECONDS] [--poison|--no-poison]
 #
 #   --no-up        skip `docker compose up -d --build` (stack already running)
-#   --timeout N    max seconds to wait for each long condition (default 600)
+#   --timeout N    max seconds to wait for each long condition (default 900 —
+#                  since R26b the terminal waits also cover a full dunning
+#                  re-collection cycle riding behind the drain)
 #   --poison       run the poison-message DLQ probe (default since R5)
 #   --no-poison    skip poison payload/DLQ checks only; listener metrics stay required
 #
@@ -39,7 +41,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-TIMEOUT=600
+TIMEOUT=900
 NO_UP=0
 POISON=1
 while [[ $# -gt 0 ]]; do
@@ -142,6 +144,8 @@ outbox_drained() { [[ "$(q 'SELECT count(*) FROM renewal_outbox WHERE published_
 
 # A today-due card outbox row is correctly billed when the stored card token
 # predicts its exact terminal status, reason, channel, and settlement attribution.
+# The 95 cohort (R26b) terminates on its attempt-2 re-collection row (|a2 key);
+# its attempt-1 failure is asserted separately in the R26b block.
 CARD_TERMINAL_MISMATCH_SQL="SELECT count(*) FROM renewal_outbox o
 JOIN subscription s ON s.id = o.subscription_id
 JOIN customer c ON c.id = s.customer_id
@@ -150,6 +154,7 @@ WHERE o.due_date = current_date
   AND NOT EXISTS (
     SELECT 1 FROM payment p
     WHERE p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
+          || CASE WHEN right(c.card_token, 2) = '95' THEN '|a2' ELSE '' END
       AND p.channel = 'CARD'
       AND p.status = CASE WHEN right(c.card_token, 2) IN ('99','98') THEN 'failed'
                           WHEN right(c.card_token, 2) = '96' THEN 'charged_back'
@@ -172,6 +177,7 @@ WHERE o.due_date = current_date
   AND NOT EXISTS (
     SELECT 1 FROM payment p
     WHERE p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(current_date, 'YYYY-MM-DD')
+          || CASE WHEN right(c.debtor_iban, 2) = '95' THEN '|a2' ELSE '' END
       AND p.channel = 'SEPA_DD' AND p.bank_id IS NOT NULL AND p.collection_id IS NOT NULL
       AND p.status = CASE WHEN right(c.debtor_iban, 2) IN ('99','98','97')
                           THEN 'failed' WHEN right(c.debtor_iban, 2) = '96'
@@ -460,7 +466,13 @@ else
 fi
 wait_for "spring_batch_job_seconds recorded on producer" batch_job_timer_recorded
 
-EXPECTED_CARD_FAILED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(c.card_token, 2) IN ('99','98')")"
+# The 95 cohort (R26b) fails its first attempt by rule, so base-key failed
+# counts and reason maps include it; its recovery is asserted separately.
+N_RETRY_SDD="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '95'")"
+N_RETRY_CARD="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(c.card_token, 2) = '95'")"
+N_RETRY=$((N_RETRY_SDD + N_RETRY_CARD))
+
+EXPECTED_CARD_FAILED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(c.card_token, 2) IN ('99','98','95')")"
 ACTUAL_CARD_FAILED="$(q "SELECT count(*) FROM payment WHERE status = 'failed' AND channel = 'CARD' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
 if [[ -n "$EXPECTED_CARD_FAILED" && "$ACTUAL_CARD_FAILED" == "$EXPECTED_CARD_FAILED" ]]; then
   pass "card failed count matches the token rule exactly (${ACTUAL_CARD_FAILED}/${N_CARD_DUE})"
@@ -470,7 +482,7 @@ fi
 CARD_REASON_MISMATCH="$(q "SELECT count(*) FROM payment p JOIN charge ch ON ch.id = p.charge_id JOIN subscription s ON s.id = ch.subscription_id JOIN customer c ON c.id = s.customer_id
 WHERE p.status = 'failed' AND p.channel = 'CARD'
   AND p.idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')
-  AND p.failure_reason IS DISTINCT FROM CASE right(c.card_token, 2) WHEN '99' THEN 'insufficient_funds' WHEN '98' THEN 'do_not_honor' END")"
+  AND p.failure_reason IS DISTINCT FROM CASE right(c.card_token, 2) WHEN '99' THEN 'insufficient_funds' WHEN '98' THEN 'do_not_honor' WHEN '95' THEN 'insufficient_funds' END")"
 if [[ "$CARD_REASON_MISMATCH" == "0" ]]; then
   pass "every failed card payment carries its token-predicted reason"
 else
@@ -490,7 +502,7 @@ if [[ "$STUCK_SUBMITTED" == "0" ]]; then
 else
   fail "zero payments stuck submitted after settlement" "count=${STUCK_SUBMITTED:-error}"
 fi
-EXPECTED_SDD_FAILED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND right(c.debtor_iban, 2) IN ('99','98','97')")"
+EXPECTED_SDD_FAILED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND right(c.debtor_iban, 2) IN ('99','98','97','95')")"
 ACTUAL_SDD_FAILED="$(q "SELECT count(*) FROM payment WHERE status = 'failed' AND channel = 'SEPA_DD' AND idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')")"
 if [[ -n "$EXPECTED_SDD_FAILED" && "$ACTUAL_SDD_FAILED" == "$EXPECTED_SDD_FAILED" ]]; then
   pass "SDD failed count matches the IBAN rule exactly (${ACTUAL_SDD_FAILED}/${N_SDD_DUE})"
@@ -500,7 +512,7 @@ fi
 REASON_MISMATCH="$(q "SELECT count(*) FROM payment p JOIN charge ch ON ch.id = p.charge_id JOIN subscription s ON s.id = ch.subscription_id JOIN customer c ON c.id = s.customer_id
 WHERE p.status = 'failed' AND p.channel = 'SEPA_DD'
   AND p.idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')
-  AND p.failure_reason IS DISTINCT FROM CASE right(c.debtor_iban, 2) WHEN '99' THEN 'AM04' WHEN '98' THEN 'AC04' WHEN '97' THEN 'MD01' END")"
+  AND p.failure_reason IS DISTINCT FROM CASE right(c.debtor_iban, 2) WHEN '99' THEN 'AM04' WHEN '98' THEN 'AC04' WHEN '97' THEN 'MD01' WHEN '95' THEN 'AM04' END")"
 if [[ "$REASON_MISMATCH" == "0" ]]; then
   pass "every failed SDD payment carries its predicted ISO reason"
 else
@@ -510,17 +522,32 @@ fi
 # Reconciliation: the 96 cohort produces TWO notifications (settled + the
 # applied chargeback), everything else one. Chargebacks lag by
 # BANK_CHARGEBACK_LAG_SECONDS, so this is a bounded wait, not a single read.
+# Since R26b the exactness is per collection family: base collections stay
+# exactly predictable, the 95 cohort adds exactly one attempt-2 row each, and
+# the 99 cohort's ongoing re-collections are deliberately unasserted here
+# (their count is a function of run length; their invariants are asserted in
+# the R26b block below).
 N_96_DUE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '96'")"
 N_CARD_AUTH="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(c.card_token, 2) NOT IN ('99','98')")"
 N_CARD_96="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(c.card_token, 2) = '96'")"
-EXPECTED_INBOX=$((N_SDD_DUE + N_96_DUE + N_CARD_AUTH + N_CARD_96))
-inbox_complete() { [[ "$(q 'SELECT count(*) FROM settlement_inbox')" -ge "$EXPECTED_INBOX" ]] 2>/dev/null; }
-wait_for "settlement inbox received every predicted notification (${EXPECTED_INBOX})" inbox_complete
-INBOX_TOTAL="$(q 'SELECT count(*) FROM settlement_inbox')"
+# Card-95 attempt 1 declines synchronously (no notification); its settled row
+# arrives under the |a2 id and is counted by the retry-family check below.
+EXPECTED_INBOX=$((N_SDD_DUE + N_96_DUE + N_CARD_AUTH - N_RETRY_CARD + N_CARD_96))
+BASE_INBOX_SQL="SELECT count(*) FROM settlement_inbox WHERE notification_id NOT LIKE '%|a%'"
+inbox_complete() { [[ "$(q "$BASE_INBOX_SQL")" -ge "$EXPECTED_INBOX" ]] 2>/dev/null; }
+wait_for "settlement inbox received every predicted base notification (${EXPECTED_INBOX})" inbox_complete
+INBOX_TOTAL="$(q "$BASE_INBOX_SQL")"
 if [[ "$INBOX_TOTAL" == "$EXPECTED_INBOX" ]]; then
-  pass "settlement inbox row count matches the prediction exactly (${INBOX_TOTAL})"
+  pass "base-collection inbox row count matches the prediction exactly (${INBOX_TOTAL})"
 else
-  fail "settlement inbox row count matches the prediction exactly" "expected=${EXPECTED_INBOX} actual=${INBOX_TOTAL:-error}"
+  fail "base-collection inbox row count matches the prediction exactly" "expected=${EXPECTED_INBOX} actual=${INBOX_TOTAL:-error}"
+fi
+RETRY_INBOX="$(q "SELECT count(*) FROM settlement_inbox i JOIN payment p ON i.bank_id = p.bank_id AND i.notification_id = p.collection_id || ':1' JOIN charge ch ON ch.id = p.charge_id JOIN subscription s ON s.id = ch.subscription_id JOIN customer c ON c.id = s.customer_id
+WHERE p.attempt = 2 AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '95') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '95'))")"
+if [[ "$RETRY_INBOX" == "$N_RETRY" ]]; then
+  pass "95-cohort attempt-2 settlements each landed one inbox row (${RETRY_INBOX})"
+else
+  fail "95-cohort attempt-2 settlements each landed one inbox row" "expected=${N_RETRY} actual=${RETRY_INBOX:-error}"
 fi
 inbox_relayed() { [[ "$(q 'SELECT count(*) FROM settlement_inbox WHERE published_at IS NULL')" == "0" ]]; }
 wait_for "every inbox row relayed to the settlements queue" inbox_relayed
@@ -558,7 +585,7 @@ fi
 
 # R23e: per-bank attribution. The compose default routing is bank-a: BE,FR;
 # bank-b: NL,IE — assert the stored attribution matches it row-for-row, and
-# each bank's inbox share matches its routed cohort exactly.
+# each bank's base-collection inbox share matches its routed cohort exactly.
 ROUTING_MISMATCH="$(q "SELECT count(*) FROM payment p JOIN charge ch ON ch.id = p.charge_id JOIN subscription s ON s.id = ch.subscription_id JOIN customer c ON c.id = s.customer_id
 WHERE p.channel = 'SEPA_DD' AND p.idempotency_key LIKE 'sub-%|' || to_char(current_date, 'YYYY-MM-DD')
   AND p.bank_id IS DISTINCT FROM CASE WHEN c.country IN ('BE','FR') THEN 'bank-a' ELSE 'bank-b' END")"
@@ -569,17 +596,17 @@ else
 fi
 for BANK in bank-a bank-b cardnet; do
   if [[ "$BANK" == "cardnet" ]]; then
-    EXPECTED_BANK_INBOX=$((N_CARD_AUTH + N_CARD_96))
+    EXPECTED_BANK_INBOX=$((N_CARD_AUTH - N_RETRY_CARD + N_CARD_96))
   else
     if [[ "$BANK" == "bank-a" ]]; then COUNTRIES="('BE','FR')"; else COUNTRIES="('NL','IE')"; fi
     EXPECTED_BANK_INBOX="$(q "SELECT count(*) + count(*) FILTER (WHERE right(c.debtor_iban, 2) = '96') FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id
 WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND c.country IN ${COUNTRIES}")"
   fi
-  ACTUAL_BANK_INBOX="$(q "SELECT count(*) FROM settlement_inbox WHERE bank_id = '${BANK}'")"
+  ACTUAL_BANK_INBOX="$(q "SELECT count(*) FROM settlement_inbox WHERE bank_id = '${BANK}' AND notification_id NOT LIKE '%|a%'")"
   if [[ -n "$EXPECTED_BANK_INBOX" && "$ACTUAL_BANK_INBOX" == "$EXPECTED_BANK_INBOX" ]]; then
-    pass "${BANK} inbox rows match its routed cohort exactly (${ACTUAL_BANK_INBOX})"
+    pass "${BANK} base inbox rows match its routed cohort exactly (${ACTUAL_BANK_INBOX})"
   else
-    fail "${BANK} inbox rows match its routed cohort exactly" "expected=${EXPECTED_BANK_INBOX:-error} actual=${ACTUAL_BANK_INBOX:-error}"
+    fail "${BANK} base inbox rows match its routed cohort exactly" "expected=${EXPECTED_BANK_INBOX:-error} actual=${ACTUAL_BANK_INBOX:-error}"
   fi
 done
 
@@ -640,6 +667,42 @@ for BANK_AND_PORT in "bank-a:${BANK_PORT}" "bank-b:${BANK_B_PORT}" "cardnet:${CA
   fi
 done
 
+# --- R26b: retriable failures re-collect as constraint-keyed attempts ---
+retry_cohort_recovered() {
+  local recovered
+  recovered="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '95') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '95')) AND s.status = 'active' AND s.grace_until IS NULL")"
+  [[ "$recovered" == "$N_RETRY" ]]
+}
+wait_for "95-cohort recovered to active with grace cleared (${N_RETRY})" retry_cohort_recovered
+
+RETRY_ATTEMPT_ONE_FAILED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id JOIN payment p ON p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(o.due_date, 'YYYY-MM-DD') WHERE o.due_date = current_date AND p.attempt = 1 AND p.status = 'failed' AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '95' AND p.failure_reason = 'AM04') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '95' AND p.failure_reason = 'insufficient_funds'))")"
+if [[ "$RETRY_ATTEMPT_ONE_FAILED" == "$N_RETRY" ]]; then
+  pass "every 95-cohort renewal failed attempt 1 with its retriable reason (${RETRY_ATTEMPT_ONE_FAILED})"
+else
+  fail "every 95-cohort renewal failed attempt 1 with its retriable reason" "expected=${N_RETRY} actual=${RETRY_ATTEMPT_ONE_FAILED:-error}"
+fi
+
+RETRY_ATTEMPT_TWO_SETTLED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id JOIN payment p ON p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(o.due_date, 'YYYY-MM-DD') || '|a2' WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '95') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '95')) AND p.status = 'succeeded' AND p.attempt = 2")"
+if [[ "$RETRY_ATTEMPT_TWO_SETTLED" == "$N_RETRY" ]]; then
+  pass "every 95-cohort renewal settled on attempt 2 (${RETRY_ATTEMPT_TWO_SETTLED})"
+else
+  fail "every 95-cohort renewal settled on attempt 2" "expected=${N_RETRY} actual=${RETRY_ATTEMPT_TWO_SETTLED:-error}"
+fi
+
+RETRIABLE_99_SUCCEEDED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id JOIN payment p ON (p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(o.due_date, 'YYYY-MM-DD') OR p.idempotency_key LIKE 'sub-' || o.subscription_id || '|' || to_char(o.due_date, 'YYYY-MM-DD') || '|a%') WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '99') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '99')) AND p.status = 'succeeded'")"
+if [[ "$RETRIABLE_99_SUCCEEDED" == "0" ]]; then
+  pass "no 99-cohort payment ever succeeded"
+else
+  fail "no 99-cohort payment ever succeeded" "count=${RETRIABLE_99_SUCCEEDED:-error}"
+fi
+
+HARD_OR_DISPUTE_RETRIES="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id JOIN payment p ON (p.idempotency_key = 'sub-' || o.subscription_id || '|' || to_char(o.due_date, 'YYYY-MM-DD') OR p.idempotency_key LIKE 'sub-' || o.subscription_id || '|' || to_char(o.due_date, 'YYYY-MM-DD') || '|a%') WHERE o.due_date = current_date AND p.attempt > 1 AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) IN ('98','97','96')) OR (c.payment_method = 'card' AND right(c.card_token, 2) IN ('98','96')))")"
+if [[ "$HARD_OR_DISPUTE_RETRIES" == "0" ]]; then
+  pass "hard-fail and dispute cohorts are never retried"
+else
+  fail "hard-fail and dispute cohorts are never retried" "count=${HARD_OR_DISPUTE_RETRIES:-error}"
+fi
+
 # --- R26a: terminal outcomes enter past_due grace exactly once by class ---
 N_PD_RETRIABLE="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '99') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '99'))")"
 N_PD_HARD="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND ((c.payment_method = 'sdd' AND right(c.debtor_iban, 2) IN ('98','97')) OR (c.payment_method = 'card' AND right(c.card_token, 2) = '98'))")"
@@ -664,7 +727,7 @@ dunning_retriable_metric_delta_matches() {
   local current
   current="$(consumer_prom_sum '^dunning_transitions_total\{class="retriable"')"
   [[ "$current" =~ ^[0-9]+$ ]] \
-    && (( current - M_DUNNING_RETRIABLE_BEFORE == N_PD_RETRIABLE ))
+    && (( current - M_DUNNING_RETRIABLE_BEFORE == N_PD_RETRIABLE + N_RETRY ))
 }
 dunning_hard_metric_delta_matches() {
   local current
@@ -679,9 +742,9 @@ dunning_dispute_metric_delta_matches() {
     && (( current - M_DUNNING_DISPUTE_BEFORE == N_PD_DISPUTE ))
 }
 if [[ "$M_DUNNING_RETRIABLE_BEFORE" =~ ^[0-9]+$ ]]; then
-  wait_for "dunning retriable transition delta matches its cohort exactly (${N_PD_RETRIABLE})" dunning_retriable_metric_delta_matches
+  wait_for "dunning retriable transition delta matches its cohort exactly (${N_PD_RETRIABLE} + ${N_RETRY})" dunning_retriable_metric_delta_matches
 else
-  fail "dunning retriable transition delta matches its cohort exactly (${N_PD_RETRIABLE})" \
+  fail "dunning retriable transition delta matches its cohort exactly (${N_PD_RETRIABLE} + ${N_RETRY})" \
     "invalid baseline=${M_DUNNING_RETRIABLE_BEFORE}"
 fi
 if [[ "$M_DUNNING_HARD_BEFORE" =~ ^[0-9]+$ ]]; then
@@ -697,11 +760,14 @@ else
     "invalid baseline=${M_DUNNING_DISPUTE_BEFORE}"
 fi
 
-FAILED_FINALIZED="$(q "SELECT count(*) FROM payment p JOIN charge c ON c.id = p.charge_id WHERE p.status = 'failed' AND c.status <> 'pending'")"
+# Since R26b a failed attempt legitimately shares its charge with a later
+# succeeded attempt, so the invariant is charge-shaped: finalization requires
+# a succeeded payment, never failures alone.
+FAILED_FINALIZED="$(q "SELECT count(*) FROM charge c WHERE c.status <> 'pending' AND NOT EXISTS (SELECT 1 FROM payment p WHERE p.charge_id = c.id AND p.status IN ('succeeded','charged_back'))")"
 if [[ "$FAILED_FINALIZED" == "0" ]]; then
-  pass "no failed payment has a finalized charge"
+  pass "no charge finalized without a succeeded payment"
 else
-  fail "no failed payment has a finalized charge" "count=${FAILED_FINALIZED:-error}"
+  fail "no charge finalized without a succeeded payment" "count=${FAILED_FINALIZED:-error}"
 fi
 
 FAILED_ADVANCED="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id
@@ -739,7 +805,11 @@ else
 fi
 
 note "same-day idempotency probe: re-triggering job, expecting zero new records…"
-SNAP_SQL="SELECT (SELECT count(*) FROM renewal_outbox) || '|' || (SELECT count(*) FROM payment) || '|' || (SELECT count(*) FROM charge) || '|' || (SELECT count(*) FROM invoice)"
+# Payment count is scoped to attempt 1: the dunning sweeper keeps creating
+# 99-cohort re-collection rows on its own clock (unbounded until R26c), and
+# those are not the renewal job's records — the probe asserts the JOB mints
+# nothing new.
+SNAP_SQL="SELECT (SELECT count(*) FROM renewal_outbox) || '|' || (SELECT count(*) FROM payment WHERE attempt = 1) || '|' || (SELECT count(*) FROM charge) || '|' || (SELECT count(*) FROM invoice)"
 SNAP_BEFORE="$(q "$SNAP_SQL")"
 trigger_job
 assert_trigger "idempotency re-trigger"

@@ -22,6 +22,7 @@ public class DunningLifecycle {
     private final JdbcTemplate jdbc;
     private final DunningProperties properties;
     private final Map<String, Counter> transitions;
+    private final Counter recoveries;
     private final AtomicLong pastDueDepth = new AtomicLong();
 
     public DunningLifecycle(
@@ -36,6 +37,9 @@ public class DunningLifecycle {
                     .register(meters));
         }
         this.transitions = Map.copyOf(counters);
+        this.recoveries = Counter.builder("dunning.recoveries")
+                .description("Subscriptions recovering from past_due grace")
+                .register(meters);
         Gauge.builder("subscriptions.past_due", pastDueDepth, AtomicLong::get)
                 .description("Subscriptions currently in past_due grace")
                 .register(meters);
@@ -52,6 +56,20 @@ public class DunningLifecycle {
             transitions.get(dunningClass).increment();
             log.info("Subscription {} entered past_due grace (class={}, reason={})",
                     subscriptionId, dunningClass, reason);
+        }
+    }
+
+    public void recoverFromGrace(UUID subscriptionId) {
+        // A grace deadline outside past_due is stale data that R26c's expiry
+        // sweep must never see, so recovery clears it atomically (D20).
+        int updated = jdbc.update("""
+                UPDATE subscription
+                SET status = 'active', grace_until = NULL
+                WHERE id = ? AND status = 'past_due'
+                """, subscriptionId);
+        if (updated == 1) {
+            recoveries.increment();
+            log.info("Subscription {} recovered from past_due grace", subscriptionId);
         }
     }
 
