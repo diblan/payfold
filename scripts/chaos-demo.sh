@@ -2,8 +2,8 @@
 # Narrated chaos demo for a RUNNING Payfold stack.
 #
 # Scenes: pipeline, poison isolation, worker loss, scale-out, broker restart,
-# chargebacks under slow/fast profiles, per-country slow-bank lag/drain, and
-# counterparty-amnesia recovery.
+# chargebacks under slow/fast profiles, per-country slow-bank lag/drain,
+# counterparty-amnesia recovery, and dunning recovery/cancellation.
 #
 # Usage:
 #   scripts/chaos-demo.sh [--auto] [--timeout SECONDS]
@@ -412,6 +412,49 @@ SQL
     return 0
   fi
   fail "scene ${scene_number} seeded ${bank} cohort" "unexpected psql output: ${seed_out}"
+  return 1
+}
+
+seed_dunning_cohort() {
+  local suffix="$1" n="$2" seed_out
+  note "seeding ${n} SDD suffix-${suffix} dunning subscriptions (emails chaos-9-${suffix}-${RUN_TAG}-<n>@example.test)…"
+  if ! seed_out="$(docker compose exec -T postgres psql -U "$PGUSER" -d "$PGDB" -v ON_ERROR_STOP=1 <<SQL
+WITH seed_plan AS (
+    SELECT id, interval FROM plan
+    WHERE interval = CASE WHEN (now() - interval '1 month') + interval '1 month' = now()
+                          THEN 'month' ELSE 'year' END
+    ORDER BY name LIMIT 1
+), new_customers AS (
+    INSERT INTO customer (
+        id, email, name, payment_method, debtor_iban, mandate_reference, country
+    )
+    SELECT gen_random_uuid(),
+           'chaos-9-${suffix}-${RUN_TAG}-' || n || '@example.test',
+           'Chaos 9 Suffix ${suffix} Customer ' || n,
+           'sdd',
+           'BE68' || lpad(n::text, 10, '0') || '${suffix}',
+           'MNDT-CHAOS-9-${suffix}-' || n,
+           'BE'
+    FROM generate_series(1, ${n}) n
+    RETURNING id
+)
+INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
+SELECT gen_random_uuid(), c.id, (SELECT id FROM seed_plan), 'active',
+       CASE WHEN (SELECT interval FROM seed_plan) = 'year'
+            THEN now() - INTERVAL '1 year' ELSE now() - INTERVAL '1 month' END
+FROM new_customers c;
+ANALYZE customer;
+ANALYZE subscription;
+SQL
+)"; then
+    fail "scene 9 seeded suffix-${suffix} cohort" "psql failed: ${seed_out}"
+    return 1
+  fi
+  if echo "$seed_out" | grep -q "INSERT 0 ${n}$"; then
+    pass "scene 9 seeded suffix-${suffix} cohort (${n} SDD renewals)"
+    return 0
+  fi
+  fail "scene 9 seeded suffix-${suffix} cohort" "unexpected psql output: ${seed_out}"
   return 1
 }
 
@@ -942,6 +985,91 @@ if [[ "$SCENE_8_RESUBMITTED_AFTER" =~ ^[0-9]+$ ]] \
 else
   fail "scene 8 recovery visibly resubmitted at least one forgotten collection" \
     "before=${SCENE_8_RESUBMITTED_BEFORE} after=${SCENE_8_RESUBMITTED_AFTER}"
+fi
+
+pause_between_scenes
+
+scene 9 "Dunning (D16/R26): a retriable failure recovers on re-collection; bounded exhaustion cancels"
+note "Watch the past-due gauge rise and fall, and the cancellations-by-cause panel tick when the 99 cohort exhausts."
+SCENE_9_SIZE=20
+DUNNING_MAX="$(env_val DUNNING_MAX_ATTEMPTS 3)"
+seed_dunning_cohort 95 "$SCENE_9_SIZE" || summary
+seed_dunning_cohort 99 "$SCENE_9_SIZE" || summary
+
+SCENE_9_EXHAUSTED_BEFORE="$(consumer_sum '^dunning_cancellations_total\{cause="exhausted"')"
+if [[ "$SCENE_9_EXHAUSTED_BEFORE" =~ ^[0-9]+$ ]]; then
+  pass "scene 9 exhausted-cancellations baseline captured (${SCENE_9_EXHAUSTED_BEFORE})"
+else
+  fail "scene 9 exhausted-cancellations baseline captured" "value=${SCENE_9_EXHAUSTED_BEFORE}"
+  summary
+fi
+
+trigger_and_wait "scene 9 renewal job trigger" || summary
+wait_until "scene 9 outbox fully published" outbox_drained || summary
+
+# The failed collections cluster within a few seconds while the earliest
+# re-collection waits out DUNNING_RETRY_DELAY_SECONDS, so the whole cohort is
+# simultaneously past_due for a comfortably pollable window.
+scene_9_95_past_due() {
+  [[ "$(q "SELECT count(*) FROM subscription s
+JOIN customer c ON c.id = s.customer_id
+WHERE c.email LIKE 'chaos-9-95-${RUN_TAG}-%@example.test'
+  AND s.status = 'past_due'")" == "$SCENE_9_SIZE" ]]
+}
+wait_until "scene 9 the whole 95 cohort visibly failed into past_due grace (${SCENE_9_SIZE})" scene_9_95_past_due || summary
+
+scene_9_95_recovered() {
+  [[ "$(q "SELECT count(*) FROM subscription s
+JOIN customer c ON c.id = s.customer_id
+JOIN charge ch ON ch.subscription_id = s.id
+JOIN payment p ON p.charge_id = ch.id AND p.attempt = 2
+WHERE c.email LIKE 'chaos-9-95-${RUN_TAG}-%@example.test'
+  AND s.status = 'active' AND s.grace_until IS NULL
+  AND p.status = 'succeeded'")" == "$SCENE_9_SIZE" ]]
+}
+wait_until "scene 9 the 95 cohort recovered to active on its settled re-collection (${SCENE_9_SIZE})" scene_9_95_recovered
+
+scene_9_99_canceled() {
+  [[ "$(q "SELECT count(*) FROM subscription s
+JOIN customer c ON c.id = s.customer_id
+WHERE c.email LIKE 'chaos-9-99-${RUN_TAG}-%@example.test'
+  AND s.status = 'canceled' AND s.grace_until IS NULL")" == "$SCENE_9_SIZE" ]]
+}
+wait_until "scene 9 the 99 cohort exhausted into cancellation with grace cleared (${SCENE_9_SIZE})" scene_9_99_canceled
+
+SCENE_9_99_ROWS_SQL="SELECT count(*) FROM payment p
+JOIN charge ch ON ch.id = p.charge_id
+JOIN subscription s ON s.id = ch.subscription_id
+JOIN customer c ON c.id = s.customer_id
+WHERE c.email LIKE 'chaos-9-99-${RUN_TAG}-%@example.test'"
+SCENE_9_99_ATTEMPTS="$(q "${SCENE_9_99_ROWS_SQL}
+  AND p.status = 'failed' AND p.failure_reason = 'AM04'")"
+if [[ "$SCENE_9_99_ATTEMPTS" == "$((SCENE_9_SIZE * DUNNING_MAX))" ]]; then
+  pass "scene 9 every 99 renewal made exactly DUNNING_MAX_ATTEMPTS failed AM04 attempts (${SCENE_9_99_ATTEMPTS})"
+else
+  fail "scene 9 every 99 renewal made exactly DUNNING_MAX_ATTEMPTS failed AM04 attempts" \
+    "expected=$((SCENE_9_SIZE * DUNNING_MAX)) actual=${SCENE_9_99_ATTEMPTS:-error}"
+fi
+
+scene_9_exhausted_delta() {
+  local current
+  current="$(consumer_sum '^dunning_cancellations_total\{cause="exhausted"')"
+  [[ "$current" =~ ^[0-9]+$ ]] \
+    && (( current - SCENE_9_EXHAUSTED_BEFORE == SCENE_9_SIZE ))
+}
+wait_until "scene 9 exhausted-cancellations counter ticked exactly ${SCENE_9_SIZE}" scene_9_exhausted_delta
+
+# Canceled is terminal: across a full sweep interval no further collection may
+# be attempted for the exhausted cohort.
+DUNNING_SWEEP_MS="$(env_val DUNNING_SWEEP_INTERVAL_MS 10000)"
+SCENE_9_ROWS_BEFORE_HOLD="$(q "$SCENE_9_99_ROWS_SQL")"
+sleep $((DUNNING_SWEEP_MS / 1000 + 5))
+SCENE_9_ROWS_AFTER_HOLD="$(q "$SCENE_9_99_ROWS_SQL")"
+if [[ -n "$SCENE_9_ROWS_BEFORE_HOLD" && "$SCENE_9_ROWS_BEFORE_HOLD" == "$SCENE_9_ROWS_AFTER_HOLD" ]]; then
+  pass "scene 9 canceled subscriptions were never re-collected across a full sweep interval (${SCENE_9_ROWS_AFTER_HOLD} rows)"
+else
+  fail "scene 9 canceled subscriptions were never re-collected across a full sweep interval" \
+    "before=${SCENE_9_ROWS_BEFORE_HOLD:-error} after=${SCENE_9_ROWS_AFTER_HOLD:-error}"
 fi
 
 echo

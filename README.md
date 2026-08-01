@@ -156,6 +156,22 @@ scripts/verify.sh --no-up --timeout 3600
 scripts/load-test.sh 50000
 ```
 
+## Dunning: failed collections get a lifecycle
+
+Terminal payment failures don't dead-end. Every failure reason maps to a
+dunning class (`retriable`, `hard_fail`, `dispute`), and any terminal failure
+moves the subscription to `past_due` with a class-specific grace deadline.
+Retriable failures re-collect on a schedule as new constraint-keyed payment
+attempts through the normal settlement spine — a settled re-collection returns
+the subscription to `active` — and stop at `DUNNING_MAX_ATTEMPTS` total
+attempts, after which the sweeper cancels the subscription as exhausted.
+Everything else is canceled when its grace deadline expires. All windows are
+env-tunable seconds (fast for verify, visible for demo); `scripts/verify.sh`
+predicts the exact end state of every seeded cohort from IBAN/token suffix
+arithmetic alone — recovered, exhausted-canceled, or grace-expired-canceled —
+and asserts the counts, and chaos-demo scene 9 shows the same arc live on the
+dashboard.
+
 ## Run the chaos demo
 
 One command demonstrates the failure modes the architecture exists for —
@@ -171,6 +187,15 @@ chargebacks leave payments
 advanced before restoring the fast profile. Scene 7 then sends equal clean SDD
 cohorts through the country registry: BE clears through fast bank-a while NL is
 still visibly `submitted` at slow bank-b, whose backlog subsequently drains.
+Scene 8 recreates a counterparty container mid-flight — its in-memory state is
+gone, and the pull-shaped recovery sweeper re-queries and resubmits until
+nothing stays stranded. Scene 9 tells the dunning story end to end: a
+suffix-95 SDD cohort fails its first collection, visibly parks `past_due` on
+the dashboard gauge, and returns to `active` when its scheduled re-collection
+settles, while a suffix-99 cohort that never settles makes exactly
+`DUNNING_MAX_ATTEMPTS` bounded attempts and is canceled as exhausted — with
+the cancellations-by-cause panel ticking and no further collection ever
+attempted.
 Every scene *asserts* its invariant (exact card/SDD per-row terminal states,
 DLQ depths, per-replica counters, and per-bank lag) rather than just showing it;
 watch it live on the provisioned Grafana dashboard at

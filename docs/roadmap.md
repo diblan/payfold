@@ -458,6 +458,8 @@ don't clone repos. The demo script makes recording reproducible, so re-recording
 after [R23](#r23) reshapes the flow is cheap and expected.
 **Done when:** the README embeds (or links) the recording near the top and every
 claim shown matches the measured numbers in quality.md/README.
+*Re-record note (2026-08-01, [R26d](#r26d)): the demo now ends with the dunning
+scene — record after R26d so the recording covers recovery and cancellation.*
 
 <a id="r27"></a>
 ### [x] R27 — chaos-demo scene 2: backlog precondition races the management API
@@ -502,7 +504,7 @@ demonstrably reaches its bank-side terminal state without manual
 intervention, bounded-time; verify.sh models the recovery deterministically.
 
 <a id="r26"></a>
-### [ ] R26 — Dunning: failed collections get a lifecycle ([D16](decisions.md#d16)) *(epic — split 2026-08-01 into R26a–R26d below; check when all four are checked)*
+### [x] R26 — Dunning: failed collections get a lifecycle ([D16](decisions.md#d16)) *(epic — split 2026-08-01 into R26a–R26d below; all four checked 2026-08-01)*
 **Scope (promotion-level):** consumes [R23](#r23)'s terminal outcomes — no new
 service, no notification channels. Per-reason retry policy (AM04 insufficient
 funds retriable on a schedule; AC04 closed account and MD01 no mandate are not),
@@ -585,7 +587,7 @@ subscription is never re-collected; re-running the sweeper is a no-op
 ([G2](invariants.md#g2)).
 
 <a id="r26d"></a>
-### [ ] R26d — The dunning story: chaos scene + README
+### [x] R26d — The dunning story: chaos scene + README
 **Scope:** `scripts/chaos-demo.sh` gains a dunning scene: the suffix-95 cohort
 visibly fails, goes `past_due` on the dashboard, recovers on retry; the 99
 cohort exhausts into cancellation — both asserted, not narrated ([R22](#r22)
