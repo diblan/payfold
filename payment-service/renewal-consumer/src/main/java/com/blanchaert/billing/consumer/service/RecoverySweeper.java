@@ -54,7 +54,11 @@ public class RecoverySweeper {
         this.noopSweeps = sweepCounter(meters, "noop");
     }
 
-    @Scheduled(fixedDelayString = "${recovery.sweep-interval-ms:60000}")
+    // Spring fires a fixedDelay task's FIRST run at scheduler startup; the
+    // initial delay pushes it one full interval out so a long test interval
+    // structurally silences the schedule (R35).
+    @Scheduled(fixedDelayString = "${recovery.sweep-interval-ms:60000}",
+            initialDelayString = "${recovery.sweep-interval-ms:60000}")
     public void sweep() {
         sweepOnce();
     }

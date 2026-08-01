@@ -701,6 +701,31 @@ least one series after the run's load (bounded poll for scrape-interval lag,
 explicit allowlist, decided at execution); a deliberately broken panel query
 demonstrably fails verification; a tightening per [G7](invariants.md#g7).
 
+<a id="r35"></a>
+### [x] R35 — Sweepers' immediate initial tick races the integration tests
+**Scope:** `DunningSweeper` and `RecoverySweeper` `@Scheduled` annotations;
+config truth-table wording ([G6](invariants.md#g6)); no schema or contract changes.
+Spring fires a `fixedDelay` task's FIRST execution immediately at scheduler
+startup — the test suites' 3600000 ms intervals only space *subsequent* ticks.
+On the first CI run of the [R26b](#r26b) suite (2026-08-01, build 30706457574)
+the consumer's single scheduler thread (shared with the 500 ms inbox relay and
+the 10 s `past_due` gauge refresh) delayed `DunningSweeper`'s initial tick ~9 s
+into the run, landing it inside `DunningRetryIntegrationTest`'s first test
+method between the `@BeforeEach` stub wipe and the test's own stub: the tick
+picked the freshly seeded fixture, POSTed to a stub-less WireMock (journaled as
+unmatched), got 404 → `BankSubmissionException` → the [D20](decisions.md#d20)
+rollback discarded the attempt row (the constraint design held — no orphan, no
+double row), and the test's `sweepOnce()` then re-picked and submitted:
+journal count 2 where the test asserts exactly 1. Local runs boot fast enough
+that the initial tick fires before any fixture exists — the red is
+scheduler-timing-dependent. `RecoverySweeper` has the same immediate initial
+tick and the same latent exposure in its own suite.
+**Done when:** both sweepers' first scheduled execution fires one full
+interval after startup (`initialDelayString` = the interval property), making
+a long test interval structurally silence the schedule; the consumer suite is
+green; verify.sh green (the compose-level first-sweep shift is ≤ one 10 s
+interval, absorbed by the existing bounded polls).
+
 <a id="r34"></a>
 ### [ ] R34 — Chaos-demo terminal predictions predate the 95 re-collection cohort
 **Scope:** `scripts/chaos-demo.sh` only; no service changes.

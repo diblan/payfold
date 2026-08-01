@@ -55,7 +55,11 @@ public class DunningSweeper {
                 "duplicate", retryCounter(meters, "duplicate"));
     }
 
-    @Scheduled(fixedDelayString = "${dunning.sweep-interval-ms:60000}")
+    // Spring fires a fixedDelay task's FIRST run at scheduler startup; the
+    // initial delay pushes it one full interval out so a long test interval
+    // structurally silences the schedule (R35).
+    @Scheduled(fixedDelayString = "${dunning.sweep-interval-ms:60000}",
+            initialDelayString = "${dunning.sweep-interval-ms:60000}")
     public void sweep() {
         sweepOnce();
     }
