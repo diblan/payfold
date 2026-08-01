@@ -577,3 +577,77 @@ the right reason, settled attempt 2, subscription re-`active` with grace
 cleared) plus never-retried proofs for hard-fail/dispute; nothing about the
 99 cohort's attempt COUNT is asserted (timing-shaped), only its invariants
 (never succeeded, still `past_due`).
+
+## D21 — R26c execution design: cancellation as a second sweeper act; exhaustion beats expiry by measured margin — 2026-08-01 — active
+<a id="d21"></a>
+Execution-level decisions for [R26c](roadmap.md#r26c), within the R26 epic's
+pre-decided spine. Committed before implementation (the [D19](#d19)/[D20](#d20)
+pattern).
+
+**Enforcement lives in the sweeper tick, as two set-based passes after the
+retry pass:** same advisory xact lock, same cadence, no second scheduled task.
+Pass one cancels **exhaustion** (subscription `past_due`, latest attempt
+`failed` with a retriable reason, `attempt >= dunning.max-attempts`); pass two
+cancels **expiry** (`past_due` and `grace_until < now()`), class-blind by
+design — grace enforcement applies to all classes, and expiry doubles as the
+retriable backstop. Order matters: exhaustion first, so a 99 that satisfies
+both predicates gets the specific verdict. The retry picker gains the
+complement bound (`attempt < max`), making picker and canceler disjoint by
+construction. Status moves live in `DunningLifecycle`
+(`cancelExhausted`/`cancelExpired`, single guarded UPDATEs), keeping the
+existing split: the sweeper picks and submits, the lifecycle transitions.
+Cancellation is idempotent by predicate — a canceled row has left `past_due`,
+so re-running either pass (or the whole sweeper) is structurally a no-op.
+
+**The 99 exhaustion-vs-expiry race is settled by retuned compose margins:**
+`DUNNING_MAX_ATTEMPTS` application default 4 (rulebook-plausible), compose 3;
+`DUNNING_RETRIABLE_GRACE_SECONDS` compose 60 → 120. Against the measured R26b
+cadence (re-collect cycle 25–30 s, sweep 10 s, delay 15 s), a 99 exhausts at
+first-failure +40..75 s — inside the 120 s grace with ≥ 45 s margin — while
+`hard_fail`/`dispute` keep 60 s and expiry-cancel at +60..70 s. The 95
+recovery (measured max 31 s) sits 4× inside the retuned grace. verify.sh
+asserts the bet: cause attribution is exact, so a straggler 99 falling to the
+expiry backstop is a red, not a shrug.
+
+**Cancellation clears `grace_until` to NULL** ([D20](#d20): a deadline outside
+`past_due` is stale data); the cause is carried by
+`dunning.cancellations{cause=exhausted|grace_expired}` (eager-registered like
+its siblings) plus one count-level log line per sweep, never per row. The
+dashboard gains a "Dunning cancellations by cause" panel
+(`sum by (cause) (dunning_cancellations_total)`) beside the transitions and
+past-due panels. **No new migration:** `canceled` is V1 vocabulary and
+`grace_until` is V10 — nothing schema-shaped moves.
+
+**Terminality under late signals:** `canceled` is invisible to the retry
+picker (status predicate), to `enterGrace` (fires on `active` only), and to
+`recoverFromGrace` (fires on `past_due` only) — a settlement landing after
+cancellation finalizes its payment row but never resurrects the subscription;
+an explicit test proves the reordered-signal no-op ([G2](invariants.md#g2)
+spirit).
+
+**verify.sh reconciliation, enumerated in the spec (the R26b lesson):**
+- *Reshaped:* the R26a end-state block becomes the cancellation matrix —
+  bounded wait until canceled == the suffix arithmetic (99 + card-99 →
+  exhausted; 98/97 + card-98 and 96 + card-96 → grace-expired), then
+  `past_due` == 0 for the due cohort; the grace-deadline check becomes "no
+  canceled subscription retains `grace_until`". The idempotency snapshot
+  drops its R26b-era `attempt = 1` scoping back to all-rows exactness — the
+  sweeper is provably quiescent by then (a [G7](invariants.md#g7) tightening).
+- *New:* per-cause cancellation metric deltas (exhausted == the 99 family,
+  grace_expired == hard-fail + dispute families); bounded 99-family attempt
+  arithmetic (exactly max−1 re-collection rows per 99, each failed with the
+  class reason; SDD-99 adds exactly (max−1)×N |a-family inbox rows, card-99
+  declines synchronously and adds none); a steady-state proof — total payment
+  count frozen across a full sweep interval plus margin (the churn-stops
+  claim made assertable).
+- *Unchanged on purpose:* terminal-prediction SQLs (payment-level truth),
+  cumulative `dunning_transitions_total` deltas (entries into grace),
+  the 95-recovery block, base-family inbox exactness, never-retried and
+  never-succeeded proofs, and the stuck-submitted check (base-scoped by its
+  LIKE anchor).
+
+**Platform-visible config drift, flagged:** `DUNNING_MAX_ATTEMPTS` is a new
+truth-table row; the retriable-grace retune changes a compose default the
+platform repo mirrors. Only the consumer image (plus compose/env) changes —
+tag v0.9.0 expected; the mock-bank needs nothing (the 99 rule already fails
+every attempt; only the 95 rule is attempt-indexed).
