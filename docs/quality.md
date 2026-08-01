@@ -19,10 +19,10 @@ Last full re-grade: **2026-07-31** (R13 entropy pass, after the R23 epic, R27, a
 | Module | Grade | Why | Tracked by |
 |---|---|---|---|
 | `billing-engine/renewal-producer` | **A** | Tested (smoke, confirm-gating, return-gating, unroutable-return, competing-publisher, async-trigger, keyset-scan — its payload asserts now follow the clamp-day seed interval, [R31](roadmap.md#r31) — channel-parking, and in-flight-window suites, on Testcontainers 2.x with no machine-local Docker pins), observable (eager counters + built-in batch timers), documented; scan and publish both page in bounded memory and the 1M-row producer run is measured (see “Measured scale runs”); unroutable messages are returned, logged, counted, and re-picked instead of silently confirm-dropped; the publish page holds a bounded channel budget under a slow-confirming broker ([R25](roadmap.md#r25)) instead of piling channels to the broker's channelMax; no known behavior defects | — |
-| `payment-service/renewal-consumer` | **A** | Tested (real-broker integration plus direct-service grace coverage for retriable, hard-fail, dispute, reordered chargeback, settled no-op, and redelivery idempotency; recovery sweeper inbox synthesis, 404 resubmission, freshness, and race dedupe; bounded DLQs and routing), observable (eager renewal, webhook, settlement, recovery, and class-tagged dunning counters; past-due gauge; latency/listener timers and dashboard panels), and documented; both methods share one terminal grace lifecycle while preserving period math; no known behavior defects | — |
+| `payment-service/renewal-consumer` | **A** | Tested (real-broker integration plus direct-service grace coverage for retriable, hard-fail, dispute, reordered chargeback, settled no-op, and redelivery idempotency; recovery sweeper inbox synthesis, 404 resubmission, freshness, scheduled-state noop, and race dedupe; bounded DLQs and routing), observable (eager renewal, webhook, settlement, recovery, and class-tagged dunning counters; past-due gauge; latency/listener timers and dashboard panels), and documented; both methods share one terminal grace lifecycle while preserving period math; overload at a counterparty is backpressure (blocked listener threads under a 10 s budget), never poison ([D19](decisions.md#d19)); no known behavior defects | — |
 | `db-migrations` | **B** | Clean, ordered, sole schema authority; since R18 also ships as the `payfold-migrations` Job image (SQL baked at build, FLYWAY_* env config), whose no-op re-run `verify.sh` asserts; V6 adds customer payment methods and submitted-payment attribution, V7–V8 add settlement, V9 adds/backfills tokenized card references, and V10 adds the dunning grace deadline plus a partial past-due index; V1 carries aspirational tables (`bank_tx`, `recon_match`, `ledger_entry`) no code uses — harmless but reviewer-confusing | — |
 | `seed-data-gen` | **B** | Seed size parameterized (`SEED_CUSTOMERS`, default 15k, all due today); payment-method, rule-bearing IBAN/card-token shares, and suffix-94 silent shares use deterministic customer-number arithmetic with no RNG; card suffixes cycle exact auth/chargeback cases, while SDD rows keep card tokens null; emails remain collision-safe across top-ups; the R18 Job image and R16 clamp-day-safe due seeding remain unchanged. No test harness of its own — the arithmetic is checked by end-to-end exact outcome and recovery assertions | — |
-| `mock-bank/` (FastAPI) | **B** | One counterparty image implements `sepa_core` and `card`: deterministic IBAN settlement rules plus token-derived synchronous authorization, async card settlement/chargeback, HMAC-signed delivery, bounded exponential retry, duplicate stored-verdict semantics, and loud give-up metrics; pytest covers both schemes including default/decline/chargeback/silent rules, no-notification declines, suppressed delivery, ordered callbacks, duplicates, and model isolation; compose healthchecks all three instances. In-memory pending-delivery loss is now modeled by the silent rule and recovered by the consumer sweeper's re-query/resubmit path | — |
+| `mock-bank/` (FastAPI) | **B** | One counterparty image implements `sepa_core` and `card`: deterministic IBAN settlement rules plus token-derived synchronous authorization, async card settlement/chargeback, HMAC-signed delivery, bounded exponential retry, duplicate stored-verdict semantics, and loud give-up metrics; pytest covers both schemes including default/decline/chargeback/silent rules, no-notification declines, suppressed delivery, ordered callbacks, duplicates, and model isolation; compose healthchecks all three instances. In-memory pending-delivery loss is now modeled by the silent rule and recovered by the consumer sweeper's re-query/resubmit path. Scales past one event loop via `BANK_WORKERS` uvicorn processes with worker-aggregated `/metrics` — worker-safe because records are a cache over deterministic outcomes, not truth ([D19](decisions.md#d19)); the measured conc-8 100k run keeps it off the critical path | — |
 | `docker-compose.yaml` + config | **B** | Stack ordering and healthchecks pass; yaml contains only consumed keys; flyway and seed-data run the published image shapes; bank-a, bank-b, and cardnet share the scheme-aware image; deterministic seed shares plus verify/demo-fast recovery and per-class dunning grace overrides are explicit; Prometheus/Grafana expose recovery and dunning alongside the scale-safe consumer ports and confirm-gated settlement relay | — |
 | `docs/` + harness | **B** | CI uses pinned Maven wrappers and real-container integration suites; `verify.sh` covers trigger/idempotency/poison behavior, exact token- and IBAN-predicted outcomes and reasons, method-tagged renewal counters, zero-stuck and inbox reconciliation, suffix-94 recovery provenance/counter exactness, and due-cohort exact `past_due` deadlines plus fleet-summed per-class transition deltas; `scripts/chaos-demo.sh` keeps eight asserted scenes, including live counterparty-amnesia recovery without manual intervention | — |
 
@@ -80,6 +80,26 @@ including the async trigger-then-poll happy path, same-day idempotency, a strict
 exact deterministic card-token and SDD-IBAN outcome assertions.
 
 ## Measured scale runs
+
+- **2026-08-01 — concurrency-8 after the counterparty capacity fix (R32, the
+  commit this entry ships in; WSL2 Docker Compose stack).** The [R30](roadmap.md#r30)
+  collapse run re-executed on the [D19](decisions.md#d19) design (cardnet at 4
+  uvicorn workers, submit timeout 2 s → 10 s, sweeper scheduled-state noop):
+  fresh-boot 100k, `CONSUMER_LISTENER_CONCURRENCY=8`, full
+  `verify.sh --no-up --timeout 3600` green (151 checks) with **zero
+  dead-lettered renewals and zero submit timeouts** — average submit round
+  trip ≈ 53 ms (8 threads at ~150/s), so the counterparty is off the critical
+  path. Drain 100,000 in **638 s = 157/s** (~190/s two-minute warm-up,
+  ~145–155/s sustained, no oscillation); end-to-end completion **1,739 s** —
+  the ~18-minute settlement tail is the single JVM's inbox relay + settlement
+  listener working through the backlog the drain built (the 3-replica fleet
+  runs three relays; this run runs one). Both silent cohorts (2,000 SDD +
+  2,000 card) recovered exactly through the sweeper across the 4-worker
+  record partition. Honest reading: conc-8 drain now ~equals the 3×1 fleet's
+  156/s — on one host the ceiling has moved from the counterparty mock to the
+  shared substrate (one Postgres absorbing every write, one JVM doing
+  submit + webhook + relay + settle), which is where a single-machine demo
+  should cap.
 
 - **2026-08-01 — async-spine re-measurement (R30, the commit this entry ships
   in; WSL2 Docker Compose stack).** Since [R23f](roadmap.md#r23f) a consume is

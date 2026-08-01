@@ -114,6 +114,7 @@ services:
     environment:
       BANK_ID: cardnet
       BANK_SCHEME: card
+      BANK_WORKERS: ${CARDNET_WORKERS:-4}
       BANK_WEBHOOK_URL: http://renewal-consumer:8080/webhooks/bank/cardnet
       BANK_WEBHOOK_SECRET: ${CARDNET_WEBHOOK_SECRET:-payfold-dev-secret-card}
       BANK_SETTLEMENT_DELAY_SECONDS: ${CARDNET_SETTLEMENT_DELAY_SECONDS:-1}

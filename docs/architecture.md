@@ -22,7 +22,7 @@ Honesty table:
 | Operational observability | Demonstrated — SLF4J logging, Prometheus counters + built-in job/listener timers, `verify.sh` cross-checks metric deltas against DB deltas |
 | Throughput at 330k/day | Measured end to end on the async spine ([R30](roadmap.md#r30), 2026-08-01) — producer: 1,015,000 due rows scanned + published in 459 s wall, peak heap 183 MiB; consumer: 100,000 due-today renewals drained in 1,606 s (62/s, ~58/s sustained) with end-to-end settlement completion at 1,639 s (zero stuck `submitted`, recovery cohort included), so a 330k night is ~2.5 min of publishing plus ~1.5 h of draining — 15–16× the 3.8/s requirement average, settled ~half a minute after the last consume. Single-node WSL2 dev-laptop numbers; the consumer is the binding constraint (see quality.md "Measured scale runs") |
 | Horizontal producer scaling | Demonstrated — `FOR UPDATE SKIP LOCKED` page claims + advisory-lock cron guard; exactly-once under two concurrent publishers proven by test (compose still runs a single producer instance) |
-| Consumer scaling levers | Re-measured on the async spine ([R30](roadmap.md#r30), 2026-08-01) — 3 same-host replicas at concurrency 1: 100k drained in 642 s (156/s, ~2.5× the 62/s baseline; RabbitMQ round-robin split 33,338/33,307/33,355), end-to-end settled in 675 s, full verify.sh-green with fleet-summed exact checks. Listener concurrency ×8: measured collapse, not throughput — the consume burst saturates the single-worker mock counterparties and bounded retries dead-letter good renewals; blocked on [R32](roadmap.md#r32) (the retired 524/s figure was WireMock-era). Same-host replicas contend for one machine; true multi-node scaling is the external platform repo's KEDA demonstration |
+| Consumer scaling levers | Re-measured on the async spine ([R30](roadmap.md#r30), 2026-08-01) — 3 same-host replicas at concurrency 1: 100k drained in 642 s (156/s, ~2.5× the 62/s baseline; RabbitMQ round-robin split 33,338/33,307/33,355), end-to-end settled in 675 s, full verify.sh-green with fleet-summed exact checks. Listener concurrency ×8 ([R32](roadmap.md#r32), 2026-08-01): 100k drained in 638 s (157/s, ~150/s sustained), settled in 1,739 s, zero dead-letters and zero submit timeouts on the [D19](decisions.md#d19) design (4-worker cardnet, 10 s timeout budget) — the earlier measured collapse is retired, and both levers now cap at the shared single-host substrate (~156/s; the retired 524/s figure was WireMock-era). Same-host replicas contend for one machine; true multi-node scaling is the external platform repo's KEDA demonstration |
 
 ## Component map
 
@@ -456,13 +456,17 @@ environment variables; there is no `application.yaml`:
 | `BANK_CHARGEBACK_LAG_SECONDS` | `5.0` | Additional delay before sequence 2 |
 | `BANK_WEBHOOK_RETRY_MAX_ATTEMPTS` | `5` | Bounded delivery-attempt cap |
 | `BANK_WEBHOOK_RETRY_BACKOFF_SECONDS` | `0.5` | Initial exponential-retry delay |
+| `BANK_WORKERS` | `1` | uvicorn worker count; compose raises cardnet's via `CARDNET_WORKERS` (default 4). Worker-safe without shared state: outcomes and notification ids are deterministic, so a cross-worker miss replays the amnesia paths ([D19](decisions.md#d19)) |
 
 The SEPA delivery surface is an explicit PSP-style fiction: real banks commonly
 report over file channels such as EBICS, with pain.002 and camt.054 batches.
 Payfold borrows that vocabulary while emitting JSON webhooks to keep the
 distributed-systems behavior inspectable. The exercised `BANK_SCHEME` seam is
 what lets cards and SDD share one image without pretending their first signal has
-the same semantics.
+the same semantics. Bank `/metrics` aggregates across workers via
+prometheus_client's multiprocess collector (`PROMETHEUS_MULTIPROC_DIR`, baked into
+the image); Prometheus does not scrape the banks — the endpoint serves verify.sh
+and live forensics, which need the fleet sum.
 
 ## Observability
 
@@ -610,7 +614,7 @@ Every runtime configuration key below has a real consumer.
 | `app.timezone`, `app.scheduleCron`, `app.scanPageSize`, `app.publishPageSize`, `app.publishInFlightLimit`, `app.confirmTimeoutMs` (producer) | `RenewalScheduler`, `RenewalJobConfig`, `RenewalJobEndpoint` | alive |
 | `rabbitmq.exchange`, `rabbitmq.routingKey` (producer) | `RabbitConfig`, `OutboxPublisher` | alive |
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |
-| `bank.timeout-ms` (consumer) | `BankProperties`, `BankClient` connect + read timeout | alive |
+| `bank.timeout-ms` (consumer) | `BankProperties`, `BankClient` connect + read timeout; 10 s — polices hung counterparties, while overload backpressure comes from blocked listener threads ([D19](decisions.md#d19)) | alive |
 | `bank.registry[]` id/scheme/base URL/webhook secret/countries (consumer) | `BankProperties`, `BankRegistry`, `BankClient`, `BillingService`, `BankWebhookController`; `countries` is required only for `sepa_core`, and the registry requires exactly one `card` entry; compose overrides indexed `BANK_REGISTRY_*` env vars | alive |
 | `RECOVERY_STALE_AFTER_SECONDS` (consumer; yaml `recovery.stale-after-seconds`) | `RecoveryProperties`, `RecoverySweeper`; compose overrides the 300 s application default with 30 s for verify/demo | alive |
 | `RECOVERY_SWEEP_INTERVAL_MS` (consumer; yaml `recovery.sweep-interval-ms`) | `RecoveryProperties`, `RecoverySweeper`; compose overrides the 60000 ms application default with 10000 ms for verify/demo | alive |
@@ -699,7 +703,7 @@ architecture-independent jar once instead of emulating Maven under QEMU.
 | `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, indexed `BANK_REGISTRY_*` including scheme, `RECOVERY_STALE_AFTER_SECONDS`, `RECOVERY_SWEEP_INTERVAL_MS`, the three `DUNNING_*_GRACE_SECONDS`, `TZ` |
 | `payfold-migrations` | `flyway/flyway:11` + `db-migrations/V*.sql`, `CMD ["migrate"]` | run-to-completion Job; exit 0 = success; re-run on a current schema is a no-op (asserted by `verify.sh`) | `FLYWAY_URL`, `FLYWAY_USER`, `FLYWAY_PASSWORD`, `FLYWAY_CONNECT_RETRIES` (image default 30) |
 | `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS`, `SEED_SDD_PERCENT`, `SEED_SDD_RULE_PERCENT`, `SEED_SDD_SILENT_PERCENT`, `SEED_CARD_RULE_PERCENT`, `SEED_CARD_SILENT_PERCENT` |
-| `payfold-mock-bank` | FastAPI mock counterparty (source + pinned pure-python deps) | long-running service; port 8080, `/health`; compose runs two SEPA instances and one card instance | `BANK_ID`, `BANK_SCHEME`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `BANK_WEBHOOK_RETRY_MAX_ATTEMPTS`, `BANK_WEBHOOK_RETRY_BACKOFF_SECONDS`, `TZ` |
+| `payfold-mock-bank` | FastAPI mock counterparty (source + pinned pure-python deps) | long-running service; port 8080, `/health`; compose runs two SEPA instances and one card instance | `BANK_ID`, `BANK_SCHEME`, `BANK_WORKERS`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `BANK_WEBHOOK_RETRY_MAX_ATTEMPTS`, `BANK_WEBHOOK_RETRY_BACKOFF_SECONDS`, `TZ` |
 
 Compose builds `payfold-migrations` and `payfold-seed-data-gen` itself (the flyway
 and seed-data services) instead of bind-mounting host paths, so the local stack

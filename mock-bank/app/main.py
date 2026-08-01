@@ -1,11 +1,17 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
+import os
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    generate_latest,
+    multiprocess,
+)
 from pydantic import BaseModel, Field, ValidationError
 
 from app.config import Settings, load_settings
@@ -59,7 +65,11 @@ def create_app(
                 await client.aclose()
 
     application = FastAPI(lifespan=lifespan)
-    # A compose instance uses one uvicorn worker, so this in-memory store needs no lock.
+    # Per-worker store: asyncio runs one thread per process, so no lock is
+    # needed. Under multiple uvicorn workers each process holds its own dict;
+    # that is safe because outcomes and notification ids are deterministic --
+    # a worker that misses a record treats the submission as new and the
+    # downstream inbox constraint dedupes re-scheduled notifications (D19).
     application.state.records = records
     application.state.tasks = tasks
 
@@ -195,8 +205,15 @@ def create_app(
 
     @application.get("/metrics")
     async def metrics() -> Response:
+        multiproc_dir = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
+        if multiproc_dir:
+            registry = CollectorRegistry()
+            multiprocess.MultiProcessCollector(registry)
+            payload = generate_latest(registry)
+        else:
+            payload = generate_latest()
         return Response(
-            content=generate_latest(),
+            content=payload,
             media_type=CONTENT_TYPE_LATEST,
         )
 

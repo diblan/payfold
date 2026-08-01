@@ -25,7 +25,11 @@ rabbitmq:
   routingKey: renewal.requested
 
 bank:
-  timeout-ms: 2000
+  # Polices hung counterparties only: the listener retry envelope owns the
+  # DLQ deadline (G5), and a saturated-but-alive counterparty must produce
+  # slow submits -- blocked listener threads are the backpressure -- never
+  # poison verdicts (D19).
+  timeout-ms: 10000
   registry:
     - id: bank-a
       scheme: sepa_core

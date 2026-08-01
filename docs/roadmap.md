@@ -628,7 +628,7 @@ are green — the red is calendar-dependent, not environmental.
 producer suite is green; verify.sh untouched.
 
 <a id="r32"></a>
-### [ ] R32 — High-rate consumption saturates the mock counterparties; retry storms DLQ good renewals
+### [x] R32 — High-rate consumption saturates the mock counterparties; retry storms DLQ good renewals
 **Scope:** design first — likely counterparty service capacity (a bare
 multi-worker uvicorn is NOT sufficient alone: collection records and pending
 delivery tasks are per-process state, so worker scaling needs a worker-safe

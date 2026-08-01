@@ -135,12 +135,15 @@ constraints, not in consumer state):
   fault-tolerance and multi-node story (autoscaled across real hardware in
   the companion platform repo).
 - **Listener concurrency ×8** (one JVM, `CONSUMER_LISTENER_CONCURRENCY=8`):
-  honestly, **currently collapses at 100k** — the consume burst saturates the
-  single-worker mock counterparties, submit timeouts ride the bounded retry,
-  and good renewals dead-letter. The pre-async 524/s figure was measured
-  against a stub that did no outbound work; making the counterparty survive
-  this lever is [R32](docs/roadmap.md#r32). Measured, not claimed — cuts both
-  ways.
+  100k drained in **638 s — 157/s** (~190/s warm-up, ~150/s sustained) and
+  fully settled in 1,739 s, with **zero dead-letters and zero submit
+  timeouts**. An earlier run collapsed here — the consume burst saturated the
+  single-worker mock counterparty and bounded retries dead-lettered good
+  renewals; [R32](docs/roadmap.md#r32) fixed both sides (multi-worker cardnet,
+  and a timeout budget that treats overload as backpressure, not poison —
+  [D19](docs/decisions.md#d19)). On one host both levers now cap at the shared
+  substrate (~156/s); the pre-async 524/s figure was measured against a stub
+  that did no outbound work. Measured, not claimed — cuts both ways.
 
 Reproduce it yourself:
 

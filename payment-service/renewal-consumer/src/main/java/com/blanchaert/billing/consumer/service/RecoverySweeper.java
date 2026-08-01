@@ -21,6 +21,9 @@ import java.util.UUID;
 /**
  * Re-querying stale submissions prevents missed pushes from stranding state;
  * deterministic counterparty outcomes make resubmission after amnesia safe.
+ * A stored seq-1 notification still marked scheduled is in flight, not
+ * missing -- the sweeper leaves it for the webhook so recovered counts stay
+ * exact under load.
  */
 @Component
 @Transactional
@@ -113,6 +116,15 @@ public class RecoverySweeper {
                         .findFirst()
                         .orElse(null);
         if (settlement == null) {
+            noopSweeps.increment();
+            return;
+        }
+
+        if ("scheduled".equals(settlement.state())) {
+            // An in-flight delivery is neither missing nor received:
+            // synthesizing now would race the webhook and inflate the
+            // recovered count past the silent cohorts (D19). The delivery
+            // envelope is bounded, so this state resolves by the next sweep.
             noopSweeps.increment();
             return;
         }

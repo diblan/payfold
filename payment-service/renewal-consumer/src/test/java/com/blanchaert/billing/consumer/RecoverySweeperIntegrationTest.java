@@ -155,6 +155,24 @@ class RecoverySweeperIntegrationTest {
     }
 
     @Test
+    void staleSddPaymentWithScheduledNotificationIsNoop() {
+        PaymentFixture fixture = seedSubmitted("SEPA_DD", BANK_A_ID);
+        age(fixture);
+        stubCollectionStatus(
+                collectionPath("/bank-a", fixture),
+                sddStatus(fixture, "scheduled"));
+        double recoveredBefore = recoveredCount();
+        double noopBefore = sweepCount("noop");
+
+        recoverySweeper.sweepOnce();
+
+        assertThat(inboxCount(fixture)).isZero();
+        assertThat(paymentStatus(fixture)).isEqualTo("submitted");
+        assertThat(recoveredCount() - recoveredBefore).isZero();
+        assertThat(sweepCount("noop") - noopBefore).isEqualTo(1.0);
+    }
+
+    @Test
     void staleCardPaymentRecoversFromNotificationsNotVerdict() {
         PaymentFixture fixture = seedSubmitted("CARD", CARD_ID);
         age(fixture);
