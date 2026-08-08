@@ -653,3 +653,59 @@ truth-table row; the retriable-grace retune changes a compose default the
 platform repo mirrors. Only the consumer image (plus compose/env) changes —
 tag v0.9.0 expected; the mock-bank needs nothing (the 99 rule already fails
 every attempt; only the 95 rule is attempt-indexed).
+
+## D22 — R36 diagnosis: the consume cost tripled because WAL fsync latency did; the fix is de-amplification, not reversion — 2026-08-08 — active
+<a id="d22"></a>
+Diagnosis-first per [R36](roadmap.md#r36); committed before the fix (the
+[D19](#d19)/[D20](#d20)/[D21](#d21) pattern).
+
+**Measured decomposition (2026-08-08, fresh 15k conc-1 drain).** The renewal
+listener sustains ~41 ms/consume (Prometheus timer, flat across the drain;
+R30 measured ~16 ms on the same code). Attribution by point-sampling
+`pg_stat_activity` at ~7/s across the drain: **>95% of DB-active samples are
+WAL flush** (`IO/WalSync` on COMMIT and on each statement of the consume
+chain, plus `LWLock/WALWrite` queueing behind concurrent flushers); the
+chain's SELECTs never appear at this resolution. `pg_stat_io` counts
+**92,639 client-backend WAL fsyncs for 15,000 renewals** (~6 per consume,
+settlement share included): `BillingService.process` is not transactional, so
+each of its 4 writes autocommits and flushes, and the settlement/relay/webhook
+actors flush concurrently on the same WAL. `pg_test_fsync` on the pgdata
+filesystem measures **fdatasync ≈ 2.4 ms/op** today. The shape
+`consume ≈ statements+CPU (~8 ms) + bank RTT (~1 ms, measured) +
+flushes × effective-flush-latency` reproduces both eras: ~16 ms at the ~1 ms
+fsync the R30-era rates imply, ~41 ms at today's 2.4 ms with queueing.
+
+**Exonerated by measurement:** the counterparty multiprocess metrics files
+([D19](#d19) suspect) — POST /collections benchmarks ~1.09 ms with
+`PROMETHEUS_MULTIPROC_DIR` baked and ~1.07 ms with it removed; the diff
+`ab60c9e..HEAD` shows `BillingService` byte-identical since R30, so no
+consumer hot-path code regressed; sweeper SELECTs were already sub-ms
+(R36 filing). The mechanism is **environmental**: WSL2/VHD fsync latency
+roughly tripled between the Aug 1 morning and evening runs and holds today
+(same ext4 VHD backs /tmp bind mounts and named volumes alike — relocating
+pgdata buys nothing).
+
+**Decision: de-amplify, do not chase the environment, do not weaken
+durability.** The host's fsync latency is not payfold's to fix, and
+`synchronous_commit = off` is rejected outright — confirm-gated durability is
+the demonstration. What payfold owns is paying that latency 4× per consume.
+The invoice/charge/payment upserts (pure DB, no external call) move into one
+`TransactionTemplate` span inside `BillingService.process`: one commit, one
+flush, then the bank call exactly as today (no DB connection held across
+HTTP — the [D14](#d14)/[D19](#d19) altitude rule), then the status UPDATE as
+its own autocommit. Renewal-thread flushes drop 4 → 2. Idempotency is
+untouched: the constraints still arbitrate ([D2](#d2)), the chain heals the
+same crash windows (an uncommitted chain redelivers wholesale; the bank
+dedupes the resubmitted collection id), and atomicity of the chain arguably
+tells the cleaner story. Programmatic `TransactionTemplate` over
+`@Transactional` because the span is mid-method and self-invocation would
+bypass the proxy.
+
+**Baseline re-documented as a shape, not a number.** quality.md and the
+README quote the post-fix measured rate with the environmental caveat: on
+this host the conc-1 drain is fsync-latency-bound, so the honest claim is the
+decomposition above — a number without its flush-latency context is how the
+62/s-vs-22/s confusion happened. The dated R30/R32 records stand as records.
+Consumer image changes — tag proposal expected. verify/demo budgets stay at
+their R26b-era values (they absorb the slow-fsync world; a faster world just
+finishes earlier).
