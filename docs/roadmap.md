@@ -723,7 +723,7 @@ green; verify.sh green (the compose-level first-sweep shift is ≤ one 10 s
 interval, absorbed by the existing bounded polls).
 
 <a id="r36"></a>
-### [ ] R36 — Single-consumer consume cost tripled across R32/R26b (16 ms → 43 ms)
+### [x] R36 — Single-consumer consume cost tripled across R32/R26b (16 ms → 43 ms)
 **Scope:** diagnosis first — measured facts before any fix; likely candidates
 are per-request costs the R32/R26b diffs added on the consume round trip, with
 the counterparty image's multiprocess metrics files
@@ -784,3 +784,36 @@ operator most needs to spot — has no override, and the renewals panels leave
 against the DB count on a scaled stack); settlement/renewal color overrides
 match only label values that exist, including `charged_back` and `submitted`;
 [R33](#r33)'s panel-query checks stay green.
+
+<a id="r38"></a>
+### [ ] R38 — load-test.sh seeds customers that violate V9's card-token constraint
+**Scope:** `scripts/load-test.sh` only.
+Its ad-hoc seed inserts `customer (id, email)` alone; `payment_method`
+defaults to `card` (V6) and `customer_card_token_chk` (V9) requires every
+card customer to carry a token, so the very first seeded row aborts the
+batch — `scripts/load-test.sh N` has been broken since V9 landed
+(2026-07-26). The [R23f](#r23f) session's "a new constraint's blast radius
+is the whole repo" sweep covered test fixtures but missed this script's
+INSERT; first exercised (and caught) 2026-08-08 during [R36](#r36)
+forensics, mitigated there with ad-hoc SQL ([R11](#r11) precedent,
+deliberately uncommitted).
+**Done when:** the seeded cohort satisfies V6+V9 (explicit `payment_method`
+plus a non-rule `card_token`, or a deterministic mix mirroring the compose
+seeder), `scripts/load-test.sh 5000` completes green against a running
+stack, and the script's README/architecture mentions stay accurate.
+
+<a id="r39"></a>
+### [ ] R39 — Re-measure the 100k scaling-lever matrix post-D23
+**Scope:** measurement + docs only (quality.md "Measured scale runs", README,
+architecture honesty table); no behavior changes — the [R30](#r30) shape.
+Every 100k lever number predates [D23](decisions.md#d23)'s counterparty stall
+fix: the conc-8 157/s ([R32](#r32)) was measured with the ~44 ms cardnet
+stall throttling all eight listener threads (8 ÷ 44 ms ≈ 180/s explains the
+observed ceiling), and the 62/s baseline and 156/s 3-replica figures
+([R30](#r30)) predate [D22](decisions.md#d22) as well. Conc-1 at the 15k demo
+scale now measures 195/s — the documented 100k matrix is stale in unknown
+directions (the substrate ceiling may finally be real, or may move again).
+**Done when:** the three documented 100k configurations (conc-1 baseline,
+×3 replicas, conc-8) are re-run green with drain and completion measured per
+[R30](#r30)'s two-quantity method; quality.md, README, and the honesty table
+quote the new numbers with the old records kept as dated history.

@@ -24,10 +24,10 @@
 #   scripts/verify.sh [--no-up] [--timeout SECONDS] [--poison|--no-poison]
 #
 #   --no-up        skip `docker compose up -d --build` (stack already running)
-#   --timeout N    max seconds to wait for each long condition (default 900 —
-#                  since R26b the terminal waits also cover dunning
-#                  re-collection cycles riding behind the drain, and since
-#                  R26c the cancellation waits cover exhaustion and expiry)
+#   --timeout N    max seconds to wait for each long condition (default 600 —
+#                  the terminal waits cover dunning re-collection cycles and
+#                  the R26c cancellation acts; re-tightened from the interim
+#                  900 after D23 restored the fast drain, R36)
 #   --poison       run the poison-message DLQ probe (default since R5)
 #   --no-poison    skip poison payload/DLQ checks only; listener metrics stay required
 #
@@ -49,7 +49,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-TIMEOUT=900
+TIMEOUT=600
 NO_UP=0
 POISON=1
 while [[ $# -gt 0 ]]; do

@@ -329,3 +329,12 @@ async def test_health_metrics_and_unknown_collection():
 
         unknown = await api.get("/collections/unknown")
         assert unknown.status_code == 404
+
+
+def test_h11_connection_made_enforces_nodelay():
+    # D23: the import of app.main must leave every worker's H11 protocol
+    # setting TCP_NODELAY on accepted sockets — multi-worker uvicorn loses
+    # asyncio's default and Nagle adds ~40 ms per response on the bridge.
+    from uvicorn.protocols.http import h11_impl
+
+    assert getattr(h11_impl.H11Protocol.connection_made, "_nodelay_enforced", False)

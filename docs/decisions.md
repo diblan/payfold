@@ -654,7 +654,7 @@ platform repo mirrors. Only the consumer image (plus compose/env) changes —
 tag v0.9.0 expected; the mock-bank needs nothing (the 99 rule already fails
 every attempt; only the 95 rule is attempt-indexed).
 
-## D22 — R36 diagnosis: the consume cost tripled because WAL fsync latency did; the fix is de-amplification, not reversion — 2026-08-08 — active
+## D22 — R36 diagnosis: the consume cost tripled because WAL fsync latency did; the fix is de-amplification, not reversion — 2026-08-08 — attribution corrected same day by [D23](#d23); the upsert batching stands
 <a id="d22"></a>
 Diagnosis-first per [R36](roadmap.md#r36); committed before the fix (the
 [D19](#d19)/[D20](#d20)/[D21](#d21) pattern).
@@ -709,3 +709,45 @@ decomposition above — a number without its flush-latency context is how the
 Consumer image changes — tag proposal expected. verify/demo budgets stay at
 their R26b-era values (they absorb the slow-fsync world; a faster world just
 finishes earlier).
+
+## D23 — R36 root cause: multi-worker uvicorn drops TCP_NODELAY; Nagle × delayed-ACK taxes every consume 40 ms — 2026-08-08 — active
+<a id="d23"></a>
+Same-day correction of [D22](#d22)'s attribution, from flight-recorder evidence.
+The [D22](#d22) upsert batching worked exactly as designed at the DB layer
+(post-fix `pg_stat_activity` sampling shows the per-INSERT WAL flushes gone and
+DB-active occupancy at ~6% ≈ 3 ms/consume) — yet the consume cost did not
+move, so WAL flush was never the dominant term.
+
+**The measured mechanism.** JFR on the renewal listener during a 5k all-card
+drain: exactly one 40–50 ms `jdk.SocketRead` per message on the counterparty
+HTTP connection (10,207 reads, avg 21.8 ms ≈ 44 ms/message paired with one
+fast header read), against ~0.5 ms/message of JDBC socket time. Isolated A/B
+matrix: container-to-container POST p50 is **0.83 ms at 1 uvicorn worker vs
+44.1 ms at 4 workers**, while the same 4-worker container answers in ~1 ms
+through host docker-proxy — which is why every host-side benchmark (including
+[R32](roadmap.md#r32)'s acceptance and D22's multiproc exoneration, both run
+at 1 worker or through the proxy) missed it. uvicorn 0.51.0 never sets
+`TCP_NODELAY` (grep: zero occurrences); single-worker mode inherits asyncio's
+per-transport default, the multi-worker socket path loses it, and Nagle holds
+each response body against the peer's ~40 ms delayed ACK. [D19](#d19) made
+cardnet 4-worker — 80% of consumes — turning 16 ms consumes into ~41 ms and
+62/s into ~22/s the same afternoon. The WSL2-environment theory is dead:
+fsync was ~2.4 ms in both eras and never dominant.
+
+**Fix: the counterparty enforces NODELAY on every accepted socket** — an
+import-time wrap of uvicorn's `H11Protocol.connection_made` in `app/main.py`
+(runs in every worker process; pure python, no new dependency, multi-arch
+property untouched; measured 44 → 0.85 ms p50; a pytest guards the wrap).
+[D19](#d19)'s 4-worker capacity design stands — it was correct about the
+event-loop ceiling and merely shipped this latent socket-option regression on
+top. The D22 batching also stands on its DB merits. verify/demo budgets
+re-tighten to their pre-regression values on the re-measured rate
+([G7](invariants.md#g7)-compatible: tightening).
+
+**One [D21](#d21) margin re-widened.** The restored fast drain clusters the
+99 cohort's first failures into ~2 minutes instead of ten, and on the first
+post-fix verify run 6/350 exhaustion cancellations lost the race to the
+120 s retriable-grace backstop (the exact cause-attribution checks caught it,
+as D21 intended). D21's sanctioned lever applies: compose
+`DUNNING_RETRIABLE_GRACE_SECONDS` 120 → 180, restoring a ≥2× margin over the
+measured ~75–90 s exhaustion path; `hard_fail`/`dispute` stay at 60 s.

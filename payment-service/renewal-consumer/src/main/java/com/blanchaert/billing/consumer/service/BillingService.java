@@ -10,6 +10,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.*;
 import java.time.format.DateTimeParseException;
@@ -25,15 +26,17 @@ public class BillingService {
     private final BankClient bank;
     private final BankRegistry bankRegistry;
     private final DunningLifecycle dunningLifecycle;
+    private final TransactionTemplate tx;
     private final Map<String, Counter> processedCounters;
 
     public BillingService(JdbcTemplate jdbc, BankClient bank,
                           BankRegistry bankRegistry, MeterRegistry meters,
-                          DunningLifecycle dunningLifecycle) {
+                          DunningLifecycle dunningLifecycle, TransactionTemplate tx) {
         this.jdbc = jdbc;
         this.bank = bank;
         this.bankRegistry = bankRegistry;
         this.dunningLifecycle = dunningLifecycle;
+        this.tx = tx;
         Map<String, Counter> counters = new HashMap<>();
         for (String method : new String[]{"card", "sdd", "unknown"}) {
             for (String outcome : new String[]{"succeeded", "failed", "invalid", "submitted"}) {
@@ -85,13 +88,17 @@ public class BillingService {
         LocalDate ps = LocalDate.parse(evt.period_start());
         LocalDate pe = LocalDate.parse(evt.period_end());
         String idem = evt.idempotency_key();
-        // 2) Upsert invoice
-        UUID invoiceId = upsertInvoice(evt.customer_id(), ps, pe, evt.amount_cents(), evt.currency());
-        // 3) Upsert charge linked to subscription + invoice + due_date
-        UUID chargeId = upsertCharge(evt.subscription_id(), invoiceId, evt.amount_cents(), evt.currency(), dueDate);
-        // 4) Create payment row (pending) guarded by idempotency unique key
+        // 2–4) Invoice, charge, and payment upsert as ONE transaction: the pure-DB
+        // chain commits with a single WAL flush instead of three autocommits (D22).
+        // The unique constraints still arbitrate idempotency (D2), and an
+        // uncommitted chain heals by wholesale redelivery. The bank call stays
+        // outside — no connection is held across HTTP.
         String channel = "sdd".equals(customerBilling.paymentMethod()) ? "SEPA_DD" : "CARD";
-        UUID paymentId = upsertPayment(idem, chargeId, evt.amount_cents(), evt.currency(), channel);
+        UUID paymentId = tx.execute(status -> {
+            UUID invoiceId = upsertInvoice(evt.customer_id(), ps, pe, evt.amount_cents(), evt.currency());
+            UUID chargeId = upsertCharge(evt.subscription_id(), invoiceId, evt.amount_cents(), evt.currency(), dueDate);
+            return upsertPayment(idem, chargeId, evt.amount_cents(), evt.currency(), channel);
+        });
         if ("sdd".equals(customerBilling.paymentMethod())) {
             String sddStatus = jdbc.queryForObject(
                     "SELECT status FROM payment WHERE id = ?", String.class, paymentId);

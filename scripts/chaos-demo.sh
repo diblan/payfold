@@ -9,11 +9,12 @@
 #   scripts/chaos-demo.sh [--auto] [--timeout SECONDS]
 #
 #   --auto         skip the pause between scenes
-#   --timeout N    max seconds to wait for each long condition (default 1200 —
+#   --timeout N    max seconds to wait for each long condition (default 900 —
 #                  on a fresh default-seed stack scene 1 bills the whole 15k
-#                  base cohort at the measured post-R26b single-consumer rate
-#                  (~22/s, see roadmap R36), plus the dunning re-collection
-#                  tails; a pre-billed stack needs nothing near this)
+#                  base cohort at the measured post-D23 single-consumer rate
+#                  (~140/s — the interim ~22/s regression is diagnosed and
+#                  fixed, roadmap R36), plus the dunning re-collection tails;
+#                  a pre-billed stack needs nothing near this)
 #
 # Environment:
 #   DEMO_AUTO=1    skip the pause between scenes
@@ -25,7 +26,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-TIMEOUT=1200
+TIMEOUT=900
 AUTO="${DEMO_AUTO:-0}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -546,10 +547,11 @@ else
 fi
 
 # The poison sits behind the scene's FIFO backlog, so its DLQ deadline is
-# queue wait + the bounded listener retry envelope: ~2000 messages at the
-# measured ~22/s single-consumer rate (R36) is ~91s, plus retry backoff and
-# the stats interval — 150s bounds it honestly. G5's bound is on attempts
-# once delivered, not on queue position.
+# queue wait + the bounded listener retry envelope: ~2000 messages drain in
+# well under a minute at the measured post-D23 ~140/s single-consumer rate
+# (R36), plus retry backoff and the stats interval — 150s stays as a
+# generous ceiling. G5's bound is on attempts once delivered, not on queue
+# position.
 POISON_DLQ_READY=0
 POISON_WAIT_START=$SECONDS
 while (( SECONDS - POISON_WAIT_START < 150 )); do

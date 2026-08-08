@@ -113,19 +113,25 @@ cohort that only completes through the recovery sweeper.
 - **Producer (scan + publish):** 1,015,000 due renewals scanned and published in
   459 s wall at 183 MiB peak heap (1M-row run). At 100k the whole job takes ~22 s —
   a 330k night is roughly 2.5 minutes of publishing.
-- **Consumer (bill + settle):** the documented 100k-due-today run drained all
-  100,000 renewals in **1,606 s — 62/s average, ~58/s sustained** after a
-  ~94/s two-minute warm-up; **end-to-end completion took 1,639 s** — the
-  asynchronous settlement tail past the last consume is ~33 s (max bank delay
-  + chargeback lag + one recovery-sweep cycle).
-- **Extrapolation:** at the measured ~58–62/s, a 330k nightly batch drains in
-  ~1.5 hours — **15–16× the 3.8/s average** the 10M/month target requires —
-  and completes settlement about half a minute later.
+- **Consumer (bill + settle):** measured 2026-08-08 after
+  [D22](docs/decisions.md#d22)/[D23](docs/decisions.md#d23): the 15k demo
+  cohort drains at **195/s single-consumer** (~6 ms per consume) with
+  end-to-end completion — every payment terminal, recovery and the full
+  dunning arc included — in **163 s**. The dated 100k record (2026-08-01,
+  pre-fix) drained at **62/s** with completion at 1,639 s; a 100k re-run on
+  the fixed system is [R39](docs/roadmap.md#r39). In between sat a diagnosed
+  regression worth reading about: a multi-worker uvicorn socket option let
+  Nagle's algorithm tax every consume ~40 ms ([D23](docs/decisions.md#d23)).
+- **Extrapolation:** even at the conservative dated 62/s, a 330k nightly batch
+  drains in ~1.5 hours — **15–16× the 3.8/s average** the 10M/month target
+  requires; at the post-fix single-consumer rate the same batch clears in
+  under 30 minutes.
 
 The single-thread consumer default is the binding constraint — and its two
-scaling levers are measured, not promised (re-measured 2026-08-01 on the async
-spine; both safe by design, because idempotency lives in database unique
-constraints, not in consumer state):
+scaling levers are measured, not promised (measured 2026-08-01 on the async
+spine, pre-[D23](docs/decisions.md#d23) — the [R39](docs/roadmap.md#r39)
+re-measure will refresh both; safe by design, because idempotency lives in
+database unique constraints, not in consumer state):
 
 - **3 consumer replicas** (`docker compose up --scale renewal-consumer=3`,
   concurrency 1 each): 100k drained in **642 s — 156/s, ~2.5× baseline** and
