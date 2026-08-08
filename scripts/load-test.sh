@@ -76,8 +76,12 @@ WITH seed_plan AS (
                           THEN 'month' ELSE 'year' END
     ORDER BY name LIMIT 1
 ), new_customers AS (
-    INSERT INTO customer (id, email)
-    SELECT gen_random_uuid(), 'load-${RUN_TAG}-' || g || '@example.test'
+    -- V6 defaults payment_method to card and V9 requires every card customer
+    -- to carry a token (R38); the -00 suffix is non-rule, so the cohort takes
+    -- the plain auth + async-settle path and adds no dunning churn.
+    INSERT INTO customer (id, email, payment_method, card_token)
+    SELECT gen_random_uuid(), 'load-${RUN_TAG}-' || g || '@example.test',
+           'card', 'tok-load-${RUN_TAG}-' || g || '-00'
     FROM generate_series(1, ${N}) g
     RETURNING id
 )

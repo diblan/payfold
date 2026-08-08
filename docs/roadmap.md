@@ -786,7 +786,7 @@ match only label values that exist, including `charged_back` and `submitted`;
 [R33](#r33)'s panel-query checks stay green.
 
 <a id="r38"></a>
-### [ ] R38 — load-test.sh seeds customers that violate V9's card-token constraint
+### [x] R38 — load-test.sh seeds customers that violate V9's card-token constraint
 **Scope:** `scripts/load-test.sh` only.
 Its ad-hoc seed inserts `customer (id, email)` alone; `payment_method`
 defaults to `card` (V6) and `customer_card_token_chk` (V9) requires every
