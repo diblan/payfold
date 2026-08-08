@@ -11,7 +11,9 @@
 # It also re-runs the payfold-migrations image as a no-op run-to-completion Job.
 # It also requires Prometheus to be scraping both services, Grafana to serve
 # the provisioned pipeline dashboard anonymously, and all three
-# mock-counterparty instances to report healthy.
+# mock-counterparty instances to report healthy; at the end of the run every
+# provisioned dashboard panel query is executed against live Prometheus and
+# must return data (R33).
 # Async settlement is asserted end to end: every payment reaches its
 # token/IBAN-predicted terminal state, reconciled row-for-row against the
 # settlement inbox; the silent (94) cohorts recover through the sweeper, the
@@ -36,7 +38,8 @@
 #   The R5 poison probe is also strict by default: management API failures fail
 #   verification, and poison must reach the DLQ within its independent 60s cap.
 #
-# Requires: docker compose v2, curl. psql runs inside the postgres container.
+# Requires: docker compose v2, curl, python3 (dashboard panel-query extraction).
+# psql runs inside the postgres container.
 # Safe to re-run against a dirty database: assertions are absolute conditions plus
 # same-run metric deltas whose baselines are snapshotted within this run, so process
 # restarts and persisted database rows do not skew the cross-checks.
@@ -1018,5 +1021,74 @@ listener_timer_recorded() {
   [[ "$count" != "absent" && "$count" != "unreachable" ]]
 }
 wait_for "spring_rabbitmq_listener timer recorded on consumer" listener_timer_recorded
+
+# --- R33: the dashboard must tell the truth, not just exist ------------------
+# Every panel query in the provisioned dashboard JSON is executed against live
+# Prometheus at the end of the run: each must be accepted (HTTP 200, status
+# success) and return at least one series. A renamed metric or a broken PromQL
+# edit now fails verification instead of leaving a lying panel behind a green
+# run. Runs after the load so every series carries this run's data; each target
+# gets a short bounded poll for scrape-interval lag (R17 precedent) with a cap
+# independent of --timeout, like the poison probe's.
+DASHBOARD_JSON="observability/grafana/dashboards/payfold-pipeline.json"
+PANEL_POLL_CAP=60
+# Panels whose series may legitimately be absent after a verify run get an
+# explicit allowlist entry (label prefix match). Empty today: every panel
+# reads eagerly-registered app series, broker per-queue series, or `up` —
+# all present on a healthy stack regardless of outcome mix.
+PANEL_ABSENT_ALLOWLIST=()
+
+panel_queries() { # emit "<panel title> [target N]\t<expr>" per dashboard target
+  python3 - "$DASHBOARD_JSON" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for p in d.get("panels", []):
+    title = (p.get("title") or "untitled").strip()
+    for i, t in enumerate(p.get("targets", []), 1):
+        expr = " ".join((t.get("expr") or "").split())
+        print(f"{title} [target {i}]\t{expr}")
+PYEOF
+}
+
+panel_query_ok() { # expr -> success iff Prometheus accepts it and returns >=1 series
+  local body
+  body="$(curl -fsS -G "http://localhost:${PROM_PORT}/api/v1/query" \
+    --data-urlencode "query=$1" 2>/dev/null)" || return 1
+  echo "$body" | grep -q '"status":"success"' && echo "$body" | grep -q '"result":\[{'
+}
+
+PANEL_LIST="$(panel_queries 2>/dev/null)"
+PANEL_COUNT=0
+[[ -n "$PANEL_LIST" ]] && PANEL_COUNT="$(wc -l <<<"$PANEL_LIST")"
+if (( PANEL_COUNT > 0 )); then
+  pass "dashboard panel queries extracted from provisioned JSON (${PANEL_COUNT} targets)"
+else
+  fail "dashboard panel queries extracted from provisioned JSON" "no targets parsed from ${DASHBOARD_JSON}"
+fi
+while IFS=$'\t' read -r PANEL_LABEL PANEL_EXPR; do
+  [[ -z "$PANEL_LABEL" ]] && continue
+  if [[ -z "$PANEL_EXPR" ]]; then
+    fail "dashboard panel has a PromQL expr — ${PANEL_LABEL}" "empty expr in ${DASHBOARD_JSON}"
+    continue
+  fi
+  PANEL_ALLOWED=0
+  for ALLOWED in "${PANEL_ABSENT_ALLOWLIST[@]:-}"; do
+    [[ -n "$ALLOWED" && "$PANEL_LABEL" == "$ALLOWED"* ]] && PANEL_ALLOWED=1
+  done
+  PANEL_OK=0
+  PANEL_START=$SECONDS
+  while (( SECONDS - PANEL_START < PANEL_POLL_CAP )); do
+    if panel_query_ok "$PANEL_EXPR"; then PANEL_OK=1; break; fi
+    (( PANEL_ALLOWED )) && break
+    sleep 2
+  done
+  if (( PANEL_OK )); then
+    pass "dashboard panel query returns live data — ${PANEL_LABEL}"
+  elif (( PANEL_ALLOWED )); then
+    pass "dashboard panel query allowlisted absent — ${PANEL_LABEL}"
+  else
+    fail "dashboard panel query returns live data — ${PANEL_LABEL}" "expr=${PANEL_EXPR}"
+  fi
+done <<<"$PANEL_LIST"
 
 summary

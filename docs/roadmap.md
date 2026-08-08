@@ -670,7 +670,7 @@ configurations; README and the architecture honesty table quote the new
 numbers and drop the era note; verify.sh untouched ([G7](invariants.md#g7)).
 
 <a id="r33"></a>
-### [ ] R33 — Verify the dashboard tells the truth, not just that it exists
+### [x] R33 — Verify the dashboard tells the truth, not just that it exists
 **Scope:** `scripts/verify.sh` (+ possibly a small helper); no service changes
 expected; architecture.md observability section per [G6](invariants.md#g6) if
 the metric-name contract wording moves.

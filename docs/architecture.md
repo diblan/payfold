@@ -558,7 +558,11 @@ main queues and DLQs, from `/metrics/detailed?family=queue_coarse_metrics`); Gra
 runs) provisions its datasource and the `payfold-pipeline` dashboard from
 `observability/` at boot and serves it to anonymous viewers, so a fresh
 `docker compose up` renders the pipeline with zero clicks. `verify.sh` asserts
-Prometheus is healthy and scraping and that the dashboard is provisioned. The
+Prometheus is healthy and scraping, that the dashboard is provisioned, and —
+since [R33](roadmap.md#r33) — that every panel query extracted from the
+provisioned JSON is accepted by live Prometheus and returns at least one series
+after the run's load, so a renamed metric or broken PromQL edit fails
+verification instead of leaving a lying panel behind a green run. The
 dashboards are demo-local; the platform repo runs its own kube-prometheus-stack
 in-cluster.
 
