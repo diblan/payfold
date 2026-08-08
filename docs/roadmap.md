@@ -767,7 +767,7 @@ story.
 `chaos-demo.sh --auto` runs green on a fresh default-seed stack.
 
 <a id="r37"></a>
-### [ ] R37 — Dashboard gauge and color semantics lie at N replicas
+### [x] R37 — Dashboard gauge and color semantics lie at N replicas
 **Scope:** `observability/grafana/dashboards/payfold-pipeline.json` only; no
 service changes. Found by the 2026-08-08 [R13](#r13) audit.
 "Subscriptions past due (now)" reads `sum(subscriptions_past_due)`, but every

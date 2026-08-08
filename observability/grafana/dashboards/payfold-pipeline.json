@@ -158,6 +158,10 @@
           {
             "matcher": { "id": "byName", "options": "invalid" },
             "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "submitted" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }]
           }
         ]
       },
@@ -192,6 +196,10 @@
           {
             "matcher": { "id": "byName", "options": "invalid" },
             "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "submitted" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }]
           }
         ]
       },
@@ -275,16 +283,20 @@
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "succeeded" },
+            "matcher": { "id": "byRegexp", "options": "/settled/" },
             "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
           },
           {
-            "matcher": { "id": "byName", "options": "failed" },
+            "matcher": { "id": "byRegexp", "options": "/charged_back/" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/failed/" },
             "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
           },
           {
-            "matcher": { "id": "byName", "options": "invalid" },
-            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+            "matcher": { "id": "byRegexp", "options": "/invalid/" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } }]
           }
         ]
       },
@@ -462,7 +474,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(subscriptions_past_due)",
+          "expr": "max(subscriptions_past_due)",
           "legendFormat": "past due"
         }
       ],
