@@ -12,8 +12,7 @@ public record DunningProperties(Map<String, String> classes,
                                 long hardFailGraceSeconds,
                                 long disputeGraceSeconds,
                                 long retryDelaySeconds,
-                                long maxAttempts,
-                                long sweepIntervalMs) {
+                                long maxAttempts) {
 
     public String classFor(String reason) {
         String dunningClass = reason == null ? null : classes.get(reason);

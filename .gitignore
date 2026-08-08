@@ -35,6 +35,7 @@ build/
 ### Python (mock-bank) ###
 __pycache__/
 *.pyc
+.pytest_cache/
 
 ### Logs ###
 *.log

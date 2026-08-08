@@ -20,7 +20,7 @@ Scope insurance. Promoting any of these onto the roadmap requires a
 | Real PSP or money movement | Mock counterparties only: the mock PSP ([R8](#r8)) pioneered the deterministic failure path; the mock bank joins it in [R23](#r23), and the async card scheme absorbs WireMock's role in [R23f](#r23f) ([D15](decisions.md#d15)/[D17](decisions.md#d17)) — still no credentials, compliance, or real money |
 | Auth / multi-tenancy | Orthogonal to the billing pipeline story |
 | Any UI | The consumers of this system are curl, psql, and the RabbitMQ console. [D12](decisions.md#d12) carves out provisioned Grafana ([R21](#r21)) — industry ops tooling as code, not a custom page |
-| Proration, refunds, tax | Each is a project of its own; the renewal happy path + failure path is the thesis. Dunning left this row 2026-07-26: [D16](decisions.md#d16) promotes it to [R26](#r26), gated on [R23](#r23) |
+| Proration, refunds, tax | Each is a project of its own; the renewal happy path + failure path is the thesis. Dunning left this row 2026-07-26: [D16](decisions.md#d16) promoted it to [R26](#r26), shipped 2026-08-01 as R26a–R26d |
 | Event-sourcing rewrite | The outbox pattern *is* the demonstration; rewriting the persistence model restarts the project |
 | More services | Two services already demonstrate cross-service delivery semantics; a third must earn its place via a decision entry — [D13](decisions.md#d13) grants exactly one: the mock-bank settlement service ([R23](#r23)) |
 | Reconciliation / ledger flows | `bank_tx`, `recon_match`, `ledger_entry` stay dormant until promoted |
@@ -28,14 +28,8 @@ Scope insurance. Promoting any of these onto the roadmap requires a
 ## Items
 
 Ordering principle: *repair the feedback loop → correctness → resilience → scale → story*.
-Dependencies: R1, R2 → R3 → R4–R8; R4 → R5; R10 → R11, R12.
-Story phase (2026-07-26): R20 → R22; R21 → R22; R22 → R24 ([R23](#r23)
-re-triggers [R24](#r24), still open).
-SEPA phase (2026-07-26): [R23](#r23) split per [D15](decisions.md#d15)/[D17](decisions.md#d17)
-into R23a → R23b → R23c → R23d → R23e → R23f, strictly in order;
-R23 → R26 ([D16](decisions.md#d16)).
-Dunning phase (2026-08-01): [R26](#r26) split into R26a → R26b → R26c → R26d,
-strictly in order; the [D16](decisions.md#d16) gate ([R23](#r23)) is closed.
+Consumed dependency/phase notes are pruned by entropy passes; the one live edge:
+[R24](#r24) (recording) waits on nothing but the user — see its re-record note.
 
 <a id="r1"></a>
 ### [x] R1 — Consumer bootstrap hygiene
@@ -158,7 +152,7 @@ the code; full re-grade of [quality.md](quality.md); prune stale roadmap notes.
 **Done when:** the checklist above is completed and quality.md's re-grade date is
 updated. **No behavior changes allowed** in this session type.
 
-*Last run: 2026-07-31 (after the R23 epic + R29, commit ab206b9 — 4th run).*
+*Last run: 2026-08-08 (after the dunning epic, R30–R32, R34, R35 — 5th run).*
 
 <a id="r14"></a>
 ### [x] R14 — Migrate to Testcontainers 2.x
@@ -694,8 +688,8 @@ asserts Grafana *serves* the provisioned dashboard (`/api/search` finds uid
 `payfold-pipeline`) but never executes a single panel query. A renamed metric
 or a broken PromQL edit leaves a lying dashboard behind a green verify —
 exactly the gap class the memo predicts. Panels have been added by
-[R21](#r21), [R23c](#r23c)–[R23f](#r23f), and [R26a](#r26a); none is
-behavior-verified.
+[R21](#r21), [R23c](#r23c)–[R23f](#r23f), [R26a](#r26a), and [R26c](#r26c);
+none is behavior-verified.
 **Done when:** verify.sh extracts every panel query from the provisioned
 dashboard JSON and asserts each is accepted by live Prometheus and returns at
 least one series after the run's load (bounded poll for scrape-interval lag,
@@ -771,3 +765,22 @@ story.
 **Done when:** every scene's terminal-prediction SQL mirrors verify.sh's
 95-aware form (attempt-2 key for the 95 cohort, base keys elsewhere); a full
 `chaos-demo.sh --auto` runs green on a fresh default-seed stack.
+
+<a id="r37"></a>
+### [ ] R37 — Dashboard gauge and color semantics lie at N replicas
+**Scope:** `observability/grafana/dashboards/payfold-pipeline.json` only; no
+service changes. Found by the 2026-08-08 [R13](#r13) audit.
+"Subscriptions past due (now)" reads `sum(subscriptions_past_due)`, but every
+consumer replica reports the same database-global count (the gauge is not
+additive — [architecture.md](architecture.md) metric table), so the stat
+over-reports ×N exactly when the chaos demo's ×3 scaling scene runs; `max()`
+is the truthful aggregation. The "Settlements — processed/s by outcome" color
+overrides match a nonexistent `succeeded` outcome (the vocabulary is
+`settled|failed|charged_back|invalid`) and are all dead anyway because the
+legend renders `{{bank}} {{outcome}}`; `charged_back` — the outcome an
+operator most needs to spot — has no override, and the renewals panels leave
+`submitted` (the dominant async-era series) uncolored.
+**Done when:** the past_due stat reads true at 1 and 3 replicas (spot-checked
+against the DB count on a scaled stack); settlement/renewal color overrides
+match only label values that exist, including `charged_back` and `submitted`;
+[R33](#r33)'s panel-query checks stay green.

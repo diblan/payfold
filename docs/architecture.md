@@ -22,12 +22,13 @@ Honesty table:
 | Operational observability | Demonstrated — SLF4J logging, Prometheus counters + built-in job/listener timers, `verify.sh` cross-checks metric deltas against DB deltas |
 | Throughput at 330k/day | Measured end to end on the async spine ([R30](roadmap.md#r30), 2026-08-01) — producer: 1,015,000 due rows scanned + published in 459 s wall, peak heap 183 MiB; consumer: 100,000 due-today renewals drained in 1,606 s (62/s, ~58/s sustained) with end-to-end settlement completion at 1,639 s (zero stuck `submitted`, recovery cohort included), so a 330k night is ~2.5 min of publishing plus ~1.5 h of draining — 15–16× the 3.8/s requirement average, settled ~half a minute after the last consume. Single-node WSL2 dev-laptop numbers; the consumer is the binding constraint (see quality.md "Measured scale runs") |
 | Horizontal producer scaling | Demonstrated — `FOR UPDATE SKIP LOCKED` page claims + advisory-lock cron guard; exactly-once under two concurrent publishers proven by test (compose still runs a single producer instance) |
+| Failed-payment lifecycle (dunning) | Demonstrated — every terminal reason maps to a class (`retriable`/`hard_fail`/`dispute`), retriable failures re-collect on schedule through the normal spine, and bounded exhaustion or grace expiry ends in cancellation; `verify.sh` asserts the exact cohort matrix from suffix arithmetic ([R26a](roadmap.md#r26a)–[R26d](roadmap.md#r26d)) |
 | Consumer scaling levers | Re-measured on the async spine ([R30](roadmap.md#r30), 2026-08-01) — 3 same-host replicas at concurrency 1: 100k drained in 642 s (156/s, ~2.5× the 62/s baseline; RabbitMQ round-robin split 33,338/33,307/33,355), end-to-end settled in 675 s, full verify.sh-green with fleet-summed exact checks. Listener concurrency ×8 ([R32](roadmap.md#r32), 2026-08-01): 100k drained in 638 s (157/s, ~150/s sustained), settled in 1,739 s, zero dead-letters and zero submit timeouts on the [D19](decisions.md#d19) design (4-worker cardnet, 10 s timeout budget) — the earlier measured collapse is retired, and both levers now cap at the shared single-host substrate (~156/s; the retired 524/s figure was WireMock-era). Same-host replicas contend for one machine; true multi-node scaling is the external platform repo's KEDA demonstration |
 
 ## Component map
 
 ```
-                 ┌─────────────┐   Flyway V1–V10   ┌──────────────┐
+                 ┌─────────────┐   Flyway V1–V11   ┌──────────────┐
                  │   flyway    ├──────────────────▶│              │
                  └─────────────┘                   │  postgres:18 │
                  ┌─────────────┐  SEED_CUSTOMERS   │   (payfold)  │
@@ -260,7 +261,7 @@ math remain untouched: a chargeback is a recorded fact, not compensation
 ([D16](decisions.md#d16)). Terminal payment-status guards make every settlement
 redelivery a no-op.
 
-### Dunning grace lifecycle (R26a)
+### Dunning grace lifecycle (R26a–R26c)
 
 Every terminal collection reason maps through the consumer's yaml-fixed policy
 to exactly one class: `retriable` (`AM04`, `insufficient_funds`), `hard_fail`
@@ -296,8 +297,9 @@ expiry — the lifecycle is complete.
 
 Card authorization declines are business failures: the payment becomes `failed`,
 the subscription enters the same grace lifecycle, the renewal is ACKed, and no
-settlement notification follows. Failed payments remain terminal in R26a and
-redelivery does not re-attempt them; retries arrive in R26b.
+settlement notification follows. Renewal redelivery never re-attempts a failed
+payment — re-collection is exclusively the dunning sweeper's, which retries card
+failures through the same submission spine as SDD.
 Authorized cards and SDD stay `submitted` until the settlement listener decides
 their terminal state.
 
@@ -519,7 +521,7 @@ Micrometer converts dots in meter names to underscores for Prometheus and append
 | `dunning.retries` | `dunning_retries_total{outcome="..."}` | Counter | `outcome=submitted \| declined \| duplicate` | Once per dunning retry decision after its attempt row is inserted or deduplicated |
 | `dunning.recoveries` | `dunning_recoveries_total` | Counter | none | Once when a settled retry returns a `past_due` subscription to `active` and clears grace |
 | `dunning.cancellations` | `dunning_cancellations_total{cause="..."}` | Counter | `cause=exhausted \| grace_expired` | Once per subscription the sweeper cancels, by verdict: bounded retriable attempts exhausted, or the grace deadline passed |
-| `subscriptions.past_due` | `subscriptions_past_due` | Gauge | none | Refreshed every 10 s from the current count of `past_due` subscriptions |
+| `subscriptions.past_due` | `subscriptions_past_due` | Gauge | none | Refreshed every 10 s from the current count of `past_due` subscriptions; every replica reports the same database-global count, so the gauge is **not additive across replicas** |
 
 All counter series are registered eagerly and therefore render as `0.0` from boot;
 `verify.sh` depends on that property. Settlement outcome×bank pairs and each
@@ -550,8 +552,8 @@ Since [R21](roadmap.md#r21) ([D12](decisions.md#d12)) the compose stack ships
 its own visualization: Prometheus (`prom/prometheus:v3.5.0`, 5s scrape) reads
 both services' `/actuator/prometheus`, discovers every scaled consumer replica
 via DNS A-record service discovery, and reads the broker plugin's per-queue
-family (`rabbitmq_detailed_queue_messages{queue="billing.renewals.main"|".dlq"}`
-from `/metrics/detailed?family=queue_coarse_metrics`); Grafana
+family (`rabbitmq_detailed_queue_messages` for the renewals *and* settlements
+main queues and DLQs, from `/metrics/detailed?family=queue_coarse_metrics`); Grafana
 (`grafana/grafana:13.1.1` — the same app version the external platform repo
 runs) provisions its datasource and the `payfold-pipeline` dashboard from
 `observability/` at boot and serves it to anonymous viewers, so a fresh
@@ -615,7 +617,7 @@ requires a version bump and decision entry.
 | V3 | `renewal_outbox` + the unique constraints in the table above + supporting indexes |
 | V4 | Spring Batch 5 metadata schema (producer sets `spring.batch.jdbc.initialize-schema: never`; Flyway is the sole schema authority, [G3](invariants.md#g3)) |
 | V5 | one yearly `plan` row ('Premium Annual') so due-today seeding has a valid renewal preimage on month-end clamp days ([R16](roadmap.md#r16)); weighted 0 in the seeder — used only via the clamp fallback |
-| V6 | customer payment method plus SDD debtor material; payment bank and collection attribution for submitted collections |
+| V6 | customer payment method plus SDD debtor material; payment bank and collection attribution for submitted collections (the in-file "NULL for card payments" comment is pre-[R23f](roadmap.md#r23f) history — cards carry bank/collection attribution since the async spine; applied migrations are immutable, [G3](invariants.md#g3)) |
 | V7 | durable `settlement_inbox` with unique bank/notification identity and confirm-gated `published_at`; `payment.failure_reason` for terminal ISO outcomes |
 | V8 | `payment.charged_back_at`, separating the dispute timestamp from settlement completion |
 | V9 | tokenized card reference on `customer`, backfilled for legacy cards and required for every card customer |
@@ -646,14 +648,18 @@ Every runtime configuration key below has a real consumer.
 | `bank.timeout-ms` (consumer) | `BankProperties`, `BankClient` connect + read timeout; 10 s — polices hung counterparties, while overload backpressure comes from blocked listener threads ([D19](decisions.md#d19)) | alive |
 | `bank.registry[]` id/scheme/base URL/webhook secret/countries (consumer) | `BankProperties`, `BankRegistry`, `BankClient`, `BillingService`, `BankWebhookController`; `countries` is required only for `sepa_core`, and the registry requires exactly one `card` entry; compose overrides indexed `BANK_REGISTRY_*` env vars | alive |
 | `RECOVERY_STALE_AFTER_SECONDS` (consumer; yaml `recovery.stale-after-seconds`) | `RecoveryProperties`, `RecoverySweeper`; compose overrides the 300 s application default with 30 s for verify/demo | alive |
-| `RECOVERY_SWEEP_INTERVAL_MS` (consumer; yaml `recovery.sweep-interval-ms`) | `RecoveryProperties`, `RecoverySweeper`; compose overrides the 60000 ms application default with 10000 ms for verify/demo; also the initial delay — the first sweep fires one interval after startup, not at boot | alive |
-| `dunning.classes.*` (consumer; yaml only) | `DunningProperties`, `DunningLifecycle`; fixed reason-to-class policy, deliberately not env-overridable | alive |
+| `RECOVERY_SWEEP_INTERVAL_MS` (consumer; yaml `recovery.sweep-interval-ms`) | `RecoverySweeper`'s `@Scheduled` placeholders (fixed delay *and* initial delay — the first sweep fires one interval after startup, not at boot); compose overrides the 60000 ms application default with 10000 ms for verify/demo | alive |
+| `dunning.classes.*` (consumer; yaml only) | `DunningProperties`, `DunningLifecycle`, `DunningSweeper` (retriable-reason picker); fixed reason-to-class policy, deliberately not env-overridable | alive |
 | `DUNNING_RETRIABLE_GRACE_SECONDS` (consumer; yaml `dunning.retriable-grace-seconds`) | `DunningProperties`, `DunningLifecycle`; compose overrides the 604800 s application default with 120 s for verify/demo (bounded exhaustion demonstrably beats the expiry backstop at the compose cadence, D21) | alive |
 | `DUNNING_HARD_FAIL_GRACE_SECONDS` (consumer; yaml `dunning.hard-fail-grace-seconds`) | `DunningProperties`, `DunningLifecycle`; compose overrides the 259200 s application default with 60 s for verify/demo | alive |
 | `DUNNING_DISPUTE_GRACE_SECONDS` (consumer; yaml `dunning.dispute-grace-seconds`) | `DunningProperties`, `DunningLifecycle`; compose overrides the 1209600 s application default with 60 s for verify/demo | alive |
 | `DUNNING_RETRY_DELAY_SECONDS` (consumer; yaml `dunning.retry-delay-seconds`) | `DunningProperties`, `DunningSweeper`; compose overrides the 86400 s application default with 15 s for verify/demo | alive |
-| `DUNNING_MAX_ATTEMPTS` (consumer; yaml `dunning.max-attempts`) | `DunningProperties`, `DunningSweeper`, `DunningLifecycle`; total attempts (base + re-collections) before the sweeper cancels as exhausted; compose overrides the 4 application default with 3 for verify/demo | alive |
-| `DUNNING_SWEEP_INTERVAL_MS` (consumer; yaml `dunning.sweep-interval-ms`) | `DunningProperties`, `DunningSweeper`; compose overrides the 60000 ms application default with 10000 ms for verify/demo; also the initial delay — the first sweep fires one interval after startup, not at boot | alive |
+| `DUNNING_MAX_ATTEMPTS` (consumer; yaml `dunning.max-attempts`) | `DunningProperties`, `DunningSweeper` (which passes the bound into `DunningLifecycle.cancelExhausted`); total attempts (base + re-collections) before the sweeper cancels as exhausted; compose overrides the 4 application default with 3 for verify/demo | alive |
+| `DUNNING_SWEEP_INTERVAL_MS` (consumer; yaml `dunning.sweep-interval-ms`) | `DunningSweeper`'s `@Scheduled` placeholders (fixed delay *and* initial delay — the first sweep fires one interval after startup, not at boot); compose overrides the 60000 ms application default with 10000 ms for verify/demo | alive |
+| `SEED_CUSTOMERS` (seeder) | `CustomerSeeder`; compose-only seed size (default 15000) — every seeded subscription is due on the seed day, so this sets the size of the day's renewal batch | alive |
+| `SEED_SDD_PERCENT` (seeder) | `CustomerSeeder`; compose-only share of customers paying by SDD (deterministic: customer number modulo 100; default 20) | alive |
+| `SEED_SDD_RULE_PERCENT` (seeder) | `CustomerSeeder`; compose-only rule-bearing IBAN-suffix share inside the SDD cohort (cycling AM04/AC04/MD01/MD06; default 4) | alive |
+| `SEED_CARD_RULE_PERCENT` (seeder) | `CustomerSeeder`; compose-only rule-bearing card-token share inside the card cohort (cycling decline/chargeback cases; default 4) | alive |
 | `SEED_SDD_SILENT_PERCENT` (seeder) | `CustomerSeeder`; compose-only deterministic suffix-94 share inside the SDD cohort | alive |
 | `SEED_CARD_SILENT_PERCENT` (seeder) | `CustomerSeeder`; compose-only deterministic suffix-94 share inside the card cohort | alive |
 | `SEED_SDD_RETRY_PERCENT` (seeder) | `CustomerSeeder`; compose-only deterministic suffix-95 share inside the SDD cohort, mirroring the silent slice | alive |
@@ -669,16 +675,10 @@ and RabbitMQ; local `.env` values can still select bind-mount paths. The consume
 compose healthcheck hits `/actuator/health`, served by actuator since
 [R1](roadmap.md#r1).
 
-Seed configuration is compose-only: `SEED_CUSTOMERS` (default 15000),
-`SEED_SDD_PERCENT` (default 20), `SEED_SDD_RULE_PERCENT` (default 4),
-`SEED_CARD_RULE_PERCENT` (default 4),
-`SEED_SDD_SILENT_PERCENT` (default 2), and `SEED_CARD_SILENT_PERCENT` (default
-2), plus `SEED_SDD_RETRY_PERCENT` and `SEED_CARD_RETRY_PERCENT` (both default
-2), are read by `CustomerSeeder` in the seed container. They deterministically
-partition customers and assign rule-bearing, silent, or recoverable
-IBAN/card-token suffixes from the global customer number. Every seeded
-subscription is due on the seed day, so
-`SEED_CUSTOMERS` directly sets the size of the day's renewal batch;
+All eight `SEED_*` keys are compose-only and carried as truth-table rows above
+(the silent and retry shares default to 2% per cohort). Together they
+deterministically partition customers and assign rule-bearing, silent, or
+recoverable IBAN/card-token suffixes from the global customer number;
 `scripts/load-test.sh` adds more due-today volume to a running stack without a
 reseed.
 
@@ -687,7 +687,9 @@ envs: bank-a uses the `BANK_*` variables, bank-b uses the corresponding
 `BANK_B_*` values, and cardnet uses `CARDNET_*`; each container receives its own
 `BANK_ID`, `BANK_SCHEME`,
 `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`,
-`BANK_SETTLEMENT_DELAY_SECONDS`, and `BANK_CHARGEBACK_LAG_SECONDS`. All three
+`BANK_SETTLEMENT_DELAY_SECONDS`, and `BANK_CHARGEBACK_LAG_SECONDS`, and cardnet
+additionally raises `BANK_WORKERS` via `CARDNET_WORKERS` (default 4,
+[D19](decisions.md#d19)). All three
 share the compose-set delivery envelope `BANK_WEBHOOK_RETRY_MAX_ATTEMPTS` /
 `BANK_WEBHOOK_RETRY_BACKOFF_SECONDS` (default 8 attempts, 2 s base — wider than
 the image defaults, sized to outlive a chaos-scene consumer outage; the
@@ -702,8 +704,31 @@ replica; `verify.sh` sums the per-replica counters over that range
 On month-end clamp days (Jul 31, Dec 31, …) every seeding path falls back to the
 V5 yearly plan, whose one-year preimage exists on all such days; the monthly path
 covers Feb 29, where only the one-month preimage exists.
-The deploy images' env contracts (`FLYWAY_*`, `POSTGRES_*`) are catalogued under
-[Deploy artifacts](#deploy-artifacts).
+The deploy images' env contracts (`FLYWAY_*` and the seeder's
+`POSTGRES_URL`/`POSTGRES_USER`/`POSTGRES_PASSWORD`) are catalogued under
+[Deploy artifacts](#deploy-artifacts); the compose stack's own plumbing
+variables are the table below.
+
+### Stack plumbing (compose-only)
+
+Infrastructure wiring consumed by `docker-compose.yaml` itself (defaults from
+`.env.example`), not by application code — listed because the truth table is
+the documented coupling surface and these are the knobs a local override
+actually turns:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` | `admin` / `admin` | Database credentials, fed to Postgres, Flyway, the seeder, and both services' datasources |
+| `POSTGRES_DB` | `payfold` | Database name in every JDBC/Flyway URL |
+| `POSTGRES_PORT` | `5432` | Postgres host port |
+| `POSTGRES_VOLUME` | `pg_data` | Postgres data volume — named volume by default, a bind path if overridden |
+| `RABBITMQ_USER` / `RABBITMQ_PASSWORD` | `guest` / `guest` | Broker credentials, fed to the broker and both services |
+| `RABBITMQ_PORT` / `RABBITMQ_MGMT_PORT` | `5672` / `15672` | AMQP and management-API host ports |
+| `RABBITMQ_VOLUME` | `rmq_data` | Broker data volume |
+| `PRODUCER_HTTP_PORT` | `8080` | Producer host port (the consumer's range is documented above) |
+| `BANK_HTTP_PORT` / `BANK_B_HTTP_PORT` / `CARDNET_HTTP_PORT` | `8085` / `8086` / `8087` | Counterparty host ports |
+| `PROMETHEUS_PORT` / `GRAFANA_PORT` | `9090` / `3000` | Observability host ports |
+| `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` | `admin` / `payfold` | Mapped to Grafana's `GF_SECURITY_ADMIN_*`; anonymous viewer access is fixed in compose via `GF_AUTH_ANONYMOUS_ENABLED` + `GF_AUTH_ANONYMOUS_ORG_ROLE` |
 
 ## Ports & endpoints
 

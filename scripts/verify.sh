@@ -9,10 +9,14 @@
 # cross-checks same-run Prometheus/DB deltas; consumer
 # counters are summed across the replica port range.
 # It also re-runs the payfold-migrations image as a no-op run-to-completion Job.
-# It also requires Prometheus to be scraping both services and Grafana to serve
-# the provisioned pipeline dashboard anonymously.
-# It also requires the standalone mock-bank service to report healthy.
-# Phase 2 is closed: SDD renewals reach IBAN-predicted terminal states after async settlement, reconciled row-for-row against the inbox.
+# It also requires Prometheus to be scraping both services, Grafana to serve
+# the provisioned pipeline dashboard anonymously, and all three
+# mock-counterparty instances to report healthy.
+# Async settlement is asserted end to end: every payment reaches its
+# token/IBAN-predicted terminal state, reconciled row-for-row against the
+# settlement inbox; the silent (94) cohorts recover through the sweeper, the
+# retriable (95) cohorts re-collect and settle, and the dunning matrix ends in
+# exact per-family cancellations with the sweeper provably quiescent.
 #
 # Usage:
 #   scripts/verify.sh [--no-up] [--timeout SECONDS] [--poison|--no-poison]

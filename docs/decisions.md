@@ -57,10 +57,12 @@ until R8 (2026-07-20), which introduced a WireMock mock called over HTTP with a
 deterministic subscription-id failure rule.
 **Why:** the project's point is delivery semantics (outbox, idempotency, failure
 routing) — provider integration is orthogonal and would have front-loaded complexity.
-**Current state:** provider outcomes are business failures and are never dead-lettered;
-failed payments are terminal, with dunning still a non-goal. A "payment" still moves
-no real money, so the real-PSP boundary in the [non-goals table](roadmap.md#non-goals)
-is unchanged.
+**Current state:** provider outcomes are business failures and are never dead-lettered.
+Since the dunning epic ([D16](decisions.md#d16), [R26](roadmap.md#r26), 2026-08-01)
+failed payments are no longer terminal facts: they enter the `past_due` grace
+lifecycle, retriable reasons re-collect on schedule, and bounded exhaustion or grace
+expiry cancels. A "payment" still moves no real money, so the real-PSP boundary in
+the [non-goals table](roadmap.md#non-goals) is unchanged.
 
 ## D6 — Spring Batch tasklets over a custom loop — pre-2026-07 — active
 <a id="d6"></a>

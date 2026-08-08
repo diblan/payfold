@@ -212,7 +212,7 @@ services:
       SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER}
       SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
 
-      # App-specific props (match your application.yml keys)
+      # App-specific props (relaxed-binding names for the consumer's application.yaml keys)
       SPRING_RABBITMQ_LISTENER_SIMPLE_CONCURRENCY: ${CONSUMER_LISTENER_CONCURRENCY:-1}
       RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE}
       RABBITMQ_QUEUE: ${RABBITMQ_QUEUE}

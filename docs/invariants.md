@@ -66,15 +66,18 @@ No floats, no implicit currency. Every amount column and payload field is
 <a id="g5"></a>
 ## G5 — Unprocessable messages reach the DLQ in bounded attempts
 
-A message that cannot be processed must land in `billing.renewals.dlq` after a bounded
-number of attempts. Never infinite requeue; never silent drop.
+A message that cannot be processed must land in its queue's DLQ after a bounded
+number of attempts — renewals in `billing.renewals.dlq`, settlements in
+`billing.settlements.dlq` (since [R23c](roadmap.md#r23c) both listener types share
+one bounded-retry customizer). Never infinite requeue; never silent drop.
 
 *Why:* poison messages must not block the listener forever or disappear outside the
 observable failure path.
 *Enforced by:* a five-attempt retry cap with bounded exponential backoff; DLX + explicit
-`dlq` routing key; `default-requeue-rejected: false`; a no-retry fast path for
-deterministic contract violations; a poison-path integration test; and the strict
-`verify.sh` poison probe.
+`dlq` routing key on both main queues; `default-requeue-rejected: false`; a no-retry
+fast path for deterministic contract violations; poison-path integration tests for
+both listeners; and the strict `verify.sh` poison probe plus its settlements-DLQ-empty
+checks.
 *Status:* **HELD** (since R5, 2026-07-20)
 
 <a id="g6"></a>
@@ -99,14 +102,16 @@ verify.sh, the change is wrong (or the tightening belongs in the same PR).
 <a id="g8"></a>
 ## G8 — The message payload is a versioned contract
 
-The `renewal.requested` payload is a contract between producer and consumer. Within a
-version, changes are additive only (consumers tolerate unknown fields); removing or
-re-typing a field requires a version bump and a decision entry.
-The contract includes delivery semantics: `renewal.requested` is delivered
-at-least-once. Duplicates are possible at any time, including the [R6](roadmap.md#r6)
-confirm-timeout re-publish window, and consumers must remain idempotent per
-[G2](invariants.md#g2).
+Every queue payload is a versioned contract: `renewal.requested` between producer
+and consumer, and since [R23c](roadmap.md#r23c) the internal `settlement.received`
+between the webhook relay and the settlement listener. Within a version, changes
+are additive only (consumers tolerate unknown fields); removing or re-typing a
+field requires a version bump and a decision entry.
+The contracts include delivery semantics: both are delivered at-least-once.
+Duplicates are possible at any time, including the [R6](roadmap.md#r6)
+confirm-timeout re-publish window and the inbox relay's confirm/crash window, and
+consumers must remain idempotent per [G2](invariants.md#g2).
 
-*Status:* **HELD** — contract v1 is documented in
+*Status:* **HELD** — both contracts are at v1, documented in
 [architecture.md](architecture.md#message-contract--renewalrequested-v1) and fully
-populated by the producer.
+populated by their producers.
