@@ -803,7 +803,7 @@ seeder), `scripts/load-test.sh 5000` completes green against a running
 stack, and the script's README/architecture mentions stay accurate.
 
 <a id="r39"></a>
-### [ ] R39 — Re-measure the 100k scaling-lever matrix post-D23
+### [ ] R39 — Re-measure the 100k scaling-lever matrix post-D23 *(blocked on [R40](#r40)/[R41](#r41))*
 **Scope:** measurement + docs only (quality.md "Measured scale runs", README,
 architecture honesty table); no behavior changes — the [R30](#r30) shape.
 Every 100k lever number predates [D23](decisions.md#d23)'s counterparty stall
@@ -817,3 +817,72 @@ directions (the substrate ceiling may finally be real, or may move again).
 ×3 replicas, conc-8) are re-run green with drain and completion measured per
 [R30](#r30)'s two-quantity method; quality.md, README, and the honesty table
 quote the new numbers with the old records kept as dated history.
+*2026-08-20 attempt: the conc-1 baseline ran red — the settlement relay's
+serialized-confirm ceiling (~60–135/s) sits below the post-D23 consume rate
+and its inbox backlog races the dunning grace clock ([R40](#r40)) while
+delivery retries reorder a handful of chargebacks ([R41](#r41)). Forensic
+numbers in quality.md "Measured scale runs" (dated entry); the matrix
+re-runs after both land.*
+
+<a id="r40"></a>
+### [ ] R40 — Settlement relay serializes per-row confirms; post-D23 consume outruns it and the dunning grace clock mass-cancels recovered subscriptions
+**Scope:** design first — `SettlementInboxRelay`'s publish path (the
+[R11](#r11)/[R25](#r25) pipelined-publish + bounded in-flight-confirm shape
+the producer already demonstrates, or equivalent), decided at execution;
+consumer image changes — tag proposal expected. Grace *values* stay policy
+([D21](decisions.md#d21)): if a margin still needs moving once the relay
+keeps pace, that is its own decision entry, not a silent widening.
+Observed 2026-08-20 during [R39](#r39)'s conc-1 100k baseline (fresh boot,
+`verify.sh --no-up --timeout 3600`): drain 100,000 in 1,236 s = **81/s**
+(Prometheus: 193/s first-minute peak, sagging as the settlement spine loads
+the same JVM and WAL; 15k measures 195/s), completion 1,685 s — and verify
+**red**. The relay publishes each `settlement_inbox` row with a synchronous
+per-row confirm wait (`CorrelationData` future `.get(5s)` — one broker RTT
+per row, serialized) plus a per-row `published_at` UPDATE, in 100-row pages
+every 500 ms: measured ~135/s peak / ~59/s mean, while webhook arrival
+tracks the consume rate (p50 receive lag 1.0 s). The backlog therefore lives
+in *unpublished inbox rows* (relay lag p50 166 s / max 322 s; the
+settlements queue itself never exceeded 1,014). Downstream, the
+compose-scaled dunning deadlines run on the wall clock while recovery
+signals ride that backlog: **2,019 of 4,000 suffix-95 subscriptions were
+grace-expiry-canceled** even though every one failed attempt 1 and settled
+attempt 2 (canceled cohort's attempt-1→attempt-2-settled gap: min 187 s ≈
+the 180 s retriable grace, median 341 s, max 651 s; recovered cohort p50
+106 s) — cancellation is terminal by design, so the late settlement cannot
+resurrect them. The 2026-08-01 runs never saw this: pre-D23 conc-1 arrival
+(62/s) sat under the relay ceiling, and conc-8's ~157/s only marginally
+outran it (18-min completion tail, no grace casualties at the then-120 s
+margin). The [R17](#r17)/[R27](#r27) measurement-race class has a
+production-shaped sibling: this one cancels real customers.
+**Done when:** the relay demonstrably sustains at least the measured consume
+arrival rate at 100k (bounded in-flight budget, zero-progress failure kept);
+the conc-1 100k `verify.sh --no-up --timeout 3600` run passes green with
+zero falsely-canceled 95s; [R39](#r39) is unblocked.
+
+<a id="r41"></a>
+### [ ] R41 — Reordered chargeback leaves the invoice posted and the subscription unadvanced, then dispute grace cancels it
+**Scope:** settlement listener chargeback path + the direct-service grace
+suite; consumer image change — tag proposal expected.
+Observed 2026-08-20 (same run as [R40](#r40)): 4 of 2,333 chargebacks (3
+SDD, 1 card) had the chargeback notification (`:2`) *received* before their
+settled notification (`:1`) — the counterparty's per-collection sends are
+ordered ([R23a](#r23a) tests hold), but a delivery retry under receiver
+load lets the independent chargeback task overtake the settled one
+(give-ups zero; ordering guarantees end at the first failed attempt). The
+reordered path records the payment `charged_back` (correct, and the
+existing both-orders tests cover exactly that), but the invoice stays
+`posted` — never paid, never marked `disputed` (the disputed mark evidently
+guards on `paid`) — and the subscription never advances, because the late
+settled notification no-ops against the terminal payment and the
+settle-advance never runs; the subscription then dispute-grace-cancels.
+Ordered arrival of the same rules ends: invoice `disputed`, period
+advanced, `past_due` grace ([D16](decisions.md#d16)'s "recorded fact on an
+advanced subscription"). Terminal state currently depends on delivery
+timing — the determinism story breaks at exactly the load where retries
+begin. Caught by verify.sh's invoice-disputed (count=4) and no-rollback
+(count=3) checks.
+**Done when:** an integration test delivers chargeback-before-settled and
+asserts the same terminal invoice and subscription state as the ordered
+case (invoice `disputed`, period advanced, dispute-class grace applied,
+idempotent under redelivery of either notification); verify.sh's existing
+exact chargeback checks pass at the 100k scale where the reorder occurs.

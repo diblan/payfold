@@ -81,6 +81,32 @@ exact deterministic card-token and SDD-IBAN outcome assertions.
 
 ## Measured scale runs
 
+- **2026-08-20 — the [R39](roadmap.md#r39) conc-1 100k re-measure attempt:
+  red, not a measurement — the settlement relay is the post-D23 constraint
+  (the commit this entry ships in; WSL2 Docker Compose stack, k3d neighbor
+  cluster active at ~0.1–0.7 of one core on 20).** Fresh-boot 100k at 1
+  replica × concurrency 1: drain 100,000 in **1,236 s = 81/s** (Prometheus
+  cross-check: 193/s first-minute peak, sagging as the settlement spine
+  loads the same JVM and WAL — the 15k demo scale still measures 195/s),
+  end-to-end completion **1,685 s** — but `verify.sh --no-up --timeout 3600`
+  went **red** on three checks, all downstream of one mechanism.
+  [SettlementInboxRelay](../payment-service/renewal-consumer/src/main/java/com/blanchaert/billing/consumer/mq/SettlementInboxRelay.java)
+  publishes each inbox row with a serialized per-row confirm wait plus a
+  per-row UPDATE (100-row pages, 500 ms cadence): measured ~135/s peak /
+  ~59/s mean against webhook arrival that tracks the consume rate (p50
+  receive lag 1.0 s), so the backlog accumulates as *unpublished inbox rows*
+  (relay lag p50 166 s / max 322 s; the settlements queue never exceeded
+  1,014). The wall-clock dunning grace then races that backlog: 2,019 of
+  4,000 suffix-95 subscriptions grace-expiry-canceled despite every one
+  settling on attempt 2 (canceled cohort's attempt-1→settled-attempt-2 gap:
+  min 187 s ≈ the 180 s retriable grace, median 341 s), and 4 chargebacks
+  arrived reordered via delivery retries, stranding invoices `posted` and
+  subscriptions unadvanced-then-canceled. Filed as [R40](roadmap.md#r40)
+  (relay throughput / grace race) and [R41](roadmap.md#r41) (reordered
+  chargeback semantics); the ×3-replica and conc-8 configs were not run —
+  the matrix re-measures after both land. The 2026-08-01 numbers below stand
+  as the current dated record.
+
 - **2026-08-08 — the consume-cost regression diagnosed to a socket option;
   conc-1 more than tripled (R36/D22/D23, the commit this entry ships in; WSL2
   Docker Compose stack).** [R36](roadmap.md#r36)'s 16 → ~43 ms consume-cost
