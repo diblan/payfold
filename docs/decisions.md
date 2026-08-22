@@ -797,3 +797,35 @@ pair (settled/chargeback of one collection) convergent, and the at-scale
 acceptance run therefore executes after R41 lands. Grace *values* move
 nowhere ([D21](#d21): policy; if a margin still needs moving once the relay
 keeps pace, that is its own decision entry).
+
+## D25 — The 100k exhaustion-path tail outruns the 15k-sized retriable backstop; D21's margin lever applies — 2026-08-22 — active
+<a id="d25"></a>
+Found by the first [R40](roadmap.md#r40) acceptance attempt (conc-1 100k,
+2026-08-22) — the first run ever to exercise [R26c](roadmap.md#r26c)'s
+cause-attribution matrix at 100k with a healthy settlement spine (the 8-01
+conc-8 run predates R26c; the 8-20 run died on the relay backlog). Everything
+[D24](#d24) promised held: relay lag p50 0.28 s / max 2.55 s (was 166 s /
+322 s), zero unpublished rows, **zero falsely-canceled 95s** (4,000/4,000
+recovered), every chargeback invoice `disputed` and advanced. The one red:
+**25 of 2,334 99-family cancellations attributed `grace_expired` instead of
+`exhausted`** — the [D21](#d21) attribution bet, lost by a 1.1% tail.
+
+**Measured mechanism, not a stall:** every 99 completed exactly its 3 bounded
+attempts; the fail-path (first→third failure) is p50 45 s but **max 205 s** at
+100k — the sweep-cycle segments stretch under drain load (each 10 s tick's
+serial re-collection submissions + two settlement-spine round trips ride the
+same JVM/WAL as the drain) — so the tail's third failure lands after the
+180 s backstop and the class-blind expiry pass wins the race D21 ordered it
+to lose. The backstop was sized at 15k (path 75–90 s, ≥2× margin,
+[D23](#d23)); 100k stretched the path past it.
+
+**Decision: D21's sanctioned lever, sized by measurement — compose
+`DUNNING_RETRIABLE_GRACE_SECONDS` 180 → 600** (~3× the measured 205 s max
+path). Nothing at any scale *waits* for the retriable backstop (exhaustion
+drives every non-pathological cancellation; `hard_fail`/`dispute` keep their
+own 60 s), so the widening costs no verify/demo wall-clock and protects the
+95 recovery margin as a side effect. The stated bet: conc-8 clusters failures
+tighter and may stretch the tail further; 600 s carries ~3× headroom, and the
+exact cause-attribution checks remain the tripwire if that bet is wrong.
+Application default (604800 s) untouched; policy stays in config
+([D21](#d21)).
