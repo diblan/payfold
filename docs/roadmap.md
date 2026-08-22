@@ -803,7 +803,7 @@ seeder), `scripts/load-test.sh 5000` completes green against a running
 stack, and the script's README/architecture mentions stay accurate.
 
 <a id="r39"></a>
-### [ ] R39 — Re-measure the 100k scaling-lever matrix post-D23 *(blocked on [R40](#r40)/[R41](#r41))*
+### [ ] R39 — Re-measure the 100k scaling-lever matrix post-D23
 **Scope:** measurement + docs only (quality.md "Measured scale runs", README,
 architecture honesty table); no behavior changes — the [R30](#r30) shape.
 Every 100k lever number predates [D23](decisions.md#d23)'s counterparty stall
@@ -825,7 +825,11 @@ numbers in quality.md "Measured scale runs" (dated entry); the matrix
 re-runs after both land.*
 
 <a id="r40"></a>
-### [ ] R40 — Settlement relay serializes per-row confirms; post-D23 consume outruns it and the dunning grace clock mass-cancels recovered subscriptions
+### [x] R40 — Settlement relay serializes per-row confirms; post-D23 consume outruns it and the dunning grace clock mass-cancels recovered subscriptions
+*Closed 2026-08-22 ([D24](decisions.md#d24) design): green conc-1 100k run
+with relay lag p50 0.27 s / max 2.09 s (was 166 s / 322 s), 209/s relay
+peak, zero falsely-canceled 95s. The first acceptance attempt exposed a
+separate 25-straggler attribution tail — [D25](decisions.md#d25).*
 **Scope:** design first — `SettlementInboxRelay`'s publish path (the
 [R11](#r11)/[R25](#r25) pipelined-publish + bounded in-flight-confirm shape
 the producer already demonstrates, or equivalent), decided at execution;
@@ -860,7 +864,11 @@ the conc-1 100k `verify.sh --no-up --timeout 3600` run passes green with
 zero falsely-canceled 95s; [R39](#r39) is unblocked.
 
 <a id="r41"></a>
-### [ ] R41 — Reordered chargeback leaves the invoice posted and the subscription unadvanced, then dispute grace cancels it
+### [x] R41 — Reordered chargeback leaves the invoice posted and the subscription unadvanced, then dispute grace cancels it
+*Closed 2026-08-22: the chargeback branch applies the full settle-implied
+composite (direct-service and real-spine tests assert both orders and both
+no-ops); the green conc-1 100k run passed every exact chargeback check with
+all 2,333 invoices `disputed` and advanced.*
 **Scope:** settlement listener chargeback path + the direct-service grace
 suite; consumer image change — tag proposal expected.
 Observed 2026-08-20 (same run as [R40](#r40)): 4 of 2,333 chargebacks (3
