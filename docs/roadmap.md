@@ -803,7 +803,7 @@ seeder), `scripts/load-test.sh 5000` completes green against a running
 stack, and the script's README/architecture mentions stay accurate.
 
 <a id="r39"></a>
-### [ ] R39 — Re-measure the 100k scaling-lever matrix post-D23
+### [x] R39 — Re-measure the 100k scaling-lever matrix post-D23
 **Scope:** measurement + docs only (quality.md "Measured scale runs", README,
 architecture honesty table); no behavior changes — the [R30](#r30) shape.
 Every 100k lever number predates [D23](decisions.md#d23)'s counterparty stall

@@ -81,6 +81,47 @@ exact deterministic card-token and SDD-IBAN outcome assertions.
 
 ## Measured scale runs
 
+- **2026-08-22 — the [R39](roadmap.md#r39) 100k matrix re-measured on the
+  [D24](decisions.md#d24) relay + [R41](roadmap.md#r41) convergence (the
+  commit this entry ships in; WSL2 Docker Compose stack, k3d neighbor
+  cluster active at ~0.05–0.6 of one core on 20).** Three fresh-boot
+  `SEED_CUSTOMERS=100000` runs, strictly serial, each
+  `verify.sh --no-up --timeout 3600` green (224 checks); drain from
+  `payment` timestamps on the Postgres clock (min→max `requested_at` at
+  attempt = 1), completion as every-payment-terminal (max `completed_at`),
+  cross-checked against Prometheus `query_range`; relay behavior from
+  `settlement_inbox` timestamps.
+  *Baseline* (1 replica × concurrency 1): drain 100,000 in **899 s =
+  111/s** (~186/s first three minutes, ~90–95/s sustained as the settlement
+  spine shares the JVM and WAL); completion **1,046 s**; relay lag p50
+  **0.27 s** / max 2.09 s (the 2026-08-20 red run measured p50 166 s / max
+  322 s), publish peak 209/s, zero unpublished rows; **zero
+  falsely-canceled 95s** (4,000/4,000 recovered).
+  *3 replicas × concurrency 1*: drain 100,000 in **388 s = 258/s**
+  (~2.3× baseline; round-robin split 33,326 / 33,365 / 33,309 = 0.17%
+  spread); completion **474 s**; three SKIP-LOCKED relays over one inbox,
+  fleet lag p50 0.17 s / max 1.26 s, fleet publish peak 440/s.
+  *Concurrency 8* (one JVM): drain 100,000 in **219 s = 457/s**
+  (Prometheus: 618/s first minute, sagging toward ~190/s as the same-JVM
+  settlement spine competes for cycles); completion **529 s** — the ~310 s
+  settlement tail is one relay + one settlement listener draining the
+  backlog the burst built; the single relay absorbed the 618/s burst at
+  p50 0.45 s / max 2.98 s lag, publish peak 687/s.
+  The honest next constraint: with the relay off the critical path, conc-1
+  is bounded by the single renewal-listener thread sharing its JVM with the
+  whole settlement spine, and at conc-8 the drain outruns the per-JVM
+  settlement side while Postgres absorbs every write (~200–250% CPU during
+  bursts) — in-process concurrency is again the cheaper local lever on one
+  host (457/s vs the fleet's 258/s). The first conc-1 attempt ran red on
+  one check family: 25 of 2,334 99-family cancellations attributed to the
+  expiry backstop because the 100k exhaustion-path tail (max 205 s, every
+  attempt completed) outran the 15k-sized 180 s retriable grace —
+  [D25](decisions.md#d25) applied [D21](decisions.md#d21)'s sanctioned
+  margin lever (180 → 600 s) and the rerun plus both remaining configs
+  passed with exact cause attribution. No chargeback arrived reordered in
+  any green run (the 2026-08-20 run measured 4; R41's convergence is
+  proven by the spine tests and the exact invoice/advance checks at 100k).
+
 - **2026-08-20 — the [R39](roadmap.md#r39) conc-1 100k re-measure attempt:
   red, not a measurement — the settlement relay is the post-D23 constraint
   (the commit this entry ships in; WSL2 Docker Compose stack, k3d neighbor

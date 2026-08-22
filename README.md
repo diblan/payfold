@@ -105,51 +105,52 @@ under "Measured scale runs".
 
 Since the async settlement spine ([R23f](docs/roadmap.md#r23f)) a consume is a
 fast synchronous auth/submission while settlement arrives later as an event, so
-two quantities are measured (2026-08-01, [R30](docs/roadmap.md#r30)): the
-renewals-queue **drain rate** and **end-to-end completion** — every payment at
-its token/IBAN-predicted terminal state, zero stuck `submitted`, including the
+two quantities are measured ([R30](docs/roadmap.md#r30)): the renewals-queue
+**drain rate** and **end-to-end completion** — every payment at its
+token/IBAN-predicted terminal state, zero stuck `submitted`, including the
 cohort that only completes through the recovery sweeper.
 
 - **Producer (scan + publish):** 1,015,000 due renewals scanned and published in
   459 s wall at 183 MiB peak heap (1M-row run). At 100k the whole job takes ~22 s —
   a 330k night is roughly 2.5 minutes of publishing.
-- **Consumer (bill + settle):** measured 2026-08-08 after
-  [D22](docs/decisions.md#d22)/[D23](docs/decisions.md#d23): the 15k demo
-  cohort drains at **195/s single-consumer** (~6 ms per consume) with
-  end-to-end completion — every payment terminal, recovery and the full
-  dunning arc included — in **163 s**. The dated 100k record (2026-08-01,
-  pre-fix) drained at **62/s** with completion at 1,639 s; a 100k re-run on
-  the fixed system is [R39](docs/roadmap.md#r39). In between sat a diagnosed
-  regression worth reading about: a multi-worker uvicorn socket option let
-  Nagle's algorithm tax every consume ~40 ms ([D23](docs/decisions.md#d23)).
-- **Extrapolation:** even at the conservative dated 62/s, a 330k nightly batch
-  drains in ~1.5 hours — **15–16× the 3.8/s average** the 10M/month target
-  requires; at the post-fix single-consumer rate the same batch clears in
-  under 30 minutes.
+- **Consumer (bill + settle):** measured 2026-08-22 at 100k on the
+  [D24](docs/decisions.md#d24) settlement relay: single consumer at
+  concurrency 1 drains 100,000 renewals in **899 s — 111/s** with end-to-end
+  completion — every payment terminal, recovery and the full dunning arc
+  included — in **1,046 s**; the 15k demo cohort measures **195/s** (~6 ms
+  per consume). Getting here twice cost a diagnosis each: a multi-worker
+  uvicorn socket option let Nagle's algorithm tax every consume ~40 ms
+  ([D23](docs/decisions.md#d23)), and the relay's serialized per-row
+  confirms then capped the settlement spine below the fixed consume rate
+  until [D24](docs/decisions.md#d24) pipelined them (relay lag p50 fell
+  from 166 s to 0.27 s).
+- **Extrapolation:** at the measured 100k single-consumer rate (111/s), a
+  330k nightly batch is ~2.5 minutes of publishing plus **~50 minutes of
+  draining — 29× the 3.8/s average** the 10M/month target requires; the
+  concurrency-8 rate below clears the same batch in ~12 minutes.
 
 The single-thread consumer default is the binding constraint — and its two
-scaling levers are measured, not promised (measured 2026-08-01 on the async
-spine, pre-[D23](docs/decisions.md#d23) — the [R39](docs/roadmap.md#r39)
-re-measure will refresh both; safe by design, because idempotency lives in
-database unique constraints, not in consumer state):
+scaling levers are measured, not promised (re-measured 2026-08-22 at 100k on
+the D24 relay; safe by design, because idempotency lives in database unique
+constraints, not in consumer state):
 
 - **3 consumer replicas** (`docker compose up --scale renewal-consumer=3`,
-  concurrency 1 each): 100k drained in **642 s — 156/s, ~2.5× baseline** and
-  fully settled in 675 s, with RabbitMQ round-robin splitting the work
-  33,338 / 33,307 / 33,355. A 330k nightly batch drains in ~35 minutes.
-  Same-host replicas share one machine; replica scaling is the
-  fault-tolerance and multi-node story (autoscaled across real hardware in
-  the companion platform repo).
+  concurrency 1 each): 100k drained in **388 s — 258/s, ~2.3× baseline** and
+  fully settled in 474 s, with RabbitMQ round-robin splitting the work
+  33,326 / 33,365 / 33,309 and three `SKIP LOCKED` relays sharing one inbox
+  (fleet publish peak 440/s). Same-host replicas share one machine; replica
+  scaling is the fault-tolerance and multi-node story (autoscaled across
+  real hardware in the companion platform repo).
 - **Listener concurrency ×8** (one JVM, `CONSUMER_LISTENER_CONCURRENCY=8`):
-  100k drained in **638 s — 157/s** (~190/s warm-up, ~150/s sustained) and
-  fully settled in 1,739 s, with **zero dead-letters and zero submit
-  timeouts**. An earlier run collapsed here — the consume burst saturated the
-  single-worker mock counterparty and bounded retries dead-lettered good
-  renewals; [R32](docs/roadmap.md#r32) fixed both sides (multi-worker cardnet,
-  and a timeout budget that treats overload as backpressure, not poison —
-  [D19](docs/decisions.md#d19)). On one host both levers now cap at the shared
-  substrate (~156/s); the pre-async 524/s figure was measured against a stub
-  that did no outbound work. Measured, not claimed — cuts both ways.
+  100k drained in **219 s — 457/s** (618/s first minute, sagging as the
+  same-JVM settlement spine competes) and fully settled in 529 s, with
+  **zero dead-letters and zero submit timeouts** — the single relay absorbed
+  the burst at sub-3 s lag (publish peak 687/s). On one host, in-process
+  concurrency is the cheaper lever (457/s vs the fleet's 258/s), and the
+  binding constraint has moved to the shared substrate: one Postgres
+  absorbing every write and the per-JVM settlement side draining the
+  backlog the burst builds. The pre-async 524/s figure was measured against
+  a stub that did no outbound work. Measured, not claimed — cuts both ways.
 
 Reproduce it yourself:
 
