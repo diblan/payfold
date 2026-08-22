@@ -1,5 +1,6 @@
 package com.blanchaert.billing.consumer.mq;
 
+import com.blanchaert.billing.consumer.config.RelayProperties;
 import com.blanchaert.billing.consumer.config.SettlementTopology;
 import com.blanchaert.billing.consumer.model.SettlementReceived;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -16,8 +17,10 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
 @Component
@@ -27,12 +30,14 @@ public class SettlementInboxRelay {
     private final JdbcTemplate jdbc;
     private final RabbitTemplate rabbitTemplate;
     private final ObjectMapper objectMapper;
+    private final RelayProperties properties;
 
     public SettlementInboxRelay(JdbcTemplate jdbc, RabbitTemplate rabbitTemplate,
-                                ObjectMapper objectMapper) {
+                                ObjectMapper objectMapper, RelayProperties properties) {
         this.jdbc = jdbc;
         this.rabbitTemplate = rabbitTemplate;
         this.objectMapper = objectMapper;
+        this.properties = properties;
     }
 
     @Scheduled(fixedDelay = 500)
@@ -43,15 +48,27 @@ public class SettlementInboxRelay {
                         FROM settlement_inbox
                         WHERE published_at IS NULL
                         ORDER BY received_at
-                        LIMIT 100
+                        LIMIT ?
                         FOR UPDATE SKIP LOCKED
                         """,
                 (rs, rowNum) -> new InboxRow(
                         rs.getObject("id", UUID.class),
                         rs.getString("bank_id"),
                         rs.getString("notification_id"),
-                        rs.getString("payload")));
+                        rs.getString("payload")),
+                properties.pageSize());
+        if (rows.isEmpty()) {
+            return;
+        }
 
+        // One deadline spans the send loop and the confirm await; the window is
+        // page-scoped so a stalled page can never leak permits into later ones
+        // (D24). Permit release rides confirm-future completion, which
+        // spring-rabbit performs synchronously with ack delivery (D14).
+        long deadlineNanos = System.nanoTime()
+                + TimeUnit.MILLISECONDS.toNanos(properties.confirmTimeoutMs());
+        Semaphore window = new Semaphore(properties.inFlightLimit());
+        List<PendingPublish> pending = new ArrayList<>(rows.size());
         for (InboxRow row : rows) {
             try {
                 SettlementReceived event = normalize(row);
@@ -59,29 +76,70 @@ public class SettlementInboxRelay {
                         .withBody(objectMapper.writeValueAsBytes(event))
                         .setContentType(MessageProperties.CONTENT_TYPE_JSON)
                         .build();
+                if (!window.tryAcquire(remaining(deadlineNanos), TimeUnit.NANOSECONDS)) {
+                    log.warn("Settlement relay confirm window stalled to the page deadline"
+                                    + " before inbox row {}; unsent rows stay unpublished",
+                            row.id());
+                    break;
+                }
                 CorrelationData correlationData = new CorrelationData();
+                correlationData.getFuture().whenComplete(
+                        (confirm, cause) -> window.release());
                 rabbitTemplate.convertAndSend(
                         SettlementTopology.EXCHANGE,
                         SettlementTopology.ROUTING_KEY,
                         message,
                         correlationData);
-                CorrelationData.Confirm confirm =
-                        correlationData.getFuture().get(5, TimeUnit.SECONDS);
-                if (!confirm.isAck()) {
-                    log.warn("Settlement relay publish nacked for inbox row {}: {}",
-                            row.id(), confirm.getReason());
-                    return;
-                }
-                jdbc.update("""
-                        UPDATE settlement_inbox
-                        SET published_at = now()
-                        WHERE id = ?
-                        """, row.id());
+                pending.add(new PendingPublish(row, correlationData));
             } catch (Exception exception) {
-                log.warn("Settlement relay stopped at inbox row {}", row.id(), exception);
-                return;
+                log.warn("Settlement relay stopped sending at inbox row {}",
+                        row.id(), exception);
+                break;
             }
         }
+
+        List<UUID> acked = new ArrayList<>(pending.size());
+        int unconfirmed = 0;
+        for (PendingPublish publish : pending) {
+            try {
+                CorrelationData.Confirm confirm = publish.correlation().getFuture()
+                        .get(remaining(deadlineNanos), TimeUnit.NANOSECONDS);
+                if (confirm.isAck()) {
+                    acked.add(publish.row().id());
+                } else {
+                    // Siblings keep awaiting: their acks still mark, and the
+                    // nacked row stays unpublished for the next tick.
+                    log.warn("Settlement relay publish nacked for inbox row {}: {}",
+                            publish.row().id(), confirm.getReason());
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                log.warn("Settlement relay interrupted awaiting confirms;"
+                        + " unmarked rows re-pick next tick");
+                break;
+            } catch (Exception exception) {
+                // Past the deadline every remaining get() returns instantly, so
+                // already-confirmed siblings still mark; this row stays
+                // unpublished for the next tick.
+                unconfirmed++;
+            }
+        }
+        if (unconfirmed > 0) {
+            log.warn("Settlement relay page deadline passed with {} of {} sends"
+                            + " unconfirmed; unconfirmed rows stay unpublished",
+                    unconfirmed, pending.size());
+        }
+        if (!acked.isEmpty()) {
+            jdbc.batchUpdate("""
+                    UPDATE settlement_inbox
+                    SET published_at = now()
+                    WHERE id = ?
+                    """, acked.stream().map(id -> new Object[] {id}).toList());
+        }
+    }
+
+    private long remaining(long deadlineNanos) {
+        return Math.max(0L, deadlineNanos - System.nanoTime());
     }
 
     private SettlementReceived normalize(InboxRow row) throws Exception {
@@ -102,5 +160,8 @@ public class SettlementInboxRelay {
     }
 
     private record InboxRow(UUID id, String bankId, String notificationId, String payload) {
+    }
+
+    private record PendingPublish(InboxRow row, CorrelationData correlation) {
     }
 }

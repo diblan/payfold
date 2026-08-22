@@ -241,13 +241,19 @@ collection id, safe because the counterparty's outcome is deterministic. This
 mirrors pull-shaped SEPA reporting and prevents a missed push from stranding a
 payment ([D18](decisions.md#d18)).
 
-Each inbox row is also its own outbox. A scheduled relay claims up to 100
-unpublished rows with `FOR UPDATE SKIP LOCKED`, so replicas safely compete,
-normalizes each payload to `settlement.received` v1, and waits synchronously for
-its correlated broker confirm. Only an ack sets `published_at`; a nack, timeout,
-or exception stops the page and leaves the row available for the next tick.
-That confirm/crash window is deliberately at-least-once, with queue-side
-idempotency absorbing duplicates.
+Each inbox row is also its own outbox. A scheduled relay claims up to
+`relay.page-size` unpublished rows (default 500, one page per 500 ms tick) with
+`FOR UPDATE SKIP LOCKED`, so replicas safely compete, normalizes each payload
+to `settlement.received` v1, and pipelines the page's sends behind a bounded
+in-flight confirm window (`relay.in-flight-limit`, default 100 — the producer's
+publish-window shape, inbound; [D24](decisions.md#d24)). One page-scoped
+deadline (`relay.confirm-timeout-ms`, default 5 s) bounds the send loop and the
+confirm await together; `published_at` is then batch-marked for exactly the
+acked rows. A nack, stall, timeout, or exception is loud (WARN) and leaves its
+rows unpublished for the next tick. Pipelined sends ride multiple channels, so
+strict page FIFO is not guaranteed — arrival-order independence is the
+settlement listener's contract (below). That confirm/crash window is
+deliberately at-least-once, with queue-side idempotency absorbing duplicates.
 
 `SettlementListener` consumes the fixed `billing.settlements.main` queue.
 `SettlementService` accepts state transitions only through SQL guards with
@@ -646,12 +652,14 @@ Every runtime configuration key below has a real consumer.
 | `spring.batch.jdbc.initialize-schema` (producer) | Spring Batch | alive |
 | `spring.rabbitmq.publisher-confirm-type` (producer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` confirm type); load-bearing: without it confirm futures never complete and every page times out | alive |
 | `spring.rabbitmq.publisher-confirm-type` (consumer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` confirm type); load-bearing: the inbox relay gates `published_at` on correlated broker confirms | alive |
+| `spring.rabbitmq.cache.channel.size` (consumer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` channel cache size); kept equal to `relay.in-flight-limit` so parked confirm channels re-cache and are reused ([D24](decisions.md#d24)) | alive |
 | `spring.rabbitmq.publisher-returns` (producer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` returns support); load-bearing: without it the broker's `basic.return` is never delivered and an unroutable message is silently confirm-acked | alive |
 | `spring.rabbitmq.template.mandatory` (producer) | Spring Boot AMQP autoconfig (`RabbitTemplate` mandatory flag); makes the broker return unroutable messages instead of dropping them | alive |
 | `spring.rabbitmq.cache.channel.size` (producer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` channel cache size); kept equal to `app.publishInFlightLimit` so parked confirm channels re-cache and are reused ([R25](roadmap.md#r25)) | alive |
 | `app.timezone`, `app.scheduleCron`, `app.scanPageSize`, `app.publishPageSize`, `app.publishInFlightLimit`, `app.confirmTimeoutMs` (producer) | `RenewalScheduler`, `RenewalJobConfig`, `RenewalJobEndpoint` | alive |
 | `rabbitmq.exchange`, `rabbitmq.routingKey` (producer) | `RabbitConfig`, `OutboxPublisher` | alive |
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |
+| `relay.page-size`, `relay.in-flight-limit`, `relay.confirm-timeout-ms` (consumer) | `RelayProperties`, `SettlementInboxRelay` — page claim size, bounded in-flight confirm window, page-scoped send+confirm deadline ([D24](decisions.md#d24)); defaults 500 / 100 / 5000 ms, env-overridable via relaxed binding (`RELAY_PAGE_SIZE`, `RELAY_IN_FLIGHT_LIMIT`, `RELAY_CONFIRM_TIMEOUT_MS`) | alive |
 | `bank.timeout-ms` (consumer) | `BankProperties`, `BankClient` connect + read timeout; 10 s — polices hung counterparties, while overload backpressure comes from blocked listener threads ([D19](decisions.md#d19)) | alive |
 | `bank.registry[]` id/scheme/base URL/webhook secret/countries (consumer) | `BankProperties`, `BankRegistry`, `BankClient`, `BillingService`, `BankWebhookController`; `countries` is required only for `sepa_core`, and the registry requires exactly one `card` entry; compose overrides indexed `BANK_REGISTRY_*` env vars | alive |
 | `RECOVERY_STALE_AFTER_SECONDS` (consumer; yaml `recovery.stale-after-seconds`) | `RecoveryProperties`, `RecoverySweeper`; compose overrides the 300 s application default with 30 s for verify/demo | alive |

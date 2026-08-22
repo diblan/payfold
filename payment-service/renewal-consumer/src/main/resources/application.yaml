@@ -9,6 +9,9 @@ spring:
     time-zone: Europe/Brussels
   rabbitmq:
     publisher-confirm-type: correlated
+    cache:
+      channel:
+        size: 100   # kept = relay.in-flight-limit so a parked confirm channel re-enters the cache and is reused, not churned (D14/D24)
     listener:
       simple:
         default-requeue-rejected: false
@@ -23,6 +26,15 @@ rabbitmq:
   exchange: billing.renewals
   queue: billing.renewals.main
   routingKey: renewal.requested
+
+relay:
+  # Settlement inbox relay (D24): one page per 500 ms tick, sends pipelined
+  # behind a bounded in-flight confirm window; each unconfirmed send holds one
+  # broker channel while its confirm is pending. One page-scoped deadline
+  # bounds the send loop and the confirm await together.
+  page-size: 500
+  in-flight-limit: 100
+  confirm-timeout-ms: 5000
 
 bank:
   # Polices hung counterparties only: the listener retry envelope owns the
