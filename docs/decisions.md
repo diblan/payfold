@@ -751,3 +751,49 @@ post-fix verify run 6/350 exhaustion cancellations lost the race to the
 as D21 intended). D21's sanctioned lever applies: compose
 `DUNNING_RETRIABLE_GRACE_SECONDS` 120 → 180, restoring a ≥2× margin over the
 measured ~75–90 s exhaustion path; `hard_fail`/`dispute` stay at 60 s.
+
+## D24 — R40 execution design: the settlement relay adopts the producer's bounded in-flight confirm window — 2026-08-22 — active
+<a id="d24"></a>
+Committed before implementation (the [D19](#d19)/[D21](#d21)/[D22](#d22)
+pattern). The measured defect ([R40](roadmap.md#r40)): the relay pays one
+serialized broker RTT per inbox row (confirm `future.get(5s)`) plus a per-row
+UPDATE, in 100-row pages every 500 ms — ~59/s mean against post-D23 webhook
+arrival that tracks the ~193/s consume peak.
+
+**Decision: pipeline the page behind a bounded in-flight window — the
+[D14](#d14) shape, inbound.** One page per 500 ms tick, unchanged
+`@Scheduled @Transactional` + `FOR UPDATE SKIP LOCKED` claim (row locks held
+for the page duration keep the ×3 fleet's relays disjoint). Sends pipeline
+through a **per-page** `Semaphore(relay.in-flight-limit)` whose permits
+release on confirm-future completion (synchronous with ack delivery, the D14
+mechanism; per-page construction leaks no permits across failed pages). One
+**page-scoped** confirm deadline (`relay.confirm-timeout-ms`, replacing the
+per-row 5 s) bounds the send loop (a window stalled to the deadline stops
+sending, loudly) and the await phase. `published_at` is then batch-marked for
+**exactly the acked rows** — per-row confirm gating survives ([D15](#d15)'s
+inbox-as-outbox story); a nack logs WARN with row id and reason and the await
+continues so sibling acks still get marked; timeout or exception stops the
+tick loudly. Everything unmarked is re-picked next tick — the at-least-once
+window narrows from "rows after the failure" to "unacked rows", and
+[G2](invariants.md#g2) absorbs duplicates as before.
+
+**Sizing:** `relay.page-size` 100 → default 500. Deliberately **no
+drain-until-empty loop**: one page per tick caps scheduler-thread occupancy
+at ~tens of ms, protecting the shared single scheduler thread whose 10 s
+sweeper cadence underpins [D21](#d21)'s exhaustion-before-expiry margins
+(a catch-up loop could starve `DunningSweeper` for the whole backlog).
+Ceiling ≈ 500 rows / (500 ms + page time) ≈ ~900/s — ~5× the measured 193/s
+requirement — and the ×3 fleet runs three relays. Consumer
+`spring.rabbitmq.cache.channel.size` is set to the in-flight limit (100) so
+parked confirm channels re-cache instead of churning (the D14 co-tuning).
+Knobs land in the consumer's top-level-section idiom (`relay.*`) and the
+config truth table ([G6](invariants.md#g6)).
+
+**Ordering weakens honestly:** pipelined sends ride multiple channels, so
+strict page FIFO is gone. Arrival order was already unguaranteed (replica
+competition; the delivery-retry overtake [R41](roadmap.md#r41) measured), so
+the listener must be order-independent — R41 makes the one order-sensitive
+pair (settled/chargeback of one collection) convergent, and the at-scale
+acceptance run therefore executes after R41 lands. Grace *values* move
+nowhere ([D21](#d21): policy; if a margin still needs moving once the relay
+keeps pace, that is its own decision entry).
