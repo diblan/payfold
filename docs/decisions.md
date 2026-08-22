@@ -50,7 +50,7 @@ stale brokers, silently duplicating every message into it forever; the same-name
 argument change instead makes the strict poison probe fail loudly, preserving
 [G5](invariants.md#g5).
 
-## D5 — Fake PSP first — pre-2026-07 — active
+## D5 — Fake PSP first — pre-2026-07 — active; the fake-counterparty role passed to the mock counterparty in [D15](#d15)/[D17](#d17) (WireMock retired with R23f)
 <a id="d5"></a>
 The initial fake-PSP phase unconditionally called `markPaymentSucceeded` and lasted
 until R8 (2026-07-20), which introduced a WireMock mock called over HTTP with a
@@ -239,7 +239,7 @@ in flight covers the measured 5k msg/s page baseline ([D10](decisions.md#d10)) w
 margin. Up to 100 idle channels stay cached on a quiet connection — well under
 `channelMax` and cheap on the broker.
 
-## D15 — R23 execution design: settlement inbox behind the queue, bank-agnostic contract, FastAPI mock bank — 2026-07-26 — active, flow scope amended by [D17](#d17)
+## D15 — R23 execution design: settlement inbox behind the queue, bank-agnostic contract, FastAPI mock bank — 2026-07-26 — active, flow scope amended by [D17](#d17), relay publish mechanics amended by [D24](#d24)
 <a id="d15"></a>
 Execution-level decisions for [D13](decisions.md#d13)'s epic, agreed in the
 2026-07-26 design discussion; where this differs from the overnight design brief
@@ -422,7 +422,7 @@ task pattern, never a trigger.
 task + config rows, verify.sh tightening, no schema change (inbox rows are the
 write path; a `settlements_recovered_total` counter carries provenance).
 
-## D19 — R32 counterparty capacity: multi-worker cardnet over shared state; timeouts police hangs, not throughput — 2026-08-01 — active
+## D19 — R32 counterparty capacity: multi-worker cardnet over shared state; timeouts police hangs, not throughput — 2026-08-01 — active; shipped a latent socket-option regression diagnosed and fixed by [D23](#d23) (capacity design unchanged)
 <a id="d19"></a>
 Design outcome of the R32 read (2026-08-01 session), committed before
 implementation per the item's design-first instruction.
@@ -580,7 +580,7 @@ cleared) plus never-retried proofs for hard-fail/dispute; nothing about the
 99 cohort's attempt COUNT is asserted (timing-shaped), only its invariants
 (never succeeded, still `past_due`).
 
-## D21 — R26c execution design: cancellation as a second sweeper act; exhaustion beats expiry by measured margin — 2026-08-01 — active
+## D21 — R26c execution design: cancellation as a second sweeper act; exhaustion beats expiry by measured margin — 2026-08-01 — active; the retriable-grace margin re-widened by [D23](#d23) (120 → 180) and [D25](#d25) (180 → 600); the mechanism stands
 <a id="d21"></a>
 Execution-level decisions for [R26c](roadmap.md#r26c), within the R26 epic's
 pre-decided spine. Committed before implementation (the [D19](#d19)/[D20](#d20)
@@ -710,7 +710,7 @@ Consumer image changes — tag proposal expected. verify/demo budgets stay at
 their R26b-era values (they absorb the slow-fsync world; a faster world just
 finishes earlier).
 
-## D23 — R36 root cause: multi-worker uvicorn drops TCP_NODELAY; Nagle × delayed-ACK taxes every consume 40 ms — 2026-08-08 — active
+## D23 — R36 root cause: multi-worker uvicorn drops TCP_NODELAY; Nagle × delayed-ACK taxes every consume 40 ms — 2026-08-08 — active; its 180 s retriable-grace retune superseded by [D25](#d25) (600 s, sized at 100k)
 <a id="d23"></a>
 Same-day correction of [D22](#d22)'s attribution, from flight-recorder evidence.
 The [D22](#d22) upsert batching worked exactly as designed at the DB layer

@@ -17,7 +17,7 @@ Scope insurance. Promoting any of these onto the roadmap requires a
 | Non-goal | Why not |
 |---|---|
 | Kubernetes / cloud deploy | Compose demonstrates the architecture; orchestration adds ops surface, not distributed-systems insight. [D11](decisions.md#d11) sanctions one epilogue — publishing versioned images for the external platform repo ([R18](#r18)); orchestration itself stays out |
-| Real PSP or money movement | Mock counterparties only: the mock PSP ([R8](#r8)) pioneered the deterministic failure path; the mock bank joins it in [R23](#r23), and the async card scheme absorbs WireMock's role in [R23f](#r23f) ([D15](decisions.md#d15)/[D17](decisions.md#d17)) — still no credentials, compliance, or real money |
+| Real PSP or money movement | Mock counterparties only: the mock PSP ([R8](#r8)) pioneered the deterministic failure path; the mock bank joined it in [R23](#r23), and the async card scheme absorbed WireMock's role in [R23f](#r23f) (2026-07-26) ([D15](decisions.md#d15)/[D17](decisions.md#d17)) — still no credentials, compliance, or real money |
 | Auth / multi-tenancy | Orthogonal to the billing pipeline story |
 | Any UI | The consumers of this system are curl, psql, and the RabbitMQ console. [D12](decisions.md#d12) carves out provisioned Grafana ([R21](#r21)) — industry ops tooling as code, not a custom page |
 | Proration, refunds, tax | Each is a project of its own; the renewal happy path + failure path is the thesis. Dunning left this row 2026-07-26: [D16](decisions.md#d16) promoted it to [R26](#r26), shipped 2026-08-01 as R26a–R26d |
@@ -152,7 +152,7 @@ the code; full re-grade of [quality.md](quality.md); prune stale roadmap notes.
 **Done when:** the checklist above is completed and quality.md's re-grade date is
 updated. **No behavior changes allowed** in this session type.
 
-*Last run: 2026-08-08 (after the dunning epic, R30–R32, R34, R35 — 5th run).*
+*Last run: 2026-08-22 (after R33, R36–R41 and D22–D25 — 6th run).*
 
 <a id="r14"></a>
 ### [x] R14 — Migrate to Testcontainers 2.x
@@ -257,7 +257,7 @@ verify.sh's consumer checks), `docs/quality.md`, README math.
 listener concurrency, and ×3 instances; rates land in quality.md "Measured scale
 runs" and the README extrapolation; the architecture honesty table row for
 consumer scaling flips to measured; verify.sh green at scale ([R17](#r17)'s poll
-fix should land first or ride along — its acceptance needs exactly this run).
+fix rode along — its acceptance needed exactly this run).
 
 <a id="r21"></a>
 ### [x] R21 — Grafana dashboards as code ([D12](decisions.md#d12))
@@ -310,13 +310,13 @@ count under delayed confirms; a slow-confirm scenario completes without
 unchanged.
 
 <a id="r23"></a>
-### [x] R23 — SEPA mock-bank: async settlement ([D13](decisions.md#d13), design [D15](decisions.md#d15)/[D17](decisions.md#d17)) *(epic — split 2026-07-26 into R23a–R23f below; check when all six are checked)*
+### [x] R23 — SEPA mock-bank: async settlement ([D13](decisions.md#d13), design [D15](decisions.md#d15)/[D17](decisions.md#d17)) *(epic — split 2026-07-26 into R23a–R23f below; all six checked 2026-07-26)*
 **Done when (epic-level):** a renewal is only `succeeded` after asynchronous
 confirmation — for **both** payment methods ([D17](decisions.md#d17)): SDD via
 the mock bank, cards via a sync auth verdict + async settlement on the same
 spine; chaos parameters demonstrably shift outcomes; verify.sh models the async
 settlement deterministically (the [R8](#r8) recomputable-rule precedent).
-Sub-items execute strictly top-down, one per session. `renewal.requested` stays
+`renewal.requested` stays
 at v1 (additive only, [G8](invariants.md#g8)); the settlement message is a new
 internal contract starting at v1 ([D15](decisions.md#d15)).
 
@@ -362,8 +362,6 @@ redelivery; duplicate delivery still yields exactly one submitted payment
 **verbatim** ([G7](invariants.md#g7) untouched) and adds exact SDD assertions:
 every SDD renewal has exactly one payment, all `submitted`, zero finalized
 (exact counts by seeded mix).
-**Note:** until [R23c](#r23c), SDD payments park in `submitted` by design while
-cards settle as today — honest intermediate state (see phase note above).
 
 <a id="r23c"></a>
 ### [x] R23c — Close the loop: webhook receiver, settlement inbox, queue, listener
@@ -449,7 +447,8 @@ checkbox closes with this item.
 The primary interviewer-facing artifact: a 3–5 minute recording of the
 [R22](#r22) chaos demo with the [R21](#r21) dashboard visible — interviewers
 don't clone repos. The demo script makes recording reproducible, so re-recording
-after [R23](#r23) reshapes the flow is cheap and expected.
+after the flow reshapes ([R23](#r23), [R26](#r26), [D24](decisions.md#d24)) is
+cheap and expected.
 **Done when:** the README embeds (or links) the recording near the top and every
 claim shown matches the measured numbers in quality.md/README.
 *Re-record note (2026-08-01, [R26d](#r26d)): the demo now ends with the dunning
@@ -804,6 +803,10 @@ stack, and the script's README/architecture mentions stay accurate.
 
 <a id="r39"></a>
 ### [x] R39 — Re-measure the 100k scaling-lever matrix post-D23
+*Closed 2026-08-22: the matrix re-measured green on the
+[D24](decisions.md#d24) relay — conc-1 111/s (899 s drain / 1,046 s
+completion), ×3 258/s, conc-8 457/s; numbers in quality.md "Measured scale
+runs".*
 **Scope:** measurement + docs only (quality.md "Measured scale runs", README,
 architecture honesty table); no behavior changes — the [R30](#r30) shape.
 Every 100k lever number predates [D23](decisions.md#d23)'s counterparty stall
@@ -821,8 +824,7 @@ quote the new numbers with the old records kept as dated history.
 serialized-confirm ceiling (~60–135/s) sits below the post-D23 consume rate
 and its inbox backlog races the dunning grace clock ([R40](#r40)) while
 delivery retries reorder a handful of chargebacks ([R41](#r41)). Forensic
-numbers in quality.md "Measured scale runs" (dated entry); the matrix
-re-runs after both land.*
+numbers in quality.md "Measured scale runs" (dated entry).*
 
 <a id="r40"></a>
 ### [x] R40 — Settlement relay serializes per-row confirms; post-D23 consume outruns it and the dunning grace clock mass-cancels recovered subscriptions

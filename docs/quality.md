@@ -3,7 +3,7 @@
 Coarse, honest, and **maintained**: any PR touching a module re-grades it in the same
 PR ([G6](invariants.md#g6)). The value of this file is currency, not precision.
 
-Last full re-grade: **2026-08-08** (R13 entropy pass, after the dunning epic, R30–R32, R34, and R35).
+Last full re-grade: **2026-08-22** (R13 entropy pass, after R33, R36–R41 and D22–D25).
 
 ## Rubric
 
@@ -23,7 +23,7 @@ Last full re-grade: **2026-08-08** (R13 entropy pass, after the dunning epic, R3
 | `db-migrations` | **B** | Clean, ordered, sole schema authority; since R18 also ships as the `payfold-migrations` Job image (SQL baked at build, FLYWAY_* env config), whose no-op re-run `verify.sh` asserts; V6 adds customer payment methods and submitted-payment attribution, V7–V8 add settlement, V9 adds/backfills tokenized card references, V10 adds the dunning grace deadline plus a partial past-due index, and V11 adds constraint-keyed payment attempts for race-safe re-collection; V1 carries aspirational tables no code touches (`bank_tx`, `recon_match`, `ledger_entry`, plus the unused `payment_method` and `mandate` tables — the live payment-method and mandate-reference data are V6 *columns* on `customer`) — harmless but reviewer-confusing | — |
 | `seed-data-gen` | **B** | Seed size parameterized (`SEED_CUSTOMERS`, default 15k, all due today); payment-method, rule-bearing IBAN/card-token shares, suffix-94 silent shares, and additive suffix-95 recoverable shares use deterministic customer-number arithmetic with no RNG; card suffixes cycle exact auth/chargeback cases, while SDD rows keep card tokens null; emails remain collision-safe across top-ups; the R18 Job image and R16 clamp-day-safe due seeding remain unchanged. No test harness of its own — the arithmetic is checked by end-to-end exact outcome, recovery, and re-collection assertions | — |
 | `mock-bank/` (FastAPI) | **B** | One counterparty image implements `sepa_core` and `card`: deterministic IBAN settlement rules plus token-derived synchronous authorization, attempt-indexed suffix-95 fail-then-recover verdicts derived only from collection identity, async card settlement/chargeback, HMAC-signed delivery, bounded exponential retry, duplicate stored-verdict semantics, and loud give-up metrics; pytest covers both schemes including default/decline/chargeback/silent/recoverable rules, no-notification declines, suppressed delivery, ordered callbacks, duplicates, and model isolation; compose healthchecks all three instances. In-memory pending-delivery loss is modeled by the silent rule and recovered by the consumer sweeper's re-query/resubmit path. Scales past one event loop via `BANK_WORKERS` uvicorn processes with worker-aggregated `/metrics` — worker-safe because records are a cache over deterministic outcomes, not truth ([D19](decisions.md#d19)); suffix-95 likewise survives worker hops and restart amnesia ([D20](decisions.md#d20)); the measured conc-8 100k run keeps it off the critical path; every accepted socket enforces TCP_NODELAY at import time (uvicorn's multi-worker path never sets it — the diagnosed ~40 ms Nagle stall behind R36, fixed by D23 and guarded by a pytest) | — |
-| `docker-compose.yaml` + config | **B** | Stack ordering and healthchecks pass; yaml contains only consumed keys; flyway and seed-data run the published image shapes; bank-a, bank-b, and cardnet share the scheme-aware image; deterministic seed shares plus verify/demo-fast recovery and per-class dunning grace overrides are explicit; Prometheus/Grafana expose recovery and dunning alongside the scale-safe consumer ports and confirm-gated settlement relay; the past_due stat reads the non-additive gauge with `max()` (spot-checked true at 1 and 3 replicas) and outcome colors match only label values that exist, `charged_back` and `submitted` included (R37) | — |
+| `docker-compose.yaml` + config | **B** | Stack ordering and healthchecks pass; yaml contains only consumed keys; flyway and seed-data run the published image shapes; bank-a, bank-b, and cardnet share the scheme-aware image; deterministic seed shares plus verify/demo-fast recovery and per-class dunning grace overrides are explicit (the retriable backstop sized at 100k by [D25](decisions.md#d25): 600 s, hard-fail/dispute 60 s); Prometheus/Grafana expose recovery and dunning alongside the scale-safe consumer ports and confirm-gated settlement relay; the past_due stat reads the non-additive gauge with `max()` (spot-checked true at 1 and 3 replicas) and outcome colors match only label values that exist, `charged_back` and `submitted` included (R37) | — |
 | `docs/` + harness | **B** | CI uses pinned Maven wrappers and real-container integration suites; `verify.sh` covers trigger/idempotency/poison behavior, exact token- and IBAN-predicted outcomes and reasons, method-tagged renewal counters, zero-stuck and inbox reconciliation, suffix-94 recovery provenance/counter exactness, and due-cohort exact `past_due` deadlines plus fleet-summed per-class transition deltas; `scripts/chaos-demo.sh` keeps nine asserted scenes, including live counterparty-amnesia recovery without manual intervention and the dunning arc — a 95 cohort visibly failing into `past_due` and recovering, a 99 cohort exhausting into cancellation with its attempt count and cause counter exact and no re-collection across a sweep interval; every provisioned dashboard panel query is executed against live Prometheus at the end of the run and must return data — a deliberately broken panel demonstrably fails (R33) | — |
 
 ## Test coverage
@@ -60,11 +60,15 @@ leave the payment pending after bounded DLQ delivery. The settlement spine suite
 (including bank-b rejecting bank-a's secret), durable webhook deduplication,
 confirm-relayed inbox rows, idempotent settlement redelivery, per-bank latency
 recording, terminal failure reasons, chargebacks after settlement and before
-settlement, idempotent chargeback redelivery, card settlement followed by a
-`fraud_dispute` chargeback, and poison settlements reaching their
+settlement — both orders converging on the same terminal composite
+([R41](roadmap.md#r41)) — idempotent chargeback redelivery, card settlement
+followed by a `fraud_dispute` chargeback, and poison settlements reaching their
 dedicated DLQ while good messages flow. The suite also
 covers the renewal poison path: malformed and contract-violating messages dead-letter
 while a subsequent good message processes.
+A direct-instance relay suite covers the [D24](decisions.md#d24) publish path:
+the in-flight window bound, `published_at` marked for exactly the acked rows,
+and a nack or stalled window failing loudly with the rest re-picked next tick.
 The isolated dunning grace suite invokes `SettlementService` and `BillingService`
 directly to prove each reason class, both chargeback arrival orders, card-decline
 redelivery, deadline preservation, period-advance preservation, and the settled no-op.
@@ -145,8 +149,8 @@ exact deterministic card-token and SDD-IBAN outcome assertions.
   subscriptions unadvanced-then-canceled. Filed as [R40](roadmap.md#r40)
   (relay throughput / grace race) and [R41](roadmap.md#r41) (reordered
   chargeback semantics); the ×3-replica and conc-8 configs were not run —
-  the matrix re-measures after both land. The 2026-08-01 numbers below stand
-  as the current dated record.
+  the matrix re-measured after both landed (see the 2026-08-22 entry above,
+  which supersedes the 2026-08-01 numbers as the current record).
 
 - **2026-08-08 — the consume-cost regression diagnosed to a socket option;
   conc-1 more than tripled (R36/D22/D23, the commit this entry ships in; WSL2
@@ -168,8 +172,8 @@ exact deterministic card-token and SDD-IBAN outcome assertions.
   and ~41 ms during the regression); **end-to-end completion 163 s** including
   both silent-cohort recoveries and the complete dunning arc
   (exhausted=350 / grace_expired=850 cause counters exact at the D23-retuned
-  180 s retriable grace). The 100k lever matrix predates the fix and is
-  re-measured under [R39](roadmap.md#r39).
+  180 s retriable grace). The 100k lever matrix predated the fix and was
+  re-measured under [R39](roadmap.md#r39) — see the 2026-08-22 entry.
 
 - **2026-08-01 — concurrency-8 after the counterparty capacity fix (R32, the
   commit this entry ships in; WSL2 Docker Compose stack).** The [R30](roadmap.md#r30)

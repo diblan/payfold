@@ -23,6 +23,7 @@ understanding to human reviewers as much as they guide agents.
 | `observability/` | Prometheus config + Grafana provisioning and the `payfold-pipeline` dashboard JSON |
 | `scripts/verify.sh` | End-to-end check; **the definition of "working"** |
 | `scripts/chaos-demo.sh` | Scene-based chaos demo; every scene asserts the invariant it shows |
+| `scripts/load-test.sh` | Top up a running stack with N extra due-today subscriptions (V6+V9-legal cohort) |
 | `docs/architecture.md` | System map, message flow, scale math, config truth table |
 | `docs/invariants.md` | Golden rules G1–G8 with HELD/VIOLATED status |
 | `docs/decisions.md` | Decision log |

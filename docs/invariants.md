@@ -24,7 +24,9 @@ duplicate window ([G2](invariants.md#g2)).
 
 *Why:* atomicity between "we decided to bill this subscription" and "we will tell the
 payment service" — the transactional outbox pattern is the core of this project.
-*Enforced by:* code review; only `OutboxPublisher` touches the template; correlated
+*Enforced by:* code review; only `OutboxPublisher` publishes renewals through the
+template — the settlement inbox relay is the settlement spine's own confirm-gated
+publisher ([D24](decisions.md#d24)); correlated
 publisher confirms gate `published_at`; `PublisherConfirmGatingTest` proves an
 unconfirmed row stays unpublished and is re-picked; `PublisherReturnGatingTest` and
 `UnroutableReturnIntegrationTest` prove a returned (unroutable) message never sets

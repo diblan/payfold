@@ -12,7 +12,7 @@
 #   --timeout N    max seconds to wait for each long condition (default 900 —
 #                  on a fresh default-seed stack scene 1 bills the whole 15k
 #                  base cohort at the measured post-D23 single-consumer rate
-#                  (~140/s — the interim ~22/s regression is diagnosed and
+#                  (~195/s — the interim ~22/s regression is diagnosed and
 #                  fixed, roadmap R36), plus the dunning re-collection tails;
 #                  a pre-billed stack needs nothing near this)
 #
@@ -548,7 +548,7 @@ fi
 
 # The poison sits behind the scene's FIFO backlog, so its DLQ deadline is
 # queue wait + the bounded listener retry envelope: ~2000 messages drain in
-# well under a minute at the measured post-D23 ~140/s single-consumer rate
+# well under a minute at the measured post-D23 ~195/s single-consumer rate
 # (R36), plus retry backoff and the stats interval — 150s stays as a
 # generous ceiling. G5's bound is on attempts once delivered, not on queue
 # position.
