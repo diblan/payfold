@@ -75,28 +75,36 @@ public class SettlementService {
         }
 
         if ("charged_back".equals(event.outcome())) {
-            // A chargeback wins regardless of arrival order. The bank sends settled
-            // before charged_back, but queue redelivery can reorder; applying from
-            // 'submitted' too (skipping the never-finalized invoice) keeps the rare
-            // reordered case consistent instead of dead-lettering it, and the later
-            // settled notification then no-ops on its own status guard.
+            // A chargeback wins regardless of arrival order, and it presupposes
+            // the collection settled — so a chargeback-first arrival (delivery
+            // retries can overtake the settled notification) carries the
+            // settle's effects with it: either order ends with the charge
+            // settled, the period advanced, and the invoice disputed (R41).
+            // The later settled notification then no-ops on its status guard.
             int updated = jdbc.update("""
                     UPDATE payment
-                    SET status = 'charged_back', failure_reason = ?, charged_back_at = now()
+                    SET status = 'charged_back', failure_reason = ?,
+                        charged_back_at = now(),
+                        completed_at = COALESCE(completed_at, now())
                     WHERE id = ? AND status IN ('submitted', 'succeeded')
                     """, event.reason(), payment.id());
             if (updated == 1) {
                 BillingLinks links = billingLinks(payment.chargeId());
-                if ("succeeded".equals(payment.status())) {
-                    jdbc.update("""
-                            UPDATE invoice SET status = 'disputed'
-                            WHERE id = ? AND status = 'paid'
-                            """, links.invoiceId());
+                if ("submitted".equals(payment.status())) {
+                    jdbc.update("UPDATE charge SET status = 'settled' WHERE id = ?",
+                            payment.chargeId());
+                    jdbc.update("UPDATE subscription SET renewed_at = ? WHERE id = ?",
+                            Timestamp.valueOf(links.periodEnd().atTime(9, 0)),
+                            links.subscriptionId());
                 }
+                jdbc.update("""
+                        UPDATE invoice SET status = 'disputed'
+                        WHERE id = ? AND status IN ('posted', 'paid')
+                        """, links.invoiceId());
                 dunningLifecycle.enterGrace(links.subscriptionId(), event.reason());
             }
-            // D16 keeps period math and the charge untouched; R26a moves only the
-            // subscription status into its grace lifecycle.
+            // D16's period math stays compensation-free: the advance above is
+            // the settle's own effect arriving late, never a rollback.
             log.info("Chargeback processed (bank_id={}, notification_id={}, collection_id={})",
                     event.bank_id(), event.notification_id(), event.collection_id());
             processedCounter("charged_back", payment.bankId()).increment();

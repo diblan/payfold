@@ -361,27 +361,44 @@ class SettlementSpineIntegrationTest {
     }
 
     @Test
-    void chargebackBeforeSettleStillWins() throws Exception {
+    void chargebackBeforeSettledConvergesThroughTheRealSpine() throws Exception {
         SubmittedPayment fixture = parkSubmitted("08");
-        Message chargedBack = jsonMessage(objectMapper.writeValueAsBytes(
-                settlement(fixture.collectionId(), 2, "charged_back", "MD06")));
-        Message settled = jsonMessage(objectMapper.writeValueAsBytes(
-                settlement(fixture.collectionId(), 1, "settled", null)));
+        byte[] chargedBack = webhook(fixture.collectionId(), 2, "charged_back", "MD06");
+        byte[] settled = webhook(fixture.collectionId(), 1, "settled", null);
 
-        rabbitTemplate.convertAndSend(
-                SettlementTopology.EXCHANGE, SettlementTopology.ROUTING_KEY, chargedBack);
-        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
-                assertThat(paymentStatus(fixture)).isEqualTo("charged_back"));
-
-        rabbitTemplate.convertAndSend(
-                SettlementTopology.EXCHANGE, SettlementTopology.ROUTING_KEY, settled);
-        awaitDb().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+        // The delivery-retry overtake, reproduced: the chargeback notification
+        // traverses webhook -> inbox -> relay -> queue -> listener before the
+        // settled one is even received. Terminal state must match the ordered
+        // case (R41): invoice disputed, charge settled, period advanced.
+        assertThat(postWebhook(BANK_A_ID, chargedBack, sign(chargedBack, BANK_A_SECRET)))
+                .isEqualTo(200);
+        awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             assertThat(paymentStatus(fixture)).isEqualTo("charged_back");
-            assertThat(renewedAt(fixture.subscriptionId()))
-                    .isEqualTo(fixture.originalRenewedAt());
             assertThat(jdbc.queryForObject(
                     "SELECT status FROM invoice WHERE customer_id = ?",
-                    String.class, fixture.customerId())).isEqualTo("posted");
+                    String.class, fixture.customerId())).isEqualTo("disputed");
+            assertThat(jdbc.queryForObject(
+                    "SELECT status FROM charge WHERE subscription_id = ?",
+                    String.class, fixture.subscriptionId())).isEqualTo("settled");
+            assertThat(renewedAt(fixture.subscriptionId()))
+                    .isEqualTo(expectedRenewedAt(fixture.periodEnd()));
+        });
+
+        assertThat(postWebhook(BANK_A_ID, settled, sign(settled, BANK_A_SECRET)))
+                .isEqualTo(200);
+        awaitDb().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+            // The late settled notification has fully traversed the spine
+            // (its inbox row is published) and no-oped on the terminal payment.
+            assertThat(jdbc.queryForObject("""
+                    SELECT published_at IS NOT NULL FROM settlement_inbox
+                    WHERE bank_id = ? AND notification_id = ?
+                    """, Boolean.class, BANK_A_ID, fixture.collectionId() + ":1")).isTrue();
+            assertThat(paymentStatus(fixture)).isEqualTo("charged_back");
+            assertThat(jdbc.queryForObject(
+                    "SELECT status FROM invoice WHERE customer_id = ?",
+                    String.class, fixture.customerId())).isEqualTo("disputed");
+            assertThat(renewedAt(fixture.subscriptionId()))
+                    .isEqualTo(expectedRenewedAt(fixture.periodEnd()));
             assertThat(amqpAdmin.getQueueInfo(SettlementTopology.MAIN_QUEUE).getMessageCount())
                     .isZero();
             assertThat(amqpAdmin.getQueueInfo(SettlementTopology.DLQ).getMessageCount())

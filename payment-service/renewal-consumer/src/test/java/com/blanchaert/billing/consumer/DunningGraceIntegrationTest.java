@@ -196,20 +196,41 @@ class DunningGraceIntegrationTest {
     }
 
     @Test
-    void chargebackBeforeSettlementAlsoEntersGrace() {
+    void chargebackBeforeSettlementConvergesToTheOrderedTerminalState() {
         PaymentFixture fixture = seedPayment("sdd", "SEPA_DD", "submitted", false);
         double transitionsBefore = transitionCount("dispute");
         Instant beforeCall = Instant.now();
 
         settlementService.apply(settlement(fixture, "charged_back", "MD06"));
 
+        // The chargeback presupposes the collection settled, so its arrival
+        // carries the settle's effects: either order must end with the charge
+        // settled, the period advanced, and the invoice disputed (R41).
         Instant afterCall = Instant.now();
         SubscriptionState state = subscriptionState(fixture);
         assertThat(paymentStatus(fixture)).isEqualTo("charged_back");
         assertThat(state.status()).isEqualTo("past_due");
-        assertThat(invoiceStatus(fixture)).isEqualTo("posted");
+        assertThat(invoiceStatus(fixture)).isEqualTo("disputed");
+        assertThat(chargeStatus(fixture)).isEqualTo("settled");
+        assertThat(state.renewedAt()).isEqualTo(expectedAdvance(fixture));
         assertGraceWindow(state.graceUntil(), beforeCall, afterCall,
                 DISPUTE_GRACE_SECONDS);
+        assertThat(transitionCount("dispute") - transitionsBefore).isEqualTo(1.0);
+
+        settlementService.apply(settlement(fixture, "settled", null));
+
+        SubscriptionState afterLateSettled = subscriptionState(fixture);
+        assertThat(paymentStatus(fixture)).isEqualTo("charged_back");
+        assertThat(invoiceStatus(fixture)).isEqualTo("disputed");
+        assertThat(afterLateSettled.status()).isEqualTo("past_due");
+        assertThat(afterLateSettled.renewedAt()).isEqualTo(state.renewedAt());
+        assertThat(afterLateSettled.graceUntil()).isEqualTo(state.graceUntil());
+
+        settlementService.apply(settlement(fixture, "charged_back", "MD06"));
+
+        SubscriptionState afterRedelivery = subscriptionState(fixture);
+        assertThat(afterRedelivery.renewedAt()).isEqualTo(state.renewedAt());
+        assertThat(afterRedelivery.graceUntil()).isEqualTo(state.graceUntil());
         assertThat(transitionCount("dispute") - transitionsBefore).isEqualTo(1.0);
     }
 
@@ -388,6 +409,18 @@ class DunningGraceIntegrationTest {
         return jdbc.queryForObject(
                 "SELECT status FROM invoice WHERE id = ?",
                 String.class, fixture.invoiceId());
+    }
+
+    private String chargeStatus(PaymentFixture fixture) {
+        return jdbc.queryForObject(
+                "SELECT status FROM charge WHERE id = ?",
+                String.class, fixture.chargeId());
+    }
+
+    // Mirrors the settle advance: Timestamp.valueOf renders period_end 09:00
+    // in the JVM zone, exactly as SettlementService writes it.
+    private Instant expectedAdvance(PaymentFixture fixture) {
+        return Timestamp.valueOf(fixture.periodEnd().atTime(9, 0)).toInstant();
     }
 
     private double transitionCount(String dunningClass) {

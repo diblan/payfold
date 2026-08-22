@@ -263,12 +263,15 @@ invoice's `period_end` at 09:00 local; `failed` records terminal `failed`,
 `failure_reason`, and `completed_at` without finalizing billing. A
 `charged_back` notification changes either `submitted` or `succeeded` to
 `charged_back`, records its reason and `charged_back_at`, and wins in either
-arrival order. When the prior state was `succeeded`, the already-paid invoice
-becomes `disputed`; when chargeback arrives first, the invoice remains `posted`
-and a later settlement no-ops. In both cases the charge and subscription period
-math remain untouched: a chargeback is a recorded fact, not compensation
-([D16](decisions.md#d16)). Terminal payment-status guards make every settlement
-redelivery a no-op.
+arrival order — converging to one terminal composite ([R41](roadmap.md#r41)):
+a chargeback presupposes the collection settled, so a chargeback-first arrival
+(delivery retries can overtake the settled notification) applies the settle's
+effects it implies — charge `settled`, period advanced — before recording the
+dispute, and either order ends with the invoice `disputed` and dispute-class
+grace applied; the later settled notification no-ops on the terminal payment's
+status guard. The period math is never compensated: the advance is the
+settle's own effect arriving late ([D16](decisions.md#d16)). Terminal
+payment-status guards make every settlement redelivery a no-op.
 
 ### Dunning grace lifecycle (R26a–R26c)
 
