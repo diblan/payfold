@@ -721,7 +721,7 @@ for port in "${SCENE_4_PORTS[@]}"; do
   fi
 done
 if (( SCENE_4_ALL_INCREASED )); then
-  pass "scene 4 every responsive replica processed messages (${SCENE_4_DETAIL}); measured 2026-07-26: 3 same-host replicas ≈2× drain, and 33,335/33,320/33,345 split at 100k; in-process concurrency ×8 ≈10×"
+  pass "scene 4 every responsive replica processed messages (${SCENE_4_DETAIL}); measured 2026-08-22: 3 same-host replicas 258/s ≈2.3× drain, and 33,326/33,365/33,309 split at 100k; in-process concurrency ×8 457/s ≈4×"
 else
   fail "scene 4 every responsive replica processed messages" "${SCENE_4_DETAIL}"
 fi
