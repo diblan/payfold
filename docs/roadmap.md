@@ -896,3 +896,92 @@ asserts the same terminal invoice and subscription state as the ordered
 case (invoice `disputed`, period advanced, dispute-class grace applied,
 idempotent under redelivery of either notification); verify.sh's existing
 exact chargeback checks pass at the 100k scale where the reorder occurs.
+
+<a id="r42"></a>
+### [ ] R42 — A never-launched night's renewals fall outside every future scan window
+**Scope:** design first — producer scan window semantics
+(`RenewalJobConfig.scanStep`, scheduler/endpoint job parameters), verify.sh
+tightening; decision entry expected (window semantics are behavior).
+The scan predicate bounds `due_local` to exactly one local day: `today` at
+local midnight to `today + 1`, where `today` is computed at run time. A run
+that *starts* and crashes is safe — the window is pinned into the step
+ExecutionContext on first page (`scanStep.window`), so a restart of that
+execution re-scans its original day. But a night where the job never
+launches (host down, scheduler outage, failed deploy noticed in the
+morning) has no path back: the next night stamps a fresh `today`, and the
+skipped day's renewals sit outside every window forever — unbilled and
+undetected. The trigger endpoint can't help: it always stamps
+`LocalDate.now(zone)`; `force` mints a new run, not an older window.
+Surfaced 2026-09-05 by an external review of the repo.
+Candidate shapes (decide in-session): run the window from the last
+successful `scheduleDate` forward (auto catch-up — a multi-day window keeps
+each row's original `due_local::date`, so the derived
+`sub-<id>|<due_date>` keys are identical to what the missed night would
+have minted and [G2](invariants.md#g2)'s constraints make catch-up
+double-billing impossible); expose the window date as an explicit trigger
+parameter (manual runbook catch-up); and/or a lag detector — count of
+`active` subscriptions whose `renewed_at` is more than one interval + one
+day in the past — as a verify.sh probe, so a silent skip fails loudly even
+before the mechanism runs.
+**Done when:** a deliberately skipped day is demonstrably recovered — a
+test (or verify probe) seeds a due-yesterday cohort, runs today's job, and
+finds it billed exactly once under the original due-date-derived keys;
+the zero-lag detector is asserted in verify.sh; architecture.md documents
+the window semantics; a decision entry records the chosen mechanism.
+
+<a id="r43"></a>
+### [ ] R43 — `renewal_outbox` and `settlement_inbox` grow without bound
+**Scope:** design first — retention policy for both tables; likely a new
+migration plus a bounded sweeper (or partitioning), verify.sh tightening;
+decision entry expected.
+Neither table is ever cleaned up. At the 10M/month design scale
+(~330k renewals/night) the outbox gains ~120M JSONB-carrying rows per
+year, and the inbox grows with every notification, redelivery, and
+synthesized recovery row. The partial indexes on unpublished/unprocessed
+rows keep the hot paths fast, so growth is invisible to every current
+measurement — the cost lands in storage, backup time, and any future full
+scan. Surfaced 2026-09-05 by an external review of the repo; no prior item
+covers it. Retention interacts with delivery semantics: a published outbox
+row is the audit trail of its renewal, and an inbox row is the forensic
+record of the signed bank bytes ([D15](decisions.md#d15)) — so the policy
+needs an explicit horizon, must never touch unpublished/unprocessed rows,
+and archives-or-drops only terminally-processed rows older than the
+horizon. Monthly partitioning makes retention a constant-time partition
+drop instead of a mass DELETE, but converting live tables to partitioned
+ones under [G3](invariants.md#g3) (applied migrations are immutable) is
+its own design problem — batch-bounded DELETEs may be the honest first
+version. Measure the actual growth and delete cost first, then decide
+([D21](decisions.md#d21) culture).
+**Done when:** a decision entry records the retention policy and horizon;
+the mechanism demonstrably removes aged fully-processed rows while
+unpublished/unprocessed rows of any age survive (a test or verify probe
+asserts both directions); architecture.md's schema section documents the
+horizon and the operational shape (partition drop vs bounded DELETE).
+
+<a id="r44"></a>
+### [ ] R44 — Webhook signatures have no replay protection
+**Scope:** mock-bank signing/delivery (`signing.py`, `delivery.py`),
+consumer `BankWebhookController`; additive contract change per
+[G8](invariants.md#g8); small.
+The HMAC covers the exact body bytes but nothing binds a signature to a
+moment: no timestamp, no nonce. Anyone holding one captured valid webhook
+can replay it indefinitely and receive 200 forever. Today the
+`(bank_id, notification_id)` inbox constraint makes every replay a no-op —
+but that is idempotency doing authentication's job by luck, not design:
+the dedupe layer exists for delivery semantics, not access control, and a
+replay arriving after a future retention purge ([R43](#r43)) would land as
+a fresh row. Surfaced 2026-09-05 by an external review of the repo.
+Fix shape: a timestamp header included in the signed bytes, with a bounded
+acceptance window checked before the inbox insert; stale-signature
+requests get a distinct 4xx. One interaction to respect: the counterparty
+re-delivers with backoff ([R23a](#r23a)), so either each attempt re-signs
+at send time or the acceptance window must exceed the full retry envelope
+— otherwise legitimate late redeliveries get rejected as replays. The
+recovery sweeper is unaffected (synthesized rows don't traverse the
+webhook path).
+**Done when:** a replayed request with a valid-but-stale timestamp is
+rejected with the documented status and never reaches the inbox; in-window
+redeliveries still land (or no-op) with 200; a test covers both
+directions; the timestamp joins the signed-byte contract in
+architecture.md's webhook section; the relation between acceptance window
+and retry envelope is asserted or documented.
