@@ -985,3 +985,49 @@ redeliveries still land (or no-op) with 200; a test covers both
 directions; the timestamp joins the signed-byte contract in
 architecture.md's webhook section; the relation between acceptance window
 and retry envelope is asserted or documented.
+
+<a id="r45"></a>
+### [x] R45 — The dashboard doesn't show what scenes 2, 5, 6, 7 and 8 claim
+**Scope:** `scripts/chaos-demo.sh` scene 2 (a bounded hold before the drain,
+asserted through Prometheus), `observability/grafana/dashboards/payfold-pipeline.json`
+(one axis, one window, two stats, one retitled stat); no service code; small.
+Found 2026-09-05 while recording [R24](#r24), by reading each scene's
+terminal claim against what Prometheus actually sampled during the take:
+- **Scene 2:** the script drained the poison ~10 ms after first seeing DLQ
+  depth 1; Prometheus scrapes RabbitMQ every 5 s, so the whole DLQ residence
+  fit in about one sample — "DLQ depth now" never left 0 on screen, and on
+  "Queue depth — main vs DLQ" a 1 beside a 2,000-message backlog is a flat
+  line.
+- **Scene 5:** the scrape saw the broker down for 10 s, but no panel plots
+  broker health and a 10 s gap in a 15-minute queue-depth line is invisible.
+- **Scene 6:** 40 chargebacks arrive at 0.7/s on a per-outcome rate panel
+  whose axis the card settlements have scaled to ~90/s — under 1 % of the
+  axis.
+- **Scene 7:** the latency panel averaged over 5 minutes, so bank-a still
+  carried scene 6's 25 s slow profile (27 s mean) while bank-b showed 8 s —
+  the panel showed the *opposite* of "bank-b lags bank-a".
+- **Scene 8:** "Settlements recovered (total)" stayed 0 because the scene
+  exercises the resubmit path, which `recovery_sweeps_total` records, not
+  `settlements_recovered_total`.
+Fix shape: scene 2 holds the poison in the DLQ for 15 s **after** the 150 s
+bound is met (the bound is unchanged) and asserts via the Prometheus API that
+the DLQ series recorded it across ≥ 3 scrapes — the demo's first assertion
+made through the dashboard's own data; the DLQ series gets its own right-hand
+axis; a "Broker up" stat (`up{job="rabbitmq-queues"}`, red at 0) joins the
+DLQ stat's row; the latency mean window drops to 30 seconds (measured: with 1 minute, bank-a still showed a 19 s blend of scene 6 when bank-b's 8 s line appeared; with 30 s it reads 2 s by then); a "Settlement
+outcomes (total)" stat (settled / failed / charged_back / invalid) joins the
+per-bank stat; the recovered stat becomes "Recovery actions (total)" by
+result. Row heights are unchanged, so the recording's scroll positions hold.
+**Done when:** a scene-2 run passes the new ≥ 3-scrapes assertion; every
+new or changed panel query passes the [R33](#r33) live-Prometheus check in
+verify.sh; on a full demo run each of the five scenes has an on-screen
+signal that agrees with its terminal claim (broker 0 → 1, charged_back +40,
+bank-b > bank-a latency during scene 7, resubmitted +20); architecture.md's
+observability section describes the panels ([G6](invariants.md#g6));
+[R24](#r24) records after this lands.
+*Accepted 2026-09-05: fresh-stack verify green (114 checks, 22 panel targets
+live); full `--auto` demo green (126 checks — scene 2's new assertion saw
+the poison across 4 scrapes); Prometheus samples from that run show every
+signal: DLQ non-zero for 5 samples, broker down for 3, charged_back 0 → 40,
+bank-b's 8 s above bank-a's 2 s once the 30 s window clears scene 6,
+resubmitted 0 → 20.*

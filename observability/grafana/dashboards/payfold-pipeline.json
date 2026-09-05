@@ -83,7 +83,12 @@
           },
           {
             "matcher": { "id": "byName", "options": "DLQ" },
-            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "custom.axisLabel", "value": "DLQ (own axis)" },
+              { "id": "custom.lineWidth", "value": 3 }
+            ]
           }
         ]
       },
@@ -108,7 +113,7 @@
       "type": "stat",
       "title": "DLQ depth now",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 16, "y": 8, "w": 8, "h": 8 },
+      "gridPos": { "x": 16, "y": 8, "w": 4, "h": 8 },
       "fieldConfig": {
         "defaults": {
           "thresholds": {
@@ -126,6 +131,37 @@
           "refId": "A",
           "expr": "rabbitmq_detailed_queue_messages{queue=\"billing.renewals.dlq\"}",
           "legendFormat": "DLQ"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Broker up",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 20, "y": 8, "w": 4, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(up{job=\"rabbitmq-queues\"}) OR on() vector(0)",
+          "legendFormat": "broker"
         }
       ],
       "options": {
@@ -367,7 +403,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (bank) (rate(settlements_latency_seconds_sum[5m])) / sum by (bank) (rate(settlements_latency_seconds_count[5m]))",
+          "expr": "sum by (bank) (rate(settlements_latency_seconds_sum[30s])) / sum by (bank) (rate(settlements_latency_seconds_count[30s]))",
           "legendFormat": "{{bank}}"
         }
       ],
@@ -380,7 +416,7 @@
       "type": "stat",
       "title": "Settlements processed by bank",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 12, "y": 40, "w": 12, "h": 8 },
+      "gridPos": { "x": 12, "y": 40, "w": 6, "h": 8 },
       "fieldConfig": {
         "defaults": {
           "thresholds": {
@@ -395,6 +431,46 @@
           "refId": "A",
           "expr": "sum by (bank) (settlements_processed_total)",
           "legendFormat": "{{bank}}"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Settlement outcomes (total)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 18, "y": 40, "w": 6, "h": 8 },
+      "fieldConfig": {
+        "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "settled" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "failed" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "charged_back" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "invalid" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (settlements_processed_total)",
+          "legendFormat": "{{outcome}}"
         }
       ],
       "options": {
@@ -431,7 +507,7 @@
     },
     {
       "type": "stat",
-      "title": "Settlements recovered (total)",
+      "title": "Recovery actions (total)",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "x": 12, "y": 48, "w": 12, "h": 8 },
       "fieldConfig": {
@@ -446,15 +522,15 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(settlements_recovered_total)",
-          "legendFormat": "recovered"
+          "expr": "sum by (result) (recovery_sweeps_total{result=~\"recovered|resubmitted\"})",
+          "legendFormat": "{{result}}"
         }
       ],
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"] },
         "colorMode": "value",
         "graphMode": "none",
-        "textMode": "value"
+        "textMode": "value_and_name"
       }
     },
     {

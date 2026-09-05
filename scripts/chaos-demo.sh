@@ -60,6 +60,7 @@ RMQ_RK="$(env_val RABBITMQ_ROUTINGKEY renewal.requested)"
 BANK_PORT="$(env_val BANK_HTTP_PORT 8085)"
 BANK_B_PORT="$(env_val BANK_B_HTTP_PORT 8086)"
 CARDNET_PORT="$(env_val CARDNET_HTTP_PORT 8087)"
+PROMETHEUS_PORT="$(env_val PROMETHEUS_PORT 9090)"
 RMQ_DLQ="billing.renewals.dlq"
 SETTLEMENT_DLQ="billing.settlements.dlq"
 
@@ -566,6 +567,27 @@ if (( POISON_DLQ_READY )); then
 else
   fail "scene 2 poison message reached DLQ within 150s" \
     "if the broker carries pre-R5 queue args, wipe the RabbitMQ volume (docker compose down -v) so the queue is redeclared"
+fi
+
+# R45: draining the instant the DLQ read 1 meant the poison's whole DLQ
+# residence fit inside one 5s Prometheus scrape — the dashboard beside the
+# terminal never showed it. Hold the message in the DLQ for several scrapes
+# AFTER the 150s bound above is met (the bound itself is unchanged), then
+# prove it through the dashboard's own series: at least three non-zero
+# samples of the DLQ depth inside the hold window.
+DLQ_HOLD_SECONDS=15
+if (( POISON_DLQ_READY )); then
+  note "holding the poison in the DLQ for ${DLQ_HOLD_SECONDS}s so the dashboard's DLQ panels show it…"
+  sleep "$DLQ_HOLD_SECONDS"
+  DLQ_SAMPLES="$(curl -fsS -G "http://localhost:${PROMETHEUS_PORT}/api/v1/query" \
+    --data-urlencode "query=sum_over_time(rabbitmq_detailed_queue_messages{queue=\"${RMQ_DLQ}\"}[$((DLQ_HOLD_SECONDS + 10))s])" \
+    2>/dev/null | grep -o '"value":\[[^]]*\]' | head -1 | sed -E 's/.*,"([0-9.]+)"\]$/\1/')"
+  if [[ "$DLQ_SAMPLES" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v n="$DLQ_SAMPLES" 'BEGIN { exit !(n >= 3) }'; then
+    pass "scene 2 dashboard's DLQ series recorded the poison across ${DLQ_SAMPLES%.*} scrapes (≥3) during the hold"
+  else
+    fail "scene 2 dashboard's DLQ series recorded the poison across ≥3 scrapes during the hold" \
+      "sum_over_time=${DLQ_SAMPLES:-unreadable} (Prometheus on :${PROMETHEUS_PORT})"
+  fi
 fi
 
 if ! DRAIN_RESPONSE="$(curl -fsS -u "${RMQ_USER}:${RMQ_PASS}" \

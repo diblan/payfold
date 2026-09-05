@@ -576,7 +576,20 @@ Prometheus is healthy and scraping, that the dashboard is provisioned, and —
 since [R33](roadmap.md#r33) — that every panel query extracted from the
 provisioned JSON is accepted by live Prometheus and returns at least one series
 after the run's load, so a renamed metric or broken PromQL edit fails
-verification instead of leaving a lying panel behind a green run. The
+verification instead of leaving a lying panel behind a green run.
+[R45](roadmap.md#r45) made the dashboard agree with what the chaos demo's
+terminal claims, scene by scene: the renewals queue-depth panel plots the
+DLQ series on its own right-hand axis (a single dead-lettered message is
+invisible on a scale shared with a thousands-deep main queue) and the poison
+scene holds its message in the DLQ for 15 s — after, not instead of, the
+150 s bound — asserting through Prometheus that at least three 5 s scrapes
+saw it; a "Broker up" stat (`up{job="rabbitmq-queues"}`, red at 0) makes the
+broker-restart scene visible; the settlement latency mean uses a 30-second
+window so one scene's slow profile does not bleed into the next; a
+"Settlement outcomes (total)" stat shows chargebacks as a count where a
+per-outcome rate panel scaled by card settlements cannot; and the recovery
+stat counts sweeper actions by result (recovered / resubmitted) rather than
+only synthesized recoveries. The
 dashboards are demo-local; the platform repo runs its own kube-prometheus-stack
 in-cluster.
 
