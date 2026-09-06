@@ -57,6 +57,8 @@ stricter (G7).
 
 1. **One roadmap item per session.** Open `docs/roadmap.md`, take the top-most
    unblocked unchecked item (unless the user names another). Nothing else.
+   `/next` (shared skill, lore `skills/next/`) does this from repo state at the
+   start of a session — and resumes an item the tree is already mid-way through.
 2. **No drive-by fixes.** A defect noticed en route becomes a new roadmap item with
    acceptance criteria — not an edit in this session.
 3. **Definition of done**, all in the same PR:
@@ -67,7 +69,10 @@ stricter (G7).
    - if the diff changes what a published image runs (service code, Dockerfiles,
      baked migrations SQL, the seeder), the session summary says so and proposes
      the next `vX.Y.Z` tag — the user pushes tags manually, and an existing tag
-     is never re-pointed (see `docs/architecture.md`, "Deploy artifacts").
+     is never re-pointed (see `docs/architecture.md`, "Deploy artifacts");
+   - anything the next session must know is filed in its durable home — the
+     roadmap entry it concerns, a decision, this file, or memory. There is no
+     handoff file; the next session starts from the repo alone.
 4. **Exemption:** sessions touching only `docs/`, `AGENTS.md`, or `README.md` with no
    behavior change need no roadmap slot.
 5. **Scope pressure?** If a task seems to require breaking a non-goal
