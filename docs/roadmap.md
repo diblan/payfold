@@ -28,8 +28,8 @@ Scope insurance. Promoting any of these onto the roadmap requires a
 ## Items
 
 Ordering principle: *repair the feedback loop → correctness → resilience → scale → story*.
-Consumed dependency/phase notes are pruned by entropy passes; the one live edge:
-[R24](#r24) (recording) waits on nothing but the user — see its re-record note.
+Consumed dependency/phase notes are pruned by entropy passes; no live edges remain
+([R24](#r24) recorded 2026-09-06).
 
 <a id="r1"></a>
 ### [x] R1 — Consumer bootstrap hygiene
@@ -442,7 +442,7 @@ per-method dimension; re-triggers [R24](#r24). Tag proposal expected. Epic
 checkbox closes with this item.
 
 <a id="r24"></a>
-### [ ] R24 — README screen recording
+### [x] R24 — README screen recording
 **Scope:** README + a recording asset/link; no code.
 The primary interviewer-facing artifact: a 3–5 minute recording of the
 [R22](#r22) chaos demo with the [R21](#r21) dashboard visible — interviewers
@@ -453,6 +453,13 @@ cheap and expected.
 claim shown matches the measured numbers in quality.md/README.
 *Re-record note (2026-08-01, [R26d](#r26d)): the demo now ends with the dunning
 scene — record after R26d so the recording covers recovery and cancellation.*
+*Recorded 2026-09-06, third take, after [R45](#r45) made the dashboard agree
+with every scene: one paced run (126 checks green) cut to 4 min 47 s / 9.25 MB
+— silent waits at ≥ 8× with the factor badged, the DLQ hold, the broker
+restart and the per-bank latency held at real time — embedded in the README
+as a GitHub asset. Takes 1–2 taught the two lessons now in the private notes:
+OBS's canvas must match the 4K display, and dashboard stats lag the terminal
+by 10–15 s, so a paced run waits at each prompt.*
 
 <a id="r27"></a>
 ### [x] R27 — chaos-demo scene 2: backlog precondition races the management API

@@ -5,6 +5,25 @@ and payment service. The services run together via Docker Compose, seeded with
 PostgreSQL data and wired to RabbitMQ so you can execute the renewal workflow
 on-demand.
 
+## Watch it run (under five minutes, no narration)
+
+https://github.com/user-attachments/assets/f4df2a5d-10ed-4b65-841e-a35e09dc3768
+
+One take of `scripts/chaos-demo.sh` on the unmodified Compose stack, cut only
+for time, with the provisioned Grafana dashboard alongside. The nine scenes
+are the ones described under [Run the chaos demo](#run-the-chaos-demo): the
+pipeline draining, a poison message dead-lettering while good traffic flows,
+a killed worker losing nothing, three replicas splitting the queue, a broker
+restart, chargebacks under a slow bank, per-country routing lag, a recreated
+counterparty recovered by the sweeper, and the dunning arc through `past_due`
+to recovery and cancellation. Every `PASS` line on screen is an assertion the
+script makes, not narration; waits are sped up and badged with their factor;
+the figures the script quotes are the measured ones in
+[Scale: measured, not claimed](#scale-measured-not-claimed), and the
+dashboard beside the terminal shows what each scene claims
+([R45](docs/roadmap.md#r45)). Recorded 2026-09-06 on v0.11.0 plus R45 and
+re-recorded whenever the flow reshapes.
+
 ## For agents & contributors
 
 This project is developed primarily with AI agents under a harness-engineering
