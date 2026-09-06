@@ -953,6 +953,9 @@ observation is filed as [R46](#r46), untouched here.*
 **Scope:** design first — retention policy for both tables; likely a new
 migration plus a bounded sweeper (or partitioning), verify.sh tightening;
 decision entry expected.
+Since [R44](#r44) the webhook replay guard no longer depends on the inbox
+constraint, so a retention purge re-opens no replay window — the design
+entry should say so and need not size retention around it.
 Neither table is ever cleaned up. At the 10M/month design scale
 (~330k renewals/night) the outbox gains ~120M JSONB-carrying rows per
 year, and the inbox grows with every notification, redelivery, and
@@ -989,7 +992,9 @@ can replay it indefinitely and receive 200 forever. Today the
 but that is idempotency doing authentication's job by luck, not design:
 the dedupe layer exists for delivery semantics, not access control, and a
 replay arriving after a future retention purge ([R43](#r43)) would land as
-a fresh row. Surfaced 2026-09-05 by an external review of the repo.
+a fresh row — closed by this item's fix: the replay check now runs before
+the inbox is touched, so R43's purge no longer re-opens replays. Surfaced
+2026-09-05 by an external review of the repo.
 Fix shape: a timestamp header included in the signed bytes, with a bounded
 acceptance window checked before the inbox insert; stale-signature
 requests get a distinct 4xx. One interaction to respect: the counterparty
