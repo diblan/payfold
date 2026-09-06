@@ -90,7 +90,8 @@ mock-counterparty ×3 ── signed POST /webhooks/bank/{id} ──▶ renewal-c
 Job `renewalJob` = `scanStep` → `publishStep`, defined in
 `billing-engine/renewal-producer/.../job/RenewalJobConfig.java`.
 
-Two ways to launch, both build the identifying parameter `scheduleDate = today`:
+Two ways to launch, both build the identifying parameter `scheduleDate = today`
+(identity only — the scan window is derived at run time, see **scanStep**):
 
 - **Cron** — `RenewalScheduler`, `${app.scheduleCron}` (default `0 0 3 * * *`, zone
   `${app.timezone}`). Cron launches are serialized across producer instances by a
@@ -121,17 +122,33 @@ Two ways to launch, both build the identifying parameter `scheduleDate = today`:
 transaction per page, keyset-paginated over the primary key: each iteration
 selects the next `${app.scanPageSize}` (default 10000) active subscriptions with
 `s.id > cursor ORDER BY s.id LIMIT n`, applies the due-window filter
-(`renewed_at` + plan interval falling in today's local-day window) *inside* the
-page, and inserts the page's due rows into `renewal_outbox` with
-`ON CONFLICT (subscription_id, due_date) DO NOTHING` (constraint
+(`renewed_at` + plan interval, localized to `app.timezone`, falling inside the
+window) *inside* the page, and inserts the page's due rows into `renewal_outbox`
+with `ON CONFLICT (subscription_id, due_date) DO NOTHING` (constraint
 `uniq_outbox_sub_due`), so re-scans and crash-resumed scans stay idempotent
 across pages. The page query reports its own row count and last id regardless of
 how many rows were due, so all-not-due pages still advance the cursor; the loop
-ends when a page comes back short, never on `inserted == 0`. The cursor — and
-the due window, fixed at the first page so a scan crossing midnight keeps one
-consistent window — is carried in the step ExecutionContext, which Spring Batch
-persists in the same transaction as the page's inserts, so a restart resumes
-from the last committed page. Each row's payload is the full
+ends when a page comes back short, never on `inserted == 0`.
+
+**Window semantics ([D26](decisions.md#d26)).** The window is
+`[today − app.scanCatchUpDays, today + 1)` at local midnight — default 7 days
+of catch-up, `0` restores today-only. Each minted row keeps its *own*
+`due_local::date` as `due_date`, so the idempotency key `sub-<id>|<due_date>`,
+the billing period, and the outbox constraint are identical whether the row is
+minted on its due day or a week later; a night on which the job never launched
+(host down, scheduler outage, failed deploy) is recovered by the next run, and
+[G2](invariants.md#g2) makes catch-up double-billing impossible. Window width
+costs nothing: the page reads every active row regardless, and the days already
+covered fall out of `ON CONFLICT DO NOTHING`. A gap deeper than the floor is an
+operator decision — raise `APP_SCANCATCHUPDAYS` and force-trigger — and is
+surfaced by the zero-lag detector `verify.sh` asserts: the count of `active`
+subscriptions whose next due date (`renewed_at` + interval, local) lies before
+today must be zero after a run. Both window edges are fixed at the first page so
+a scan crossing midnight keeps one consistent window; the cursor and the window
+(`scanStep.cursor`, `scanStep.window`, `scanStep.windowStart`) are carried in
+the step ExecutionContext, which Spring Batch persists in the same transaction
+as the page's inserts, so a restart resumes from the last committed page with
+its original window. Each row's payload is the full
 [`renewal.requested` v1 contract](#message-contract--renewalrequested-v1),
 including the producer-minted identity, idempotency key, due date, and billing
 period. Scanning keyset-over-all-actives instead of indexing the due predicate
@@ -676,6 +693,7 @@ Every runtime configuration key below has a real consumer.
 | `spring.rabbitmq.template.mandatory` (producer) | Spring Boot AMQP autoconfig (`RabbitTemplate` mandatory flag); makes the broker return unroutable messages instead of dropping them | alive |
 | `spring.rabbitmq.cache.channel.size` (producer) | Spring Boot AMQP autoconfig (`CachingConnectionFactory` channel cache size); kept equal to `app.publishInFlightLimit` so parked confirm channels re-cache and are reused ([R25](roadmap.md#r25)) | alive |
 | `app.timezone`, `app.scheduleCron`, `app.scanPageSize`, `app.publishPageSize`, `app.publishInFlightLimit`, `app.confirmTimeoutMs` (producer) | `RenewalScheduler`, `RenewalJobConfig`, `RenewalJobEndpoint` | alive |
+| `app.scanCatchUpDays` (producer; env `APP_SCANCATCHUPDAYS` via relaxed binding) | `RenewalJobConfig` scan window floor — the scan reaches back this many local days before today ([D26](decisions.md#d26)); default 7, `0` = today-only, negative rejected at startup | alive |
 | `rabbitmq.exchange`, `rabbitmq.routingKey` (producer) | `RabbitConfig`, `OutboxPublisher` | alive |
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |
 | `relay.page-size`, `relay.in-flight-limit`, `relay.confirm-timeout-ms` (consumer) | `RelayProperties`, `SettlementInboxRelay` — page claim size, bounded in-flight confirm window, page-scoped send+confirm deadline ([D24](decisions.md#d24)); defaults 500 / 100 / 5000 ms, env-overridable via relaxed binding (`RELAY_PAGE_SIZE`, `RELAY_IN_FLIGHT_LIMIT`, `RELAY_CONFIRM_TIMEOUT_MS`) | alive |
@@ -793,7 +811,7 @@ architecture-independent jar once instead of emulating Maven under QEMU.
 
 | Image (`ghcr.io/diblan/…`) | Contents | Run pattern | Config (env) |
 |---|---|---|---|
-| `payfold-renewal-producer` | producer Spring Boot jar | long-running service; port 8080, `/actuator/health` | the compose `renewal-producer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_ROUTINGKEY`, `APP_TIMEZONE`, `APP_SCHEDULECRON`, `TZ` |
+| `payfold-renewal-producer` | producer Spring Boot jar | long-running service; port 8080, `/actuator/health` | the compose `renewal-producer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_ROUTINGKEY`, `APP_TIMEZONE`, `APP_SCHEDULECRON`, `TZ`; optional `APP_SCANCATCHUPDAYS` (catch-up floor, default 7 — [D26](decisions.md#d26)) |
 | `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, indexed `BANK_REGISTRY_*` including scheme, `RECOVERY_STALE_AFTER_SECONDS`, `RECOVERY_SWEEP_INTERVAL_MS`, the three `DUNNING_*_GRACE_SECONDS`, `DUNNING_RETRY_DELAY_SECONDS`, `DUNNING_MAX_ATTEMPTS`, `DUNNING_SWEEP_INTERVAL_MS`, the optional relay overrides `RELAY_PAGE_SIZE` / `RELAY_IN_FLIGHT_LIMIT` / `RELAY_CONFIRM_TIMEOUT_MS` ([D24](decisions.md#d24)), `SPRING_RABBITMQ_LISTENER_SIMPLE_CONCURRENCY`, `TZ` |
 | `payfold-migrations` | `flyway/flyway:11` + `db-migrations/V*.sql`, `CMD ["migrate"]` | run-to-completion Job; exit 0 = success; re-run on a current schema is a no-op (asserted by `verify.sh`) | `FLYWAY_URL`, `FLYWAY_USER`, `FLYWAY_PASSWORD`, `FLYWAY_CONNECT_RETRIES` (image default 30) |
 | `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS`, `SEED_SDD_PERCENT`, `SEED_SDD_RULE_PERCENT`, `SEED_SDD_SILENT_PERCENT`, `SEED_SDD_RETRY_PERCENT`, `SEED_CARD_RULE_PERCENT`, `SEED_CARD_SILENT_PERCENT`, `SEED_CARD_RETRY_PERCENT` |

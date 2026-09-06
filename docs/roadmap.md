@@ -905,7 +905,7 @@ idempotent under redelivery of either notification); verify.sh's existing
 exact chargeback checks pass at the 100k scale where the reorder occurs.
 
 <a id="r42"></a>
-### [ ] R42 — A never-launched night's renewals fall outside every future scan window
+### [x] R42 — A never-launched night's renewals fall outside every future scan window
 **Scope:** design first — producer scan window semantics
 (`RenewalJobConfig.scanStep`, scheduler/endpoint job parameters), verify.sh
 tightening; decision entry expected (window semantics are behavior).
@@ -935,6 +935,18 @@ test (or verify probe) seeds a due-yesterday cohort, runs today's job, and
 finds it billed exactly once under the original due-date-derived keys;
 the zero-lag detector is asserted in verify.sh; architecture.md documents
 the window semantics; a decision entry records the chosen mechanism.
+*Accepted 2026-09-06 ([D26](decisions.md#d26)): the window is
+`[today − app.scanCatchUpDays, today + 1)` (default 7), both edges pinned in
+the step context; `ScanCatchUpWindowTest` pins the edges with a 2-day floor;
+verify.sh seeds a 100-row due-yesterday card cohort before the trigger and
+proves it billed exactly once under `sub-<id>|<yesterday>`, none under
+today's key, every row advanced, and the zero-lag detector at zero — the
+inbox exactness predictions (base and per-bank) now count past-dated rows.
+Fresh-stack verify green (121 checks, 22 panel targets live); producer
+suite green (23 tests). The live producer logged
+`Scan window [2026-08-30, 2026-09-07)` and the outbox held the 100 rows dated
+2026-09-05 beside 15,000 due today. The `renewed_at` period-advance
+observation is filed as [R46](#r46), untouched here.*
 
 <a id="r43"></a>
 ### [ ] R43 — `renewal_outbox` and `settlement_inbox` grow without bound
@@ -1038,3 +1050,28 @@ the poison across 4 scrapes); Prometheus samples from that run show every
 signal: DLQ non-zero for 5 samples, broker down for 3, charged_back 0 → 40,
 bank-b's 8 s above bank-a's 2 s once the 30 s window clears scene 6,
 resubmitted 0 → 20.*
+
+<a id="r46"></a>
+### [ ] R46 — Settlement advances `renewed_at` to `period_end`, so the next due date lands one interval after the paid period ends
+**Scope:** design first — the meaning of `subscription.renewed_at`; consumer
+`SettlementService` (both settle paths), the seeders and `scripts/load-test.sh`
+(preimage arithmetic), the producer's due predicate; decision entry expected
+([D16](decisions.md#d16)'s "period math is never compensated" is the
+neighbouring rule).
+Three places read or write `renewed_at` and two of them disagree with the
+third. The seeders plant `renewed_at = due − interval`, and the scan marks a
+row due when `renewed_at + interval` falls in the window — so `renewed_at`
+means *the last renewal date, the start of the period currently paid for*.
+Settlement then sets `renewed_at = invoice.period_end` (at 09:00 local), i.e.
+`due + interval`, which makes the *next* due date `due + 2·interval`: the
+period `[due + interval, due + 2·interval)` is never invoiced. Read the
+other way — `renewed_at` as *paid-through* — the seeders plant every
+subscription one interval overdue and the scan's predicate is off by one in
+the other direction. Either reading, one of seeder/scan/settle is wrong;
+verify.sh never sees it because every run bills a single day. Surfaced
+2026-09-06 while designing [R42](#r42) ([D26](decisions.md#d26)).
+**Done when:** a decision entry fixes the meaning of `renewed_at`; seeder,
+scan, and both settle paths agree with it; an integration test renews one
+subscription twice in succession and proves the two invoices cover adjacent
+periods with no gap and no overlap; verify.sh asserts every settled due-today
+subscription's next due date is exactly one interval after today.

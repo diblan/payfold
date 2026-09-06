@@ -44,7 +44,10 @@ consume time.
 *Why:* RabbitMQ is at-least-once; redelivery timing is not under our control.
 *Enforced by:* DB unique constraints (`uniq_invoice_period`, `uniq_charge_period`,
 `payment.idempotency_key`) + producer-supplied key/period material + a cross-midnight
-redelivery integration test; the consumer never reads the clock.
+redelivery integration test; the consumer never reads the clock. The producer's
+catch-up window ([D26](decisions.md#d26)) relies on this: a renewal minted days
+after its due date carries the same key and period the due night would have
+minted, and `verify.sh`'s due-yesterday cohort proves it bills exactly once.
 *Status:* **HELD** (since R4, 2026-07-20)
 
 <a id="g3"></a>

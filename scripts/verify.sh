@@ -19,6 +19,10 @@
 # settlement inbox; the silent (94) cohorts recover through the sweeper, the
 # retriable (95) cohorts re-collect and settle, and the dunning matrix ends in
 # exact per-family cancellations with the sweeper provably quiescent.
+# A never-launched night is recoverable (R42/D26): a cohort seeded due
+# YESTERDAY before the trigger must be billed exactly once by today's job under
+# yesterday's due-date keys, and afterwards no active subscription may be
+# overdue (the zero-lag detector).
 #
 # Usage:
 #   scripts/verify.sh [--no-up] [--timeout SECONDS] [--poison|--no-poison]
@@ -88,6 +92,7 @@ RMQ_QUEUE="$(env_val RABBITMQ_QUEUE billing.renewals.main)"
 RMQ_EXCHANGE="$(env_val RABBITMQ_EXCHANGE billing.renewals)"
 RMQ_RK="$(env_val RABBITMQ_ROUTINGKEY renewal.requested)"
 BANK_PORT="$(env_val BANK_HTTP_PORT 8085)"
+TZ_VAL="$(env_val TZ Europe/Brussels)"
 BANK_B_PORT="$(env_val BANK_B_HTTP_PORT 8086)"
 CARDNET_PORT="$(env_val CARDNET_HTTP_PORT 8087)"
 RMQ_DLQ="billing.renewals.dlq"
@@ -393,6 +398,49 @@ M_CANCEL_EXPIRED_BEFORE="$(consumer_prom_sum '^dunning_cancellations_total\{caus
 DB_OUTBOX_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox')"
 DB_PUB_BEFORE="$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NOT NULL')"
 
+# --- R42/D26: a never-launched night's renewals must be recoverable ----------
+# Seed a cohort due YESTERDAY (09:00 local, plain -00 card tokens — the R38-legal
+# load-test shape) before the trigger. Today's job must reach back and mint it
+# under yesterday's due-date keys, the consumer bills it from message content
+# alone (G2), and afterwards no active subscription may be overdue. Run-unique
+# emails keep dirty-database re-runs collision-free; an earlier run's cohort is
+# already advanced and therefore invisible to both the window and the detector.
+CATCHUP_N=100
+CATCHUP_TAG="$(date +%s)-$$"
+CATCHUP_SEED_OUT="$(docker compose exec -T postgres psql -U "$PGUSER" -d "$PGDB" -v ON_ERROR_STOP=1 <<SQL
+WITH due AS (
+    SELECT ((current_date - 1) + time '09:00') AT TIME ZONE '${TZ_VAL}' AS due_at
+), seed_plan AS (
+    -- the clamp-day preimage rule (R16), evaluated for YESTERDAY
+    SELECT p.id, p.interval FROM plan p, due
+    WHERE p.interval = CASE WHEN (due.due_at - interval '1 month') + interval '1 month' = due.due_at
+                            THEN 'month' ELSE 'year' END
+    ORDER BY p.name LIMIT 1
+), new_customers AS (
+    INSERT INTO customer (id, email, payment_method, card_token)
+    SELECT gen_random_uuid(), 'catchup-${CATCHUP_TAG}-' || g || '@example.test',
+           'card', 'tok-catchup-${CATCHUP_TAG}-' || g || '-00'
+    FROM generate_series(1, ${CATCHUP_N}) g
+    RETURNING id
+)
+INSERT INTO subscription (id, customer_id, plan_id, status, renewed_at)
+SELECT gen_random_uuid(), c.id, (SELECT id FROM seed_plan), 'active',
+       (SELECT due_at FROM due) - ('1 ' || (SELECT interval FROM seed_plan))::interval
+FROM new_customers c;
+SQL
+)"
+if echo "$CATCHUP_SEED_OUT" | grep -q "INSERT 0 ${CATCHUP_N}$"; then
+  pass "catch-up cohort seeded due yesterday (${CATCHUP_N})"
+else
+  fail "catch-up cohort seeded due yesterday (${CATCHUP_N})" "psql: $(echo "$CATCHUP_SEED_OUT" | tail -1)"
+fi
+CATCHUP_OVERDUE_BEFORE="$(q "SELECT count(*) FROM subscription s JOIN customer c ON c.id = s.customer_id JOIN plan p ON p.id = s.plan_id WHERE c.email LIKE 'catchup-${CATCHUP_TAG}-%' AND s.status = 'active' AND ((s.renewed_at + ('1 ' || p.interval)::interval) AT TIME ZONE '${TZ_VAL}')::date = current_date - 1")"
+if [[ "$CATCHUP_OVERDUE_BEFORE" == "$CATCHUP_N" ]]; then
+  pass "catch-up cohort is due exactly yesterday by the scan's own arithmetic (${CATCHUP_OVERDUE_BEFORE})"
+else
+  fail "catch-up cohort is due exactly yesterday by the scan's own arithmetic" "expected=${CATCHUP_N} actual=${CATCHUP_OVERDUE_BEFORE:-error}"
+fi
+
 note "triggering renewal job (async endpoint — POST returns the execution id)…"
 trigger_job
 assert_trigger "renewal job trigger"
@@ -425,6 +473,44 @@ fi
 wait_for "outbox fully published"                outbox_drained
 wait_for "every due card renewal reached its token-predicted terminal payment" all_cards_terminal
 wait_for "every due SDD renewal reached its bank-predicted terminal payment" all_sdd_terminal
+
+# R42/D26: the missed night's rows carry yesterday's date — exactly one outbox
+# row and exactly one payment per subscription, both keyed sub-<id>|<yesterday>,
+# none keyed today — then the zero-lag detector: no active subscription whose
+# next due date (renewed_at + interval, local) lies before today. The detector
+# is the exact complement of the scan window and is deliberately unbounded by
+# the catch-up floor, so a row older than the floor fails loudly here.
+CATCHUP_BILLED_SQL="SELECT count(*) FROM subscription s JOIN customer c ON c.id = s.customer_id
+WHERE c.email LIKE 'catchup-${CATCHUP_TAG}-%'
+  AND (SELECT count(*) FROM renewal_outbox o WHERE o.subscription_id = s.id) = 1
+  AND EXISTS (SELECT 1 FROM renewal_outbox o WHERE o.subscription_id = s.id AND o.due_date = current_date - 1
+              AND o.payload->>'idempotency_key' = 'sub-' || s.id || '|' || to_char(current_date - 1, 'YYYY-MM-DD'))
+  AND (SELECT count(*) FROM payment p WHERE p.idempotency_key LIKE 'sub-' || s.id || '|%') = 1
+  AND EXISTS (SELECT 1 FROM payment p WHERE p.idempotency_key = 'sub-' || s.id || '|' || to_char(current_date - 1, 'YYYY-MM-DD')
+              AND p.channel = 'CARD' AND p.status = 'succeeded')"
+catchup_billed_once() { [[ "$(q "$CATCHUP_BILLED_SQL")" == "$CATCHUP_N" ]]; }
+wait_for "catch-up cohort billed exactly once under yesterday's due-date keys (${CATCHUP_N})" catchup_billed_once
+CATCHUP_TODAY_KEYED="$(q "SELECT count(*) FROM payment p JOIN charge ch ON ch.id = p.charge_id JOIN subscription s ON s.id = ch.subscription_id JOIN customer c ON c.id = s.customer_id WHERE c.email LIKE 'catchup-${CATCHUP_TAG}-%' AND p.idempotency_key LIKE '%|' || to_char(current_date, 'YYYY-MM-DD') || '%'")"
+if [[ "$CATCHUP_TODAY_KEYED" == "0" ]]; then
+  pass "no catch-up payment was keyed to today (original due dates only)"
+else
+  fail "no catch-up payment was keyed to today (original due dates only)" "count=${CATCHUP_TODAY_KEYED:-error}"
+fi
+CATCHUP_ADVANCED="$(q "SELECT count(*) FROM subscription s JOIN customer c ON c.id = s.customer_id JOIN plan p ON p.id = s.plan_id WHERE c.email LIKE 'catchup-${CATCHUP_TAG}-%' AND s.status = 'active' AND ((s.renewed_at + ('1 ' || p.interval)::interval) AT TIME ZONE '${TZ_VAL}')::date >= current_date")"
+if [[ "$CATCHUP_ADVANCED" == "$CATCHUP_N" ]]; then
+  pass "every catch-up subscription is active and no longer overdue (${CATCHUP_ADVANCED})"
+else
+  fail "every catch-up subscription is active and no longer overdue" "expected=${CATCHUP_N} actual=${CATCHUP_ADVANCED:-error}"
+fi
+LAG_SQL="SELECT count(*) FROM subscription s JOIN plan p ON p.id = s.plan_id
+WHERE s.status = 'active' AND s.renewed_at IS NOT NULL
+  AND ((s.renewed_at + ('1 ' || p.interval)::interval) AT TIME ZONE '${TZ_VAL}')::date < current_date"
+OVERDUE_ACTIVE="$(q "$LAG_SQL")"
+if [[ "$OVERDUE_ACTIVE" == "0" ]]; then
+  pass "zero-lag detector: no active subscription is overdue after today's run"
+else
+  fail "zero-lag detector: no active subscription is overdue after today's run" "count=${OVERDUE_ACTIVE:-error}"
+fi
 
 DB_OUTBOX_AFTER="$(q 'SELECT count(*) FROM renewal_outbox')"
 DB_PUB_AFTER="$(q 'SELECT count(*) FROM renewal_outbox WHERE published_at IS NOT NULL')"
@@ -543,7 +629,14 @@ N_CARD_AUTH="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s
 N_CARD_96="$(q "SELECT count(*) FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id WHERE o.due_date = current_date AND c.payment_method = 'card' AND right(c.card_token, 2) = '96'")"
 # Card-95 attempt 1 declines synchronously (no notification); its settled row
 # arrives under the |a2 id and is counted by the retry-family check below.
-EXPECTED_INBOX=$((N_SDD_DUE + N_96_DUE + N_CARD_AUTH - N_RETRY_CARD + N_CARD_96))
+# R42: rows the catch-up window minted for PAST due dates settle through the
+# same spine — one base notification per SDD or card-authorized collection, a
+# second for a 96, none for a card 99/98 (declined) or card 95 (its settled row
+# is |a2). Generic over every past-dated row so dirty-database re-runs stay exact.
+N_PAST_NOTIFYING="$(q "SELECT count(*) + count(*) FILTER (WHERE (c.payment_method = 'sdd' AND right(c.debtor_iban, 2) = '96') OR (c.payment_method = 'card' AND right(c.card_token, 2) = '96'))
+FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id
+WHERE o.due_date < current_date AND NOT (c.payment_method = 'card' AND right(c.card_token, 2) IN ('99','98','95'))")"
+EXPECTED_INBOX=$((N_SDD_DUE + N_96_DUE + N_CARD_AUTH - N_RETRY_CARD + N_CARD_96 + N_PAST_NOTIFYING))
 BASE_INBOX_SQL="SELECT count(*) FROM settlement_inbox WHERE notification_id NOT LIKE '%|a%'"
 inbox_complete() { [[ "$(q "$BASE_INBOX_SQL")" -ge "$EXPECTED_INBOX" ]] 2>/dev/null; }
 wait_for "settlement inbox received every predicted base notification (${EXPECTED_INBOX})" inbox_complete
@@ -605,13 +698,18 @@ if [[ "$ROUTING_MISMATCH" == "0" ]]; then
 else
   fail "every SDD payment routed to its country's bank" "count=${ROUTING_MISMATCH:-error}"
 fi
+# R42: past-dated rows (the catch-up window's) settle at the same banks — the
+# card share adds every past-dated authorized card row (plus a second row per
+# 96), and the SDD shares are counted over every due date up to today.
+N_PAST_CARD_NOTIFYING="$(q "SELECT count(*) + count(*) FILTER (WHERE right(c.card_token, 2) = '96') FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id
+WHERE o.due_date < current_date AND c.payment_method = 'card' AND right(c.card_token, 2) NOT IN ('99','98','95')")"
 for BANK in bank-a bank-b cardnet; do
   if [[ "$BANK" == "cardnet" ]]; then
-    EXPECTED_BANK_INBOX=$((N_CARD_AUTH - N_RETRY_CARD + N_CARD_96))
+    EXPECTED_BANK_INBOX=$((N_CARD_AUTH - N_RETRY_CARD + N_CARD_96 + N_PAST_CARD_NOTIFYING))
   else
     if [[ "$BANK" == "bank-a" ]]; then COUNTRIES="('BE','FR')"; else COUNTRIES="('NL','IE')"; fi
     EXPECTED_BANK_INBOX="$(q "SELECT count(*) + count(*) FILTER (WHERE right(c.debtor_iban, 2) = '96') FROM renewal_outbox o JOIN subscription s ON s.id = o.subscription_id JOIN customer c ON c.id = s.customer_id
-WHERE o.due_date = current_date AND c.payment_method = 'sdd' AND c.country IN ${COUNTRIES}")"
+WHERE o.due_date <= current_date AND c.payment_method = 'sdd' AND c.country IN ${COUNTRIES}")"
   fi
   ACTUAL_BANK_INBOX="$(q "SELECT count(*) FROM settlement_inbox WHERE bank_id = '${BANK}' AND notification_id NOT LIKE '%|a%'")"
   if [[ -n "$EXPECTED_BANK_INBOX" && "$ACTUAL_BANK_INBOX" == "$EXPECTED_BANK_INBOX" ]]; then

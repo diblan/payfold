@@ -36,6 +36,7 @@ public class RenewalJobConfig {
     private static final Logger log = LoggerFactory.getLogger(RenewalJobConfig.class);
     private static final String SCAN_CURSOR_KEY = "scanStep.cursor";
     private static final String SCAN_WINDOW_KEY = "scanStep.window";
+    private static final String SCAN_WINDOW_START_KEY = "scanStep.windowStart";
     private static final String NIL_UUID = "00000000-0000-0000-0000-000000000000";
 
     @Bean
@@ -84,7 +85,11 @@ public class RenewalJobConfig {
                          JdbcTemplate jdbc,
                          MeterRegistry meters,
                          @Value("${app.timezone:Europe/Brussels}") String tz,
-                         @Value("${app.scanPageSize:10000}") int scanPageSize) {
+                         @Value("${app.scanPageSize:10000}") int scanPageSize,
+                         @Value("${app.scanCatchUpDays:7}") int scanCatchUpDays) {
+        if (scanCatchUpDays < 0) {
+            throw new IllegalArgumentException("app.scanCatchUpDays must be >= 0, got " + scanCatchUpDays);
+        }
         Counter insertedCounter = Counter.builder("outbox.inserted")
                 .description("Outbox rows inserted by scanStep")
                 .register(meters);
@@ -99,19 +104,33 @@ public class RenewalJobConfig {
                     // I/O with no extra write amplification (D10). The due-window filter sits INSIDE
                     // the page, so the page query reports its row count and last id no matter how
                     // many rows were due — all-not-due pages still advance the cursor, and the loop
-                    // ends on a short page, never on inserted == 0. The cursor and the due window
-                    // (fixed on the first page so a scan crossing midnight keeps one consistent
-                    // window) live in the step ExecutionContext, which Spring Batch persists in the
-                    // same transaction as the page's inserts: a crash resumes from the last
-                    // committed page, and ON CONFLICT DO NOTHING absorbs the one re-scanned page.
+                    // ends on a short page, never on inserted == 0.
+                    // The due window is [today - scanCatchUpDays, today + 1) at local midnight
+                    // (D26): a night on which the job never launched leaves its renewals
+                    // overdue-but-active, and the next run's window reaches back to mint them
+                    // under their own due_local::date — the same keys the missed night would
+                    // have minted — at zero extra I/O, since the page reads every active row
+                    // regardless of window width. Days already covered fall out of ON CONFLICT
+                    // DO NOTHING. Both edges are fixed on the first page so a scan crossing
+                    // midnight keeps one consistent window; cursor and window live in the step
+                    // ExecutionContext, which Spring Batch persists in the same transaction as
+                    // the page's inserts: a crash resumes from the last committed page, and ON
+                    // CONFLICT DO NOTHING absorbs the one re-scanned page.
                     ExecutionContext stepCtx = chunkContext.getStepContext().getStepExecution().getExecutionContext();
                     ZoneId zone = ZoneId.of(tz);
                     String windowDate = stepCtx.getString(SCAN_WINDOW_KEY, null);
                     LocalDate today = windowDate == null ? LocalDate.now(zone) : LocalDate.parse(windowDate);
+                    String windowStartDate = stepCtx.getString(SCAN_WINDOW_START_KEY, null);
+                    LocalDate windowStart = windowStartDate == null
+                            ? today.minusDays(scanCatchUpDays)
+                            : LocalDate.parse(windowStartDate);
                     if (windowDate == null) {
                         stepCtx.putString(SCAN_WINDOW_KEY, today.toString());
+                        stepCtx.putString(SCAN_WINDOW_START_KEY, windowStart.toString());
+                        log.info("Scan window [{}, {}) local — {} day(s) of catch-up before today",
+                                windowStart, today.plusDays(1), scanCatchUpDays);
                     }
-                    LocalDateTime start = today.atStartOfDay();
+                    LocalDateTime start = windowStart.atStartOfDay();
                     LocalDateTime end = today.plusDays(1).atStartOfDay();
                     UUID cursor = UUID.fromString(stepCtx.getString(SCAN_CURSOR_KEY, NIL_UUID));
 

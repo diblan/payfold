@@ -23,6 +23,7 @@ spring:
 app:
   timezone: Europe/Brussels
   scanPageSize: 10000
+  scanCatchUpDays: 7   # scan window reaches back this many local days before today (D26); 0 = today only
   publishPageSize: 10000
   publishInFlightLimit: 100   # max unconfirmed sends in flight per publish page; each holds one broker channel while its confirm is pending
   confirmTimeoutMs: 10000
