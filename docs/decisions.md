@@ -829,3 +829,79 @@ tighter and may stretch the tail further; 600 s carries ~3× headroom, and the
 exact cause-attribution checks remain the tripwire if that bet is wrong.
 Application default (604800 s) untouched; policy stays in config
 ([D21](#d21)).
+
+## D26 — R42 scan window: a bounded catch-up floor replaces "today only"; the lag detector is the acceptance test, not the mechanism — 2026-09-06 — active
+<a id="d26"></a>
+[R42](roadmap.md#r42): the scan predicate bounded `due_local` to exactly one
+local day, computed at run time, so a night on which the job never launched
+(host down, scheduler outage, failed deploy) left that day's renewals outside
+every future window — unbilled and undetected. A run that *starts* was always
+safe (the window is pinned into the step ExecutionContext on the first page
+and a restart re-scans its own day); a run that never starts had no window
+at all. The roadmap offered three shapes; this entry picks one and says why
+the other two lost.
+
+**Decision: the window becomes `[today − app.scanCatchUpDays, today + 1)` at
+local midnight, both edges pinned in the step ExecutionContext on the first
+page (`scanStep.windowStart` beside the existing `scanStep.window`); default
+7 days, `0` restores the old today-only predicate.** Nothing else in the row
+changes: `due_date` is still each row's own `due_local::date`, the key is
+still `sub-<id>|<due_date>`, `uniq_outbox_sub_due` still dedupes, and the
+consumer still derives period and idempotency material from message content
+alone ([G2](invariants.md#g2)) — so a missed night's rows, minted a day or a
+week late, are what that night would have minted apart from `event_id` and
+`occurred_at`, and catch-up double-billing is structurally impossible. The
+days the window re-covers cost nothing: [D10](#d10)'s keyset scan reads every
+active row with the due predicate *inside* the page, so window width is a
+free parameter — zero extra I/O at any catch-up depth — and the already-minted
+rows fall out of `ON CONFLICT DO NOTHING` exactly as a crash-resumed page does.
+
+**Why not "from the last successful `scheduleDate` forward".** It reads the
+fact from the wrong table. The JobRepository knows which *runs* completed, not
+which *rows* are owed: force re-runs carry a random `run.id`, a restored or
+freshly initialized batch schema has no history at all (a fresh stack has
+none — the acceptance probe would have had to fabricate `BATCH_*` rows to
+exercise it), and a never-launched night is only one way to end up with an
+overdue active subscription; a row seeded late for a past day, a support
+edit to `renewed_at`, or a restore from backup produce the same state and the
+same obligation. The overdue state *is* the fact, and it lives in
+`subscription` — the table the outbox already derives from. Reading the
+window from there covers every cause with one predicate.
+
+**Why not an explicit window parameter on the trigger.** It makes the
+operator compute dates, it cannot help the cron path (which is where the
+missed night happens), and it invites the exact trap the roadmap flags:
+`scheduleDate` is the job instance's *identity*, and turning it into the
+scan anchor would make "re-run today" and "scan yesterday" the same knob.
+`scheduleDate` stays identity-only. The operator lever for a gap deeper than
+the floor is the env override — raise `APP_SCANCATCHUPDAYS`, force-trigger,
+restore — with no new endpoint surface and no runbook arithmetic.
+
+**Why bounded.** An unbounded "everything overdue" window would let a restore
+of a months-old backup silently bill months of renewals at 03:00. Seven days
+covers a week-long outage noticed late; anything older is a human decision,
+and surfacing it is the detector's job, not the scan's.
+
+**The detector.** `count(*)` of `active` subscriptions with a non-null
+`renewed_at` whose `(renewed_at + plan.interval) AT TIME ZONE app.timezone`
+falls on a local date **before today**. The roadmap phrased it as "renewed_at
+older than one interval plus one day"; the date form is chosen because it is
+the exact complement of the scan predicate — "detector = 0 after a run" is the
+literal statement *no active row lies outside every future window*, true at
+any time of day. It is deliberately **not** floor-bounded: a row older than
+the catch-up floor must fail loudly, which is the whole point of having a
+floor. `verify.sh` asserts it at zero after the drain. It is a verify probe,
+not a service metric: a nightly-scale count over 10M actives belongs to the
+scan (which already pays for the pass), not to a scrape.
+
+**Acceptance shape.** `verify.sh` seeds a due-*yesterday* card cohort (plain
+`-00` tokens, the [R38](roadmap.md#r38)-legal load-test shape) before the
+first trigger and asserts each row billed exactly once under
+`sub-<id>|<yesterday>`, none under today's key, then the detector at zero; the
+inbox exactness prediction gains the cohort's settlements. A producer
+integration test pins the window edges: yesterday and the floor day are in,
+the day beyond the floor and tomorrow are out, and a re-run mints nothing.
+
+**Out of scope, noticed here:** the settlement path advances `renewed_at` to
+the invoice's `period_end`, which makes the *next* due date one interval after
+the paid period ends — filed as a roadmap item rather than touched.
