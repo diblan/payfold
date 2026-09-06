@@ -76,6 +76,7 @@ async def test_clean_submission_delivers_one_signed_webhook():
             request.content,
             "test-secret",
             request.headers["X-Bank-Signature"],
+            int(request.headers["X-Bank-Timestamp"]),
         )
         payload = json.loads(request.content)
         assert payload.keys() == {

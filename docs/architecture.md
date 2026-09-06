@@ -241,13 +241,23 @@ and `charged_back`. The subscription vocabulary is `active`, `paused`,
 
 The settlement spine closes that asynchronous submission loop. `POST
 /webhooks/bank/{bankId}` first rejects an unknown bank as `404`, then verifies
-the HMAC-SHA256 signature over the exact request bytes (`401` on a missing or
-mismatched signature), then validates the required notification identity
-(`400` for unparseable or incomplete JSON). A valid callback returns `200` only
-after its raw payload is durably inserted into `settlement_inbox`; uniqueness on
-`(bank_id, notification_id)` makes bank redelivery a no-op that still returns
-`200`. The path bank id, whose secret was verified, is the trusted bank
-attribution.
+the HMAC-SHA256 signature over `<X-Bank-Timestamp>.` + the exact request bytes
+(`401` on a missing, malformed, or mismatched signature or timestamp), then
+checks that the signed timestamp lies within `bank.webhook-tolerance-seconds`
+(default 300) of the receiver's clock in either direction (`403` — stale —
+otherwise; [R44](roadmap.md#r44)), then validates the required notification
+identity (`400` for unparseable or incomplete JSON). A valid callback returns
+`200` only after its raw payload is durably inserted into `settlement_inbox`;
+uniqueness on `(bank_id, notification_id)` makes bank redelivery a no-op that
+still returns `200`. The path bank id, whose secret was verified, is the
+trusted bank attribution. Because the timestamp is inside the signed bytes, a
+captured webhook cannot be re-dated, and the replay check runs before the
+inbox is touched — the inbox constraint stays a delivery-semantics dedupe, not
+an access control, so a replay arriving after a future retention purge
+([R43](roadmap.md#r43)) is still rejected. The receiver reads its clock for
+authentication only; idempotency and period material still come from message
+content ([G2](invariants.md#g2)). Each receiver result is counted:
+`settlement_webhooks_received_total{result="accepted|duplicate|unauthorized|stale|rejected"}`.
 
 A consumer-side recovery sweeper makes this path pull-shaped as well as pushed:
 it pages through stale `submitted` payments under a transaction-scoped advisory
@@ -475,9 +485,16 @@ Repeating a card `collection_id` returns HTTP `200` with the same stored
 extra notification.
 
 Webhook delivery sends the exact compact JSON bytes that were signed. Headers
-are `Content-Type: application/json`, `X-Bank-Id: <bank_id>`, and
-`X-Bank-Signature: sha256=<hex HMAC-SHA256 of the exact raw body>`. The
-versioned payload has seven fields:
+are `Content-Type: application/json`, `X-Bank-Id: <bank_id>`,
+`X-Bank-Timestamp: <unix seconds at send time>`, and
+`X-Bank-Signature: sha256=<hex HMAC-SHA256 of "<timestamp>." + the exact raw body>`
+([R44](roadmap.md#r44)). **Every retry attempt re-signs with a fresh
+timestamp**, so the receiver's acceptance window (consumer
+`bank.webhook-tolerance-seconds`, default 300) only has to cover clock skew
+plus transit, never the retry envelope — a legitimately late redelivery is
+never mistaken for a replay. The relation holds even for a counterparty that
+signed once: the compose envelope (8 attempts, 2 s base → 254 s of backoff)
+still fits inside the 300 s window. The versioned payload has seven fields:
 
 ```json
 {
@@ -545,7 +562,7 @@ Micrometer converts dots in meter names to underscores for Prometheus and append
 | `renewals.processed` | `renewals_processed_total{outcome="...",method="..."}` | Counter | `outcome=succeeded \| failed \| invalid \| submitted`; `method=card \| sdd \| unknown` | Per renewal delivery at its decision point; invalid messages without a known customer use `unknown`, and authorized card/SDD submissions count as submitted |
 | `settlements.processed` | `settlements_processed_total{outcome="...",bank="..."}` | Counter | `outcome=settled \| failed \| charged_back \| invalid`; `bank=bank-a \| bank-b \| cardnet \| unknown` | Per settlement delivery at validation or its accepted outcome; terminal redeliveries count as processings; invalid deliveries with no payment attribution use `unknown` |
 | `settlements.latency` | `settlements_latency_seconds_count/_sum/_max{bank="..."}` | Timer | `bank=bank-a \| bank-b \| cardnet` | Submission-to-terminal round trip, recorded once when a settled or failed guarded payment update succeeds |
-| `settlement.webhooks.received` | `settlement_webhooks_received_total{result="..."}` | Counter | `result=accepted \| duplicate \| unauthorized \| rejected` | Once per webhook request after its receiver decision |
+| `settlement.webhooks.received` | `settlement_webhooks_received_total{result="..."}` | Counter | `result=accepted \| duplicate \| unauthorized \| stale \| rejected` | Once per webhook request after its receiver decision |
 | `settlements.recovered` | `settlements_recovered_total` | Counter | none | Once when the recovery sweeper synthesizes a missing sequence-1 settlement into the inbox |
 | `recovery.sweeps` | `recovery_sweeps_total{result="..."}` | Counter | `result=recovered \| resubmitted \| noop` | Once per stale-payment recovery action after query, synthesis/resubmission, or inbox-race no-op |
 | `dunning.transitions` | `dunning_transitions_total{class="..."}` | Counter | `class=retriable \| hard_fail \| dispute` | Once when an active subscription enters `past_due`, classified by its terminal reason |
@@ -697,6 +714,7 @@ Every runtime configuration key below has a real consumer.
 | `rabbitmq.exchange`, `rabbitmq.routingKey` (producer) | `RabbitConfig`, `OutboxPublisher` | alive |
 | `rabbitmq.exchange/queue/routingKey` (consumer) | `RabbitTopology`, `RenewalListener` | alive |
 | `relay.page-size`, `relay.in-flight-limit`, `relay.confirm-timeout-ms` (consumer) | `RelayProperties`, `SettlementInboxRelay` — page claim size, bounded in-flight confirm window, page-scoped send+confirm deadline ([D24](decisions.md#d24)); defaults 500 / 100 / 5000 ms, env-overridable via relaxed binding (`RELAY_PAGE_SIZE`, `RELAY_IN_FLIGHT_LIMIT`, `RELAY_CONFIRM_TIMEOUT_MS`) | alive |
+| `bank.webhook-tolerance-seconds` (consumer; env `BANK_WEBHOOK_TOLERANCE_SECONDS` via relaxed binding) | `BankProperties`, `BankWebhookController` — a webhook's signed `X-Bank-Timestamp` must lie within this many seconds of the receiver's clock or the request is `403` stale ([R44](roadmap.md#r44)); default 300, negative rejected at startup; the counterparty re-signs every retry attempt, so this covers skew + transit, not the retry envelope | alive |
 | `bank.timeout-ms` (consumer) | `BankProperties`, `BankClient` connect + read timeout; 10 s — polices hung counterparties, while overload backpressure comes from blocked listener threads ([D19](decisions.md#d19)) | alive |
 | `bank.registry[]` id/scheme/base URL/webhook secret/countries (consumer) | `BankProperties`, `BankRegistry`, `BankClient`, `BillingService`, `BankWebhookController`; `countries` is required only for `sepa_core`, and the registry requires exactly one `card` entry; compose overrides indexed `BANK_REGISTRY_*` env vars | alive |
 | `RECOVERY_STALE_AFTER_SECONDS` (consumer; yaml `recovery.stale-after-seconds`) | `RecoveryProperties`, `RecoverySweeper`; compose overrides the 300 s application default with 30 s for verify/demo | alive |
@@ -812,7 +830,7 @@ architecture-independent jar once instead of emulating Maven under QEMU.
 | Image (`ghcr.io/diblan/…`) | Contents | Run pattern | Config (env) |
 |---|---|---|---|
 | `payfold-renewal-producer` | producer Spring Boot jar | long-running service; port 8080, `/actuator/health` | the compose `renewal-producer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_ROUTINGKEY`, `APP_TIMEZONE`, `APP_SCHEDULECRON`, `TZ`; optional `APP_SCANCATCHUPDAYS` (catch-up floor, default 7 — [D26](decisions.md#d26)) |
-| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, indexed `BANK_REGISTRY_*` including scheme, `RECOVERY_STALE_AFTER_SECONDS`, `RECOVERY_SWEEP_INTERVAL_MS`, the three `DUNNING_*_GRACE_SECONDS`, `DUNNING_RETRY_DELAY_SECONDS`, `DUNNING_MAX_ATTEMPTS`, `DUNNING_SWEEP_INTERVAL_MS`, the optional relay overrides `RELAY_PAGE_SIZE` / `RELAY_IN_FLIGHT_LIMIT` / `RELAY_CONFIRM_TIMEOUT_MS` ([D24](decisions.md#d24)), `SPRING_RABBITMQ_LISTENER_SIMPLE_CONCURRENCY`, `TZ` |
+| `payfold-renewal-consumer` | consumer Spring Boot jar | long-running service; port 8080 (host 8081 in compose), `/actuator/health` | the compose `renewal-consumer` env block: `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE`, `RABBITMQ_ROUTINGKEY`, indexed `BANK_REGISTRY_*` including scheme, `RECOVERY_STALE_AFTER_SECONDS`, `RECOVERY_SWEEP_INTERVAL_MS`, the three `DUNNING_*_GRACE_SECONDS`, `DUNNING_RETRY_DELAY_SECONDS`, `DUNNING_MAX_ATTEMPTS`, `DUNNING_SWEEP_INTERVAL_MS`, the optional relay overrides `RELAY_PAGE_SIZE` / `RELAY_IN_FLIGHT_LIMIT` / `RELAY_CONFIRM_TIMEOUT_MS` ([D24](decisions.md#d24)), optional `BANK_WEBHOOK_TOLERANCE_SECONDS` (default 300, [R44](roadmap.md#r44)), `SPRING_RABBITMQ_LISTENER_SIMPLE_CONCURRENCY`, `TZ` |
 | `payfold-migrations` | `flyway/flyway:11` + `db-migrations/V*.sql`, `CMD ["migrate"]` | run-to-completion Job; exit 0 = success; re-run on a current schema is a no-op (asserted by `verify.sh`) | `FLYWAY_URL`, `FLYWAY_USER`, `FLYWAY_PASSWORD`, `FLYWAY_CONNECT_RETRIES` (image default 30) |
 | `payfold-seed-data-gen` | seeder source + PostgreSQL JDBC driver + name data; compiles at container start | run-to-completion Job; exit 0 = success; needs a writable `SEED_OUT_DIR` (default `/tmp/seed-out`) | `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `SEED_CUSTOMERS`, `SEED_SDD_PERCENT`, `SEED_SDD_RULE_PERCENT`, `SEED_SDD_SILENT_PERCENT`, `SEED_SDD_RETRY_PERCENT`, `SEED_CARD_RULE_PERCENT`, `SEED_CARD_SILENT_PERCENT`, `SEED_CARD_RETRY_PERCENT` |
 | `payfold-mock-bank` | FastAPI mock counterparty (source + pinned pure-python deps) | long-running service; port 8080, `/health`; compose runs two SEPA instances and one card instance | `BANK_ID`, `BANK_SCHEME`, `BANK_WORKERS`, `BANK_WEBHOOK_URL`, `BANK_WEBHOOK_SECRET`, `BANK_SETTLEMENT_DELAY_SECONDS`, `BANK_CHARGEBACK_LAG_SECONDS`, `BANK_WEBHOOK_RETRY_MAX_ATTEMPTS`, `BANK_WEBHOOK_RETRY_BACKOFF_SECONDS`, `TZ` |

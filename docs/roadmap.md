@@ -978,7 +978,7 @@ asserts both directions); architecture.md's schema section documents the
 horizon and the operational shape (partition drop vs bounded DELETE).
 
 <a id="r44"></a>
-### [ ] R44 — Webhook signatures have no replay protection
+### [x] R44 — Webhook signatures have no replay protection
 **Scope:** mock-bank signing/delivery (`signing.py`, `delivery.py`),
 consumer `BankWebhookController`; additive contract change per
 [G8](invariants.md#g8); small.
@@ -1004,6 +1004,17 @@ redeliveries still land (or no-op) with 200; a test covers both
 directions; the timestamp joins the signed-byte contract in
 architecture.md's webhook section; the relation between acceptance window
 and retry envelope is asserted or documented.
+*Accepted 2026-09-06: signed bytes are now `"<X-Bank-Timestamp>." + body`;
+the mock-bank re-signs every retry attempt at send time (pytest: three
+attempts, three timestamps, each signature valid only for its own moment);
+the consumer verifies the HMAC over the same bytes, then rejects a timestamp
+outside `bank.webhook-tolerance-seconds` (default 300, either direction) with
+`403` and a `result="stale"` counter before the inbox insert — stale,
+future-dated, re-dated, missing, and malformed cases covered by the spine
+suite, in-window redelivery still `200`. The window/envelope relation is
+documented: re-signing decouples them, and even a sign-once counterparty's
+compose envelope (254 s) fits the 300 s window. Coupled rollout: both the
+counterparty and consumer images change.*
 
 <a id="r45"></a>
 ### [x] R45 — The dashboard doesn't show what scenes 2, 5, 6, 7 and 8 claim

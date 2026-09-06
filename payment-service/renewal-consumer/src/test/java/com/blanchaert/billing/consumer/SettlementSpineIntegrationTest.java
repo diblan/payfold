@@ -1,5 +1,6 @@
 package com.blanchaert.billing.consumer;
 
+import com.blanchaert.billing.consumer.config.BankProperties;
 import com.blanchaert.billing.consumer.config.SettlementTopology;
 import com.blanchaert.billing.consumer.model.RenewalRequested;
 import com.blanchaert.billing.consumer.model.SettlementReceived;
@@ -126,9 +127,9 @@ class SettlementSpineIntegrationTest {
         byte[] webhook = webhook(
                 fixture.collectionId(), 1, "settled", null);
 
-        assertThat(postWebhook(BANK_A_ID, webhook, sign(webhook, BANK_A_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, webhook, BANK_A_SECRET))
                 .isEqualTo(200);
-        assertThat(postWebhook(BANK_A_ID, webhook, sign(webhook, BANK_A_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, webhook, BANK_A_SECRET))
                 .isEqualTo(200);
 
         assertThat(jdbc.queryForObject("""
@@ -222,17 +223,54 @@ class SettlementSpineIntegrationTest {
         byte[] validBody = webhook("collection-rejected", 1, "settled", null);
         byte[] garbage = "not json".getBytes(StandardCharsets.UTF_8);
 
-        assertThat(postWebhook(BANK_A_ID, validBody, sign(validBody, "wrong-secret")))
+        assertThat(postWebhook(BANK_A_ID, validBody, "wrong-secret"))
                 .isEqualTo(401);
-        assertThat(postWebhook(BANK_A_ID, garbage, sign(garbage, BANK_A_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, garbage, BANK_A_SECRET))
                 .isEqualTo(400);
-        assertThat(postWebhook(
-                "unknown-bank", validBody, sign(validBody, BANK_A_SECRET)))
+        assertThat(postWebhook("unknown-bank", validBody, BANK_A_SECRET))
                 .isEqualTo(404);
 
         assertThat(jdbc.queryForObject(
                 "SELECT count(*) FROM settlement_inbox",
                 Long.class)).isZero();
+    }
+
+    // R44: the signature binds the body to a moment. A genuine signature over a
+    // stale timestamp is 403 and never reaches the inbox; a re-dated header no
+    // longer matches its signature (401); a missing timestamp is 401; and an
+    // in-window redelivery of an already-landed notification still returns 200.
+    @Test
+    void webhookRejectsStaleAndRedatedTimestampsButAcceptsInWindowRedelivery() throws Exception {
+        jdbc.update("DELETE FROM settlement_inbox");
+        byte[] body = webhook("collection-replay", 1, "settled", null);
+        long now = Instant.now().getEpochSecond();
+        long stale = now - BankProperties.DEFAULT_WEBHOOK_TOLERANCE_SECONDS - 60;
+        long future = now + BankProperties.DEFAULT_WEBHOOK_TOLERANCE_SECONDS + 60;
+
+        assertThat(postWebhook(BANK_A_ID, body, String.valueOf(stale), sign(body, BANK_A_SECRET, stale)))
+                .isEqualTo(403);
+        assertThat(postWebhook(BANK_A_ID, body, String.valueOf(future), sign(body, BANK_A_SECRET, future)))
+                .isEqualTo(403);
+        // Captured stale signature, header re-dated to now: the moment is signed.
+        assertThat(postWebhook(BANK_A_ID, body, String.valueOf(now), sign(body, BANK_A_SECRET, stale)))
+                .isEqualTo(401);
+        assertThat(postWebhook(BANK_A_ID, body, null, sign(body, BANK_A_SECRET, now)))
+                .isEqualTo(401);
+        assertThat(postWebhook(BANK_A_ID, body, "not-a-timestamp", sign(body, BANK_A_SECRET, now)))
+                .isEqualTo(401);
+        assertThat(jdbc.queryForObject(
+                "SELECT count(*) FROM settlement_inbox WHERE notification_id = 'collection-replay:1'",
+                Long.class)).isZero();
+
+        // In-window: the first delivery lands, a redelivery signed a few seconds
+        // later (the counterparty re-signs every attempt) is a 200 no-op.
+        assertThat(postWebhook(BANK_A_ID, body, BANK_A_SECRET)).isEqualTo(200);
+        long later = now + 5;
+        assertThat(postWebhook(BANK_A_ID, body, String.valueOf(later), sign(body, BANK_A_SECRET, later)))
+                .isEqualTo(200);
+        assertThat(jdbc.queryForObject(
+                "SELECT count(*) FROM settlement_inbox WHERE notification_id = 'collection-replay:1'",
+                Long.class)).isEqualTo(1L);
     }
 
     @Test
@@ -241,14 +279,14 @@ class SettlementSpineIntegrationTest {
         byte[] settled =
                 webhook(BANK_B_ID, fixture.collectionId(), 1, "settled", null);
 
-        assertThat(postWebhook(BANK_B_ID, settled, sign(settled, BANK_A_SECRET)))
+        assertThat(postWebhook(BANK_B_ID, settled, BANK_A_SECRET))
                 .isEqualTo(401);
         assertThat(jdbc.queryForObject("""
                 SELECT count(*) FROM settlement_inbox
                 WHERE bank_id = ? AND notification_id = ?
                 """, Long.class, BANK_B_ID, fixture.collectionId() + ":1")).isZero();
 
-        assertThat(postWebhook(BANK_B_ID, settled, sign(settled, BANK_B_SECRET)))
+        assertThat(postWebhook(BANK_B_ID, settled, BANK_B_SECRET))
                 .isEqualTo(200);
         awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             assertThat(paymentStatus(fixture)).isEqualTo("succeeded");
@@ -264,7 +302,7 @@ class SettlementSpineIntegrationTest {
         SubmittedPayment fixture = parkSubmitted("05");
         byte[] webhook = webhook(fixture.collectionId(), 1, "failed", "AM04");
 
-        assertThat(postWebhook(BANK_A_ID, webhook, sign(webhook, BANK_A_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, webhook, BANK_A_SECRET))
                 .isEqualTo(200);
 
         awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
@@ -293,11 +331,11 @@ class SettlementSpineIntegrationTest {
         byte[] settled = webhook(fixture.collectionId(), 1, "settled", null);
         byte[] chargedBack = webhook(fixture.collectionId(), 2, "charged_back", "MD06");
 
-        assertThat(postWebhook(BANK_A_ID, settled, sign(settled, BANK_A_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, settled, BANK_A_SECRET))
                 .isEqualTo(200);
         awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(fixture)).isEqualTo("succeeded"));
-        assertThat(postWebhook(BANK_A_ID, chargedBack, sign(chargedBack, BANK_A_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, chargedBack, BANK_A_SECRET))
                 .isEqualTo(200);
 
         awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
@@ -326,17 +364,17 @@ class SettlementSpineIntegrationTest {
         byte[] settled = webhook(fixture.collectionId(), 1, "settled", null);
         byte[] chargedBack = webhook(fixture.collectionId(), 2, "charged_back", "MD06");
 
-        assertThat(postWebhook(BANK_A_ID, settled, sign(settled, BANK_A_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, settled, BANK_A_SECRET))
                 .isEqualTo(200);
         awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(fixture)).isEqualTo("succeeded"));
-        assertThat(postWebhook(BANK_A_ID, chargedBack, sign(chargedBack, BANK_A_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, chargedBack, BANK_A_SECRET))
                 .isEqualTo(200);
         awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(fixture)).isEqualTo("charged_back"));
         Instant firstChargedBackAt = chargedBackAt(fixture);
 
-        assertThat(postWebhook(BANK_A_ID, chargedBack, sign(chargedBack, BANK_A_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, chargedBack, BANK_A_SECRET))
                 .isEqualTo(200);
 
         awaitDb().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
@@ -370,7 +408,7 @@ class SettlementSpineIntegrationTest {
         // traverses webhook -> inbox -> relay -> queue -> listener before the
         // settled one is even received. Terminal state must match the ordered
         // case (R41): invoice disputed, charge settled, period advanced.
-        assertThat(postWebhook(BANK_A_ID, chargedBack, sign(chargedBack, BANK_A_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, chargedBack, BANK_A_SECRET))
                 .isEqualTo(200);
         awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             assertThat(paymentStatus(fixture)).isEqualTo("charged_back");
@@ -384,7 +422,7 @@ class SettlementSpineIntegrationTest {
                     .isEqualTo(expectedRenewedAt(fixture.periodEnd()));
         });
 
-        assertThat(postWebhook(BANK_A_ID, settled, sign(settled, BANK_A_SECRET)))
+        assertThat(postWebhook(BANK_A_ID, settled, BANK_A_SECRET))
                 .isEqualTo(200);
         awaitDb().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
             // The late settled notification has fully traversed the spine
@@ -412,7 +450,7 @@ class SettlementSpineIntegrationTest {
         byte[] settled = webhook(
                 CARD_ID, fixture.collectionId(), 1, "settled", null);
 
-        assertThat(postWebhook(CARD_ID, settled, sign(settled, CARD_SECRET)))
+        assertThat(postWebhook(CARD_ID, settled, CARD_SECRET))
                 .isEqualTo(200);
         awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(paymentStatus(fixture)).isEqualTo("succeeded"));
@@ -421,8 +459,7 @@ class SettlementSpineIntegrationTest {
         byte[] chargedBack = webhook(
                 CARD_ID, fixture.collectionId(), 2,
                 "charged_back", "fraud_dispute");
-        assertThat(postWebhook(
-                CARD_ID, chargedBack, sign(chargedBack, CARD_SECRET)))
+        assertThat(postWebhook(CARD_ID, chargedBack, CARD_SECRET))
                 .isEqualTo(200);
 
         awaitDb().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
@@ -550,19 +587,29 @@ class SettlementSpineIntegrationTest {
                 outcome, reason, "2030-01-01T00:00:00+00:00");
     }
 
-    private int postWebhook(String bankId, byte[] body, String signature) {
-        return RestClient.create()
+    // Signs "<now>." + body the way the counterparty does on every attempt (R44).
+    private int postWebhook(String bankId, byte[] body, String secret) throws Exception {
+        long now = Instant.now().getEpochSecond();
+        return postWebhook(bankId, body, String.valueOf(now), sign(body, secret, now));
+    }
+
+    private int postWebhook(String bankId, byte[] body, String timestampHeader, String signature) {
+        var request = RestClient.create()
                 .post()
                 .uri("http://localhost:" + port + "/webhooks/bank/" + bankId)
                 .contentType(MediaType.APPLICATION_JSON)
-                .header("X-Bank-Signature", signature)
-                .body(body)
-                .exchange((request, response) -> response.getStatusCode().value());
+                .header("X-Bank-Signature", signature);
+        if (timestampHeader != null) {
+            request = request.header("X-Bank-Timestamp", timestampHeader);
+        }
+        return request.body(body)
+                .exchange((request1, response) -> response.getStatusCode().value());
     }
 
-    private static String sign(byte[] body, String secret) throws Exception {
+    private static String sign(byte[] body, String secret, long timestamp) throws Exception {
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+        mac.update((timestamp + ".").getBytes(StandardCharsets.UTF_8));
         return "sha256=" + HexFormat.of().formatHex(mac.doFinal(body));
     }
 

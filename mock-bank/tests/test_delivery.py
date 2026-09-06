@@ -3,7 +3,9 @@ import logging
 import httpx
 from prometheus_client import REGISTRY
 
+import app.delivery as delivery_module
 from app.delivery import deliver
+from app.signing import verify
 
 
 def notification():
@@ -103,3 +105,45 @@ async def test_retries_http_error():
 
     assert result is True
     assert len(requests) == 2
+
+
+async def test_every_attempt_carries_its_own_fresh_signed_timestamp(monkeypatch):
+    # R44: each retry re-signs at send time. With a clock that advances between
+    # attempts, the timestamps differ, every signature verifies against ITS
+    # timestamp, and none verifies against another attempt's.
+    # Replace only delivery's module reference: httpx keeps its own `time`.
+    class FakeTime:
+        ticks = iter([1_800_000_000, 1_800_000_007, 1_800_000_021])
+
+        def time(self):
+            return next(self.ticks)
+
+    monkeypatch.setattr(delivery_module, "time", FakeTime())
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        status = 200 if len(requests) == 3 else 503
+        return httpx.Response(status, request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await deliver(
+            client,
+            "http://sink/webhook",
+            "secret",
+            "bank-test",
+            notification(),
+            max_attempts=3,
+            backoff_seconds=0,
+        )
+
+    assert result is True
+    timestamps = [int(r.headers["X-Bank-Timestamp"]) for r in requests]
+    assert timestamps == [1_800_000_000, 1_800_000_007, 1_800_000_021]
+    for request, timestamp in zip(requests, timestamps):
+        assert verify(request.content, "secret", request.headers["X-Bank-Signature"], timestamp)
+    assert not verify(
+        requests[1].content, "secret", requests[0].headers["X-Bank-Signature"], timestamps[1]
+    )

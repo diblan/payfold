@@ -20,6 +20,7 @@ import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
+import java.time.Instant;
 import java.util.HexFormat;
 
 @RestController
@@ -30,16 +31,20 @@ public class BankWebhookController {
     private final Counter accepted;
     private final Counter duplicate;
     private final Counter unauthorized;
+    private final Counter stale;
     private final Counter rejected;
+    private final long toleranceSeconds;
 
-    public BankWebhookController(BankRegistry bankRegistry, ObjectMapper objectMapper,
-                                 JdbcTemplate jdbc, MeterRegistry meters) {
+    public BankWebhookController(BankRegistry bankRegistry, BankProperties bankProperties,
+                                 ObjectMapper objectMapper, JdbcTemplate jdbc, MeterRegistry meters) {
         this.bankRegistry = bankRegistry;
         this.objectMapper = objectMapper;
         this.jdbc = jdbc;
+        this.toleranceSeconds = bankProperties.webhookToleranceSeconds();
         this.accepted = receivedCounter(meters, "accepted");
         this.duplicate = receivedCounter(meters, "duplicate");
         this.unauthorized = receivedCounter(meters, "unauthorized");
+        this.stale = receivedCounter(meters, "stale");
         this.rejected = receivedCounter(meters, "rejected");
     }
 
@@ -50,15 +55,28 @@ public class BankWebhookController {
             // cannot recover it from reflection (the producer pom differs).
             @PathVariable("bankId") String bankId,
             @RequestHeader(value = "X-Bank-Signature", required = false) String signature,
+            @RequestHeader(value = "X-Bank-Timestamp", required = false) String timestamp,
             @RequestBody byte[] body) {
         BankProperties.BankEntry bank = bankRegistry.byId(bankId);
         if (bank == null) {
             rejected.increment();
             return ResponseEntity.notFound().build();
         }
-        if (!validSignature(signature, body, bank.webhookSecret())) {
+        // R44: the signature covers "<timestamp>." + body, so the moment is
+        // authenticated before it is judged. A missing, malformed, or
+        // mismatching signature/timestamp is 401; a genuine signature whose
+        // moment lies outside the tolerance is 403 (stale) — a captured
+        // webhook cannot be replayed past the window, and nothing here reads
+        // the inbox. The consumer's clock is read for authentication only;
+        // idempotency and period material still come from message content (G2).
+        if (!validSignature(signature, timestamp, body, bank.webhookSecret())) {
             unauthorized.increment();
             return ResponseEntity.status(401).build();
+        }
+        long sentAt = Long.parseLong(timestamp);
+        if (Math.abs(Instant.now().getEpochSecond() - sentAt) > toleranceSeconds) {
+            stale.increment();
+            return ResponseEntity.status(403).build();
         }
 
         JsonNode payload;
@@ -90,8 +108,8 @@ public class BankWebhookController {
         return ResponseEntity.ok().build();
     }
 
-    private boolean validSignature(String signature, byte[] body, String webhookSecret) {
-        if (signature == null) {
+    private boolean validSignature(String signature, String timestamp, byte[] body, String webhookSecret) {
+        if (signature == null || timestamp == null || !timestamp.matches("\\d{1,19}")) {
             return false;
         }
         try {
@@ -99,6 +117,7 @@ public class BankWebhookController {
             mac.init(new SecretKeySpec(
                     webhookSecret.getBytes(StandardCharsets.UTF_8),
                     "HmacSHA256"));
+            mac.update((timestamp + ".").getBytes(StandardCharsets.UTF_8));
             String expected = "sha256=" + HexFormat.of().formatHex(mac.doFinal(body));
             return MessageDigest.isEqual(
                     expected.getBytes(StandardCharsets.UTF_8),

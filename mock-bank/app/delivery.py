@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 
 import httpx
 from prometheus_client import Counter
@@ -34,13 +35,19 @@ async def deliver(
     backoff_seconds: float,
 ) -> bool:
     body = json.dumps(notification, separators=(",", ":")).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "X-Bank-Id": bank_id,
-        "X-Bank-Signature": sign(body, secret),
-    }
 
     for attempt in range(1, max_attempts + 1):
+        # Re-sign every attempt with a fresh timestamp (R44): the receiver's
+        # acceptance window then only has to cover clock skew and transit, not
+        # the whole retry envelope, so a legitimately late redelivery is never
+        # mistaken for a replay.
+        timestamp = int(time.time())
+        headers = {
+            "Content-Type": "application/json",
+            "X-Bank-Id": bank_id,
+            "X-Bank-Timestamp": str(timestamp),
+            "X-Bank-Signature": sign(body, secret, timestamp),
+        }
         try:
             response = await client.post(url, content=body, headers=headers)
             if 200 <= response.status_code < 300:

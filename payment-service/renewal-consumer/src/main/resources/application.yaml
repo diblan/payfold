@@ -42,6 +42,11 @@ bank:
   # slow submits -- blocked listener threads are the backpressure -- never
   # poison verdicts (D19).
   timeout-ms: 10000
+  # R44: a webhook's signed X-Bank-Timestamp must lie within this many seconds
+  # of the receiver's clock (either direction) or the request is rejected 403
+  # before the inbox insert. The counterparty re-signs every retry attempt, so
+  # this covers clock skew + transit only, not the retry envelope.
+  webhook-tolerance-seconds: 300
   registry:
     - id: bank-a
       scheme: sepa_core

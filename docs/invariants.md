@@ -119,4 +119,7 @@ consumers must remain idempotent per [G2](invariants.md#g2).
 
 *Status:* **HELD** — both contracts are at v1, documented in
 [architecture.md](architecture.md#message-contract--renewalrequested-v1) and fully
-populated by their producers.
+populated by their producers. The settlement webhook's *transport* contract gained
+a signed `X-Bank-Timestamp` header in [R44](roadmap.md#r44); the payload is unchanged,
+and the counterparty and receiver images ship the new signed-byte definition together
+(a coupled rollout, flagged under Deploy artifacts).
